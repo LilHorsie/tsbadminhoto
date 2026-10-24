@@ -1,0 +1,48 @@
+import { useDisclosure } from '@chakra-ui/react'
+import { Meta, StoryFn } from '@storybook/react-vite'
+
+import { FormId, UserId } from 'formsg-shared/types'
+import { Workspace, WorkspaceId } from 'formsg-shared/types/workspace'
+
+import { userHandlers } from '~/mocks/msw/handlers/user'
+
+import { viewportModes } from '~utils/storybook'
+
+import {
+  DeleteWorkspaceModal,
+  DeleteWorkspaceModalProps,
+} from '../WorkspaceModals/DeleteWorkspaceModal'
+
+export default {
+  title: 'Pages/WorkspacePage/DeleteWorkspaceModal',
+  component: DeleteWorkspaceModal,
+  parameters: {
+    layout: 'fullscreen',
+    // Pages fill the viewport; fit-to-content would crop them.
+    argos: { fitToContent: false },
+    // Prevent flaky tests due to modal animating in.
+    msw: userHandlers({ delay: 0 }),
+  },
+} as Meta
+
+const Template: StoryFn<DeleteWorkspaceModalProps> = (args) => {
+  const modalProps = useDisclosure({ defaultIsOpen: true })
+
+  const mockWorkspace: Workspace = {
+    _id: '' as WorkspaceId,
+    title: 'ImAWorkspace',
+    formIds: ['' as FormId],
+    admin: '' as UserId,
+  }
+
+  return (
+    <DeleteWorkspaceModal
+      {...args}
+      {...modalProps}
+      onClose={() => console.log('close modal')}
+      activeWorkspace={mockWorkspace}
+    />
+  )
+}
+export const DeleteWorkspace = Template.bind({})
+DeleteWorkspace.parameters = { argos: { modes: viewportModes('mobile') } }

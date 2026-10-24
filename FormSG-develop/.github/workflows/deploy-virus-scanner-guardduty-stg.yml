@@ -1,0 +1,25 @@
+name: Deploy Virus Scanner GuardDuty to stg
+
+permissions:
+  id-token: write
+  contents: read
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: 'Release version tag to deploy (e.g. v7.4.5)'
+        required: true
+        type: string
+
+jobs:
+  deploy-scanner-guardduty:
+    name: Deploy Scanner GuardDuty
+    uses: ./.github/workflows/aws-deploy-scanner-guardduty-iac.yml
+    with:
+      checkoutBranch: ${{ inputs.version }}
+      gha-environment: 'stg'
+      environment: 'stg'
+      provisionedConcurrency: 1
+    secrets:
+      cicd-role: ${{ secrets.IAC_AWS_CI_ROLE_TO_ASSUME }}

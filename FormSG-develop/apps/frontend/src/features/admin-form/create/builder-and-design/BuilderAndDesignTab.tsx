@@ -1,0 +1,298 @@
+import { useCallback, useState } from 'react'
+import { useDisclosure } from '@chakra-ui/react'
+import {
+  DragDropContext,
+  DragStart,
+  DragUpdate,
+  DropResult,
+} from '@hello-pangea/dnd'
+
+import { createLoginIdentityField } from 'formsg-shared/utils/login-identity'
+
+import {
+  getFieldCreationMeta,
+  getMyInfoFieldCreationMeta,
+} from '~features/admin-form/create/builder-and-design/utils/fieldCreation'
+
+import MagicFormBuilderAcceptDeny from './MagicFormBuilder/components/MagicFormBuilderAcceptDeny'
+import MagicFormBuilderPromptModal from './MagicFormBuilder/components/MagicFormBuilderPromptModal'
+import { useMagicFormBuilder } from './MagicFormBuilder/useMagicFormBuilder'
+import { useReorderFormField } from './mutations/useReorderFormField'
+import {
+  getPlaceholderStartProps,
+  getPlaceholderUpdateProps,
+} from './utils/dnd'
+import { BuilderAndDesignContent } from './BuilderAndDesignContent'
+import { BuilderAndDesignContext } from './BuilderAndDesignContext'
+import { BuilderAndDesignDrawer } from './BuilderAndDesignDrawer'
+import {
+  BASIC_FIELDS_CONTENT_AND_DESCRIPTIONS,
+  BASIC_FIELDS_DATES_AND_NUMBER,
+  BASIC_FIELDS_FREE_TEXT,
+  BASIC_FIELDS_OPTIONS,
+  BASIC_FIELDS_ORDERED,
+  BASIC_FIELDS_OTHERS,
+  BASIC_FIELDS_PERSONAL,
+  CREATE_CORPPASS_IDENTITY_DROP_ID,
+  CREATE_CORPPASS_IDENTITY_FIELDS_ORDERED,
+  CREATE_FIELD_BASIC_FIELDS_OPTIONS_DROP_ID,
+  CREATE_FIELD_CONTENT_AND_DESCRIPTIONS_DROP_ID,
+  CREATE_FIELD_DATES_AND_NUMBER_DROP_ID,
+  CREATE_FIELD_DROP_ID,
+  CREATE_FIELD_FREE_TEXT_DROP_ID,
+  CREATE_FIELD_OTHERS_DROP_ID,
+  CREATE_FIELD_PERSONAL_DROP_ID,
+  CREATE_MYINFO_CHILDREN_DROP_ID,
+  CREATE_MYINFO_CHILDREN_FIELDS_ORDERED,
+  CREATE_MYINFO_CONTACT_DROP_ID,
+  CREATE_MYINFO_CONTACT_FIELDS_ORDERED,
+  CREATE_MYINFO_IDENTITY_DROP_ID,
+  CREATE_MYINFO_IDENTITY_FIELDS_ORDERED,
+  CREATE_MYINFO_MARRIAGE_DROP_ID,
+  CREATE_MYINFO_MARRIAGE_FIELDS_ORDERED,
+  CREATE_MYINFO_PARTICULARS_DROP_ID,
+  CREATE_MYINFO_PARTICULARS_FIELDS_ORDERED,
+  CREATE_MYINFO_PERSONAL_DROP_ID,
+  CREATE_MYINFO_PERSONAL_FIELDS_ORDERED,
+  FIELD_LIST_DROP_ID,
+  PENDING_CREATE_FIELD_ID,
+} from './constants'
+import { DeleteFieldModal } from './DeleteFieldModal'
+import { DeletePaymentModal } from './DeletePaymentModal'
+import { DndPlaceholderProps } from './types'
+import { useCreateTabForm } from './useCreateTabForm'
+import {
+  setCreateInsertionIndexSelector,
+  updateCreateStateSelector,
+  useFieldBuilderStore,
+} from './useFieldBuilderStore'
+
+export const BuilderAndDesignTab = (): JSX.Element => {
+  const {
+    isModalOpen,
+    isAcceptDenyOpen,
+    onAccept,
+    onDeny,
+    onMfbTextPromptSubmit,
+    isMfbTextPromptSubmitLoading,
+    onMfbVisionPromptSubmit,
+    isMfbVisionPromptSubmitLoading,
+    onModalClose,
+  } = useMagicFormBuilder()
+
+  const setToCreating = useFieldBuilderStore(updateCreateStateSelector)
+  const setCreateInsertionIndex = useFieldBuilderStore(
+    setCreateInsertionIndexSelector,
+  )
+  const { data } = useCreateTabForm()
+
+  const { reorderFieldMutation } = useReorderFormField()
+
+  const [placeholderProps, setPlaceholderProps] = useState<DndPlaceholderProps>(
+    {},
+  )
+
+  const onDragStart = useCallback(
+    (dragStart: DragStart) => {
+      const startPlaceholderProps = getPlaceholderStartProps(dragStart)
+      if (startPlaceholderProps) {
+        setPlaceholderProps(startPlaceholderProps)
+      }
+    },
+    [setPlaceholderProps],
+  )
+
+  const onDragUpdate = useCallback(
+    (dragUpdate: DragUpdate) => {
+      const updatePlaceholderProps = getPlaceholderUpdateProps(dragUpdate)
+      if (updatePlaceholderProps) {
+        setPlaceholderProps(updatePlaceholderProps)
+      }
+    },
+    [setPlaceholderProps],
+  )
+
+  const onDragEnd = useCallback(
+    ({ source, destination, draggableId }: DropResult) => {
+      setPlaceholderProps({})
+
+      if (!data || !destination) return
+
+      switch (source.droppableId) {
+        case CREATE_FIELD_DROP_ID: {
+          return setToCreating(
+            getFieldCreationMeta(BASIC_FIELDS_ORDERED[source.index]),
+            destination.index,
+          )
+        }
+
+        // TODO: FRM-2071 Refactor when categories experiment is completed
+        case CREATE_FIELD_FREE_TEXT_DROP_ID: {
+          return setToCreating(
+            getFieldCreationMeta(BASIC_FIELDS_FREE_TEXT[source.index]),
+            destination.index,
+          )
+        }
+
+        case CREATE_FIELD_BASIC_FIELDS_OPTIONS_DROP_ID: {
+          return setToCreating(
+            getFieldCreationMeta(BASIC_FIELDS_OPTIONS[source.index]),
+            destination.index,
+          )
+        }
+
+        case CREATE_FIELD_CONTENT_AND_DESCRIPTIONS_DROP_ID: {
+          return setToCreating(
+            getFieldCreationMeta(
+              BASIC_FIELDS_CONTENT_AND_DESCRIPTIONS[source.index],
+            ),
+            destination.index,
+          )
+        }
+
+        case CREATE_FIELD_DATES_AND_NUMBER_DROP_ID: {
+          return setToCreating(
+            getFieldCreationMeta(BASIC_FIELDS_DATES_AND_NUMBER[source.index]),
+            destination.index,
+          )
+        }
+
+        case CREATE_FIELD_PERSONAL_DROP_ID: {
+          return setToCreating(
+            getFieldCreationMeta(BASIC_FIELDS_PERSONAL[source.index]),
+            destination.index,
+          )
+        }
+
+        case CREATE_FIELD_OTHERS_DROP_ID: {
+          return setToCreating(
+            getFieldCreationMeta(BASIC_FIELDS_OTHERS[source.index]),
+            destination.index,
+          )
+        }
+
+        case CREATE_MYINFO_IDENTITY_DROP_ID: {
+          return setToCreating(
+            createLoginIdentityField(
+              CREATE_MYINFO_IDENTITY_FIELDS_ORDERED[source.index],
+            ),
+            destination.index,
+          )
+        }
+
+        case CREATE_CORPPASS_IDENTITY_DROP_ID: {
+          return setToCreating(
+            createLoginIdentityField(
+              CREATE_CORPPASS_IDENTITY_FIELDS_ORDERED[source.index],
+            ),
+            destination.index,
+          )
+        }
+
+        case CREATE_MYINFO_PERSONAL_DROP_ID: {
+          return setToCreating(
+            getMyInfoFieldCreationMeta(
+              CREATE_MYINFO_PERSONAL_FIELDS_ORDERED[source.index],
+            ),
+            destination.index,
+          )
+        }
+
+        case CREATE_MYINFO_CONTACT_DROP_ID: {
+          return setToCreating(
+            getMyInfoFieldCreationMeta(
+              CREATE_MYINFO_CONTACT_FIELDS_ORDERED[source.index],
+            ),
+            destination.index,
+          )
+        }
+
+        case CREATE_MYINFO_PARTICULARS_DROP_ID: {
+          return setToCreating(
+            getMyInfoFieldCreationMeta(
+              CREATE_MYINFO_PARTICULARS_FIELDS_ORDERED[source.index],
+            ),
+            destination.index,
+          )
+        }
+
+        case CREATE_MYINFO_MARRIAGE_DROP_ID: {
+          return setToCreating(
+            getMyInfoFieldCreationMeta(
+              CREATE_MYINFO_MARRIAGE_FIELDS_ORDERED[source.index],
+            ),
+            destination.index,
+          )
+        }
+
+        case CREATE_MYINFO_CHILDREN_DROP_ID: {
+          return setToCreating(
+            getMyInfoFieldCreationMeta(
+              CREATE_MYINFO_CHILDREN_FIELDS_ORDERED[source.index],
+            ),
+            destination.index,
+          )
+        }
+
+        case FIELD_LIST_DROP_ID: {
+          if (destination.index === source.index) {
+            return
+          }
+          // The placeholder has no saved row to reorder, so moving it only
+          // updates where it will be inserted on create.
+          if (draggableId === PENDING_CREATE_FIELD_ID) {
+            return setCreateInsertionIndex(destination.index)
+          }
+          return reorderFieldMutation.mutate({
+            fields: data.form_fields,
+            from: source.index,
+            to: destination.index,
+          })
+        }
+      }
+    },
+    [
+      data,
+      reorderFieldMutation,
+      setToCreating,
+      setPlaceholderProps,
+      setCreateInsertionIndex,
+    ],
+  )
+
+  const deleteFieldModalDisclosure = useDisclosure()
+  const deletePaymentModalDisclosure = useDisclosure()
+
+  return (
+    <DragDropContext
+      onDragStart={onDragStart}
+      onDragUpdate={onDragUpdate}
+      onDragEnd={onDragEnd}
+    >
+      <BuilderAndDesignContext.Provider
+        value={{
+          deleteFieldModalDisclosure,
+          deletePaymentModalDisclosure,
+        }}
+      >
+        <MagicFormBuilderPromptModal
+          isOpen={isModalOpen}
+          onTextPromptSubmit={onMfbTextPromptSubmit}
+          isTextPromptSubmitLoading={isMfbTextPromptSubmitLoading}
+          onVisionPromptSubmit={onMfbVisionPromptSubmit}
+          isVisionPromptSubmitLoading={isMfbVisionPromptSubmitLoading}
+          onClose={onModalClose}
+        />
+        <MagicFormBuilderAcceptDeny
+          isOpen={isAcceptDenyOpen}
+          onAccept={onAccept}
+          onDeny={onDeny}
+        />
+        <BuilderAndDesignDrawer />
+        <BuilderAndDesignContent placeholderProps={placeholderProps} />
+        {deleteFieldModalDisclosure.isOpen && <DeleteFieldModal />}
+        {deletePaymentModalDisclosure.isOpen && <DeletePaymentModal />}
+      </BuilderAndDesignContext.Provider>
+    </DragDropContext>
+  )
+}

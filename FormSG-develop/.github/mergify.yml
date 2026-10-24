@@ -1,0 +1,17 @@
+pull_request_rules:
+  - name: Approve and merge non-major dependabot dependency upgrades
+    conditions:
+      - author=dependabot[bot]
+      - title~=bump [^\s]+ from ([\d]+)\..+ to \1\.
+    actions:
+      review:
+        type: APPROVE
+  - name: Approve and merge non-major Snyk.io upgrades
+    conditions:
+      - author=snyk-bot
+      - title~=\[Snyk\] Security upgrade [^\s]+ from ([\d]+)\..+ to \1\.
+    actions:
+      review:
+        type: APPROVE
+      merge:
+        method: squash

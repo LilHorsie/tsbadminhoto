@@ -1,0 +1,203 @@
+# This docker-compose file is only for local development purposes.
+version: '3'
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.development
+    depends_on:
+      - database
+    extra_hosts:
+      - 'host.docker.internal:host-gateway'
+    volumes:
+      - ./:/opt/formsg
+      - /opt/formsg/node_modules
+    ports:
+      - '5001:5000'
+      - '4566:4566' # localstack ports
+      - '5156:5156' # mockpass ports
+      - '9229:9229' # Node debugger port
+    environment:
+      - NODE_ENV=development
+      - DB_HOST=mongodb://database:27017/formsg?directConnection=true
+      - APP_NAME=FormSG
+      - APP_URL=http://localhost:5001
+      - FE_APP_URL=http://localhost:5173
+      - ATTACHMENT_S3_BUCKET=local-attachment-bucket
+      - SUBMISSION_HISTORY_V4_S3_BUCKET=local-submission-history-v4-bucket
+      - SUBMISSION_HISTORY_V1_S3_BUCKET=local-submission-history-v1-bucket
+      - SUBMISSION_HISTORY_V1_ATTACHMENT_S3_BUCKET=local-submission-history-v1-attachment-bucket
+      - PAYMENT_PROOF_S3_BUCKET=local-payment-proof-bucket
+      - IMAGE_S3_BUCKET=local-image-bucket
+      - LOGO_S3_BUCKET=local-logo-bucket
+      - STATIC_ASSETS_S3_BUCKET=local-static-assets-bucket
+      - GUARDDUTY_QUARANTINE_S3_BUCKET=local-guardduty-quarantine-bucket
+      - GUARDDUTY_CLEAN_S3_BUCKET=local-guardduty-clean-bucket
+      - FORMSG_SDK_MODE=development
+      - BOUNCE_LIFE_SPAN=86400000
+      - AWS_ACCESS_KEY_ID=fakeKey
+      - AWS_SECRET_ACCESS_KEY=fakeSecret
+      - SESSION_SECRET=thisisasecret
+      - AWS_ENDPOINT=http://127.0.0.1:4566
+      - SECRET_ENV=development
+      - SUBMISSIONS_RATE_LIMIT=200
+      - SEND_AUTH_OTP_RATE_LIMIT=60
+      - SES_PORT=1025
+      - SES_HOST=maildev
+      - WEBHOOK_SQS_URL=http://sqs.us-east-1.localhost.localstack.cloud:4566/000000000000/local-webhooks-sqs-main
+      - INTRANET_IP_LIST_PATH=__tests__/setup/mock-intranet-ips.txt
+      - INTRANET_IP_LIST=127.0.0.1
+      - OGP_IP_LIST=127.0.0.1
+      - RBI_IP_LIST=127.0.0.1
+      # This needs to be removed and replaced with a real tracking ID in a local .env file
+      # in order to enable GA in a local environment
+      # Test credentials from reCAPTCHA docs
+      # https://developers.google.com/recaptcha/docs/faq#id-like-to-run-automated-tests-with-recaptcha.-what-should-i-do
+      - GOOGLE_CAPTCHA=6LeIxAcTAAAAAGG-vFI1TnRWxMZNFuojJ4WifJWe
+      - GOOGLE_CAPTCHA_PUBLIC=6LeIxAcTAAAAAJcZVRqyHh71UMIEGNQ_MXjiZKhI
+      # Keep in sync with the development key in
+      # https://github.com/opengovsg/formsg-javascript-sdk/blob/develop/src/resource/verification-keys.ts
+      - VERIFICATION_SECRET_KEY=iGkfOuI6uxrlfw+7CZFFUZBwk86I+pu6v+g7EWA6qJpJnilXQleCPx2EVTr24eWWphzFO2WJiaL53oyXnqWdBQ==
+      # Keep in sync with the development key in
+      # https://github.com/opengovsg/formsg-javascript-sdk/blob/develop/src/resource/signing-keys.ts
+      - SIGNING_SECRET_KEY=HDBXpu+2/gu10bLHpy8HjpN89xbA6boH9GwibPGJA8BOXmB+zOUpxCP33/S5p8vBWlPokC7gLR0ca8urVwfMUQ==
+      - SP_OIDC_NDI_DISCOVERY_ENDPOINT=http://localhost:5156/singpass/v2/.well-known/openid-configuration
+      - SP_OIDC_NDI_JWKS_ENDPOINT=http://localhost:5156/singpass/v2/.well-known/keys
+      - SP_OIDC_RP_CLIENT_ID=rpClientId
+      - SP_OIDC_RP_REDIRECT_URL=http://localhost:5001/api/v3/singpass/login
+      - SP_OIDC_RP_JWKS_PUBLIC_PATH=__tests__/setup/certs/test_sp_rp_public_jwks.json
+      - SP_OIDC_RP_JWKS_SECRET_PATH=__tests__/setup/certs/test_sp_rp_secret_jwks.json
+      - CP_OIDC_NDI_DISCOVERY_ENDPOINT=http://localhost:5156/corppass/v2/.well-known/openid-configuration
+      - CP_OIDC_NDI_JWKS_ENDPOINT=http://localhost:5156/corppass/v2/.well-known/keys
+      - CP_OIDC_RP_CLIENT_ID=rpClientId
+      - CP_OIDC_RP_REDIRECT_URL=http://localhost:5001/api/v3/corppass/login
+      - CP_OIDC_RP_JWKS_PUBLIC_PATH=__tests__/setup/certs/test_cp_rp_public_jwks.json
+      - CP_OIDC_RP_JWKS_SECRET_PATH=__tests__/setup/certs/test_cp_rp_secret_jwks.json
+      - IS_SP_MAINTENANCE
+      - IS_CP_MAINTENANCE
+      - MYINFO_BANNER_CONTENT
+      - MYINFO_JWT_SECRET=mockJwtSecret
+      # Use mockpass key pairs and endpoints
+      - MYINFO_FAPI_ISSUER=http://localhost:5156/singpass/v3/fapi
+      - MYINFO_FAPI_CLIENT_ID=mockFapiClientId
+      - MYINFO_FAPI_RP_JWKS_PUBLIC_PATH=__tests__/setup/certs/test_myinfo_fapi_rp_public_jwks.json
+      - MYINFO_FAPI_RP_JWKS_SECRET_PATH=__tests__/setup/certs/test_myinfo_fapi_rp_secret_jwks.json
+      - SGID_HOSTNAME=http://localhost:5156
+      - SGID_CLIENT_ID=sgidclientid
+      - SGID_CLIENT_SECRET=sgidclientsecret
+      - SGID_ADMIN_LOGIN_REDIRECT_URI=http://localhost:5001/api/v3/auth/sgid/login/callback
+      - SGID_PRIVATE_KEY_PATH=node_modules/@opengovsg/mockpass/static/certs/key.pem
+      - SES_PASS
+      - SES_USER
+      - OTP_LIFE_SPAN
+      - AWS_REGION
+      # this needs to be replaced with the ID of a feedback form that you create
+      # in your local environment
+      - REACT_SWITCH_ENV_FEEDBACK_FORM_ID_ADMIN=6386ecc0bdf691005457c67e
+      - REACT_SWITCH_ENV_FEEDBACK_FORM_ID_RESPONDENT=6386e4ba847f280069797a54
+      - REACT_MIGRATION_ANGULAR_END_DATE=15 September 2022
+      - REACT_MIGRATION_RESP_ROLLOUT_EMAIL=100
+      - REACT_MIGRATION_RESP_ROLLOUT_STORAGE=100
+      - REACT_MIGRATION_ADMIN_ROLLOUT=100
+      - REACT_MIGRATION_REMOVE_INFOBOX_THRESHOLD_ADMIN=101
+      - REACT_MIGRATION_REMOVE_INFOBOX_THRESHOLD_RESPONDENT=101
+      - REACT_MIGRATION_USE_FETCH_FOR_SUBMISSIONS=false
+      # env vars for stripe payment integration
+      - PAYMENT_STRIPE_PUBLISHABLE_KEY
+      # duplicate PAYMENT_STRIPE_SECRET_KEY to STRIPE_API_KEY in stripe-webhook-listener container
+      - PAYMENT_STRIPE_SECRET_KEY
+      - PAYMENT_STRIPE_CLIENT_ID
+      - PAYMENT_STRIPE_WEBHOOK_SECRET
+      - PAYMENT_MAX_PAYMENT_AMOUNT_CENTS
+      - PAYMENT_MIN_PAYMENT_AMOUNT_CENTS=50
+      - SSM_ENV_SITE_NAME=development
+      - PAYMENT_GUIDE_LINK
+      - PAYMENT_LANDING_GUIDE_LINK
+      # Cron secrets
+      - CRON_PAYMENT_API_SECRET=secretKey
+      - CRON_SCHEDULED_CLOSURE_API_SECRET=secretKey
+      # env vars for go integration
+      - GOGOV_API_KEY
+      # Bearer token API key format
+      - API_KEY_VERSION=v1
+      # env vars for growthbook (development client keys are non-sensitive)
+      # configure here: https://app.growthbook.io/sdks/sdk_19g61ollbqklip
+      - GROWTHBOOK_CLIENT_KEY=sdk-TxTUolCEFDculuDw
+      # env vars for virus scanner
+      - VIRUS_SCANNER_LAMBDA_FUNCTION_NAME=function
+      - GUARDDUTY_LAMBDA_FUNCTION_NAME=function
+      - PDF_GENERATOR_LAMBDA_FUNCTION_NAME=pdf-gen-sparticuz-dev
+      - WOGAA_SECRET_KEY
+      - WOGAA_START_ENDPOINT
+      - WOGAA_SUBMIT_ENDPOINT
+      - WOGAA_FEEDBACK_ENDPOINT
+      - POSTMAN_MOP_CAMPAIGN_ID=campaign_test
+      - POSTMAN_MOP_CAMPAIGN_API_KEY=key_test_123
+      - POSTMAN_INTERNAL_CAMPAIGN_ID=campaign_test_2
+      - POSTMAN_INTERNAL_CAMPAIGN_API_KEY=key_test_456
+      - POSTMAN_BASE_URL=https://test.postman.gov.sg/api/v2
+      - DOWNLOAD_FORM_WHITELIST_RATE_LIMIT
+      - UPLOAD_FORM_WHITELIST_RATE_LIMIT
+      - KILL_EMAIL_MODE_FEEDBACK_FORMID=67b2b52264eeaf439cfb4f28
+      - SSO_DISCOVERY_URL
+      - SSO_CLIENT_ID
+      - SSO_CLIENT_SECRET
+      - ONE_DISCOVERY_URL
+      - ONE_CLIENT_ID
+      - ONE_OIDC_RP_JWKS_SECRET
+
+  mockpass:
+    image: opengovsg/mockpass:4.7.1
+    depends_on:
+      - backend
+    environment:
+      - MOCKPASS_NRIC=S6005038D
+      - MOCKPASS_UEN=123456789A
+      - SHOW_LOGIN_PAGE=true
+      - SP_RP_JWKS_ENDPOINT=http://localhost:5000/sp/.well-known/jwks.json
+      - CP_RP_JWKS_ENDPOINT=http://localhost:5000/api/v3/corppass/.well-known/jwks.json
+      - FAPI_CLIENT_JWKS_ENDPOINT=http://localhost:5000/mi/fapi/.well-known/jwks.json
+    network_mode: 'service:backend' # reuse backend service's network stack so that it can resolve localhost:5156 to mockpass:5156
+
+  database:
+    image: 'bitnamilegacy/mongodb:4.4'
+    environment:
+      - MONGODB_DATABASE=formsg
+      - MONGODB_ADVERTISED_HOSTNAME=database
+      - MONGODB_REPLICA_SET_MODE=primary
+      - ALLOW_EMPTY_PASSWORD=yes
+    volumes:
+      - mongodb_data:/bitnami/mongodb
+      - ./init-mongo.js:/docker-entrypoint-initdb.d/init-mongo.js:ro
+    ports:
+      - '27017:27017'
+
+  localstack:
+    image: localstack/localstack:3.3
+    depends_on:
+      - backend
+    environment:
+      - SERVICES=s3,sqs
+      - DNS_ADDRESS=0
+      - EXTRA_CORS_ALLOWED_ORIGINS=http://localhost:5173
+    volumes:
+      - ./.localstack/volume:/var/lib/localstack
+      - /var/run/docker.sock:/var/run/docker.sock
+    network_mode: 'service:backend' # reuse backend service's network stack so that it can resolve localhost:4566 to localstack:4566
+    attach: false
+
+  maildev:
+    image: maildev/maildev
+    ports:
+      - '1080:1080'
+
+  stripe-cli:
+    image: stripe/stripe-cli
+    command: 'listen --api-key ${STRIPE_API_KEY} --device-name ${STRIPE_DEVICE_NAME} --forward-to host.docker.internal:5001/api/v3/notifications/stripe'
+    environment:
+      - STRIPE_API_KEY
+      - STRIPE_DEVICE_NAME=StripeWebhookListener
+
+volumes:
+  mongodb_data:
+    driver: local

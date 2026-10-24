@@ -1,0 +1,514 @@
+import { useCallback, useMemo, useState } from 'react'
+import { useTranslation } from 'react-i18next'
+import { BiDownload } from 'react-icons/bi'
+import { useParams } from 'react-router-dom'
+import { useThrottle } from 'react-use'
+import {
+  Box,
+  CheckboxGroup,
+  Flex,
+  MenuButton,
+  MenuList,
+  Stack,
+  Text,
+  useDisclosure,
+} from '@chakra-ui/react'
+import { datadogLogs } from '@datadog/browser-logs'
+import simplur from 'simplur'
+
+import { AnalyticsEventType, ResultsDownloadFormat } from 'formsg-shared/types'
+
+import { BxsChevronDown } from '~assets/icons/BxsChevronDown'
+import { BxsChevronUp } from '~assets/icons/BxsChevronUp'
+import { useToast } from '~hooks/useToast'
+import Button from '~components/Button'
+import Checkbox from '~components/Checkbox'
+import IconButton from '~components/IconButton'
+import Menu from '~components/Menu'
+import { NavigationPrompt } from '~templates/NavigationPrompt'
+
+import { CSV_BUFFER_MAX_RESPONSES } from '~features/admin-form/responses/constants'
+import { useIsDelightfulDashboard } from '~features/admin-form/responses/hooks'
+import { logAnalyticsEvent } from '~features/analytics/AnalyticsEventService'
+
+import { useStorageResponsesContext } from '../StorageResponsesContext'
+import {
+  CanceledResult,
+  DownloadOptions,
+  DownloadResult,
+  isCsvOnlyDownload,
+} from '../types'
+import useDecryptionWorkers from '../useDecryptionWorkers'
+import { CsvExportView } from '../utils/csvExportView'
+
+import { DownloadWithAttachmentModal } from './DownloadWithAttachmentModal'
+import { ProgressModal } from './ProgressModal'
+import { matchesSavedView } from './savedViews'
+import { useUnlockedResponses } from './UnlockedResponsesProvider'
+
+const toDownloadFormats = ({
+  isDownloadCsv,
+  isDownloadAttachments,
+  isDownloadPdf,
+}: DownloadOptions): ResultsDownloadFormat[] => [
+  ...(isDownloadCsv ? (['csv'] as const) : []),
+  ...(isDownloadAttachments ? (['attachments'] as const) : []),
+  ...(isDownloadPdf ? (['pdf'] as const) : []),
+]
+
+const DownloadSelectorCheckbox = ({
+  optionText,
+  isChecked,
+  onChange,
+}: {
+  optionText: string
+  isChecked: boolean
+  onChange: () => void
+}) => {
+  return (
+    <Checkbox isChecked={isChecked} onChange={onChange} px="1rem" py="0.75rem">
+      {optionText}
+    </Checkbox>
+  )
+}
+
+const DownloadSelector = ({
+  onClickNext,
+  onDownload,
+  downloadOptions,
+  setDownloadOptions,
+  isCsvConfirmed,
+}: {
+  onClickNext: () => void
+  downloadOptions: DownloadOptions
+  onDownload: () => void
+  setDownloadOptions: (downloadOptions: DownloadOptions) => void
+  isCsvConfirmed: boolean
+}) => {
+  const { t } = useTranslation('translation', {
+    keyPrefix:
+      'features.adminForm.responses.responsesPage.storage.unlockedResponses.downloadButton.menuItem',
+  })
+
+  const { isDownloadCsv, isDownloadAttachments, isDownloadPdf } =
+    downloadOptions
+  const onlyDownloadCsv = !isCsvConfirmed && isCsvOnlyDownload(downloadOptions)
+  const isDownloadOptionSelected =
+    isDownloadCsv || isDownloadAttachments || isDownloadPdf
+
+  return (
+    <Stack>
+      <CheckboxGroup value={['csv', 'attachments']}>
+        <Stack direction="column">
+          <DownloadSelectorCheckbox
+            optionText={t('csv')}
+            isChecked={isDownloadCsv}
+            onChange={() =>
+              setDownloadOptions({
+                ...downloadOptions,
+                isDownloadCsv: !isDownloadCsv,
+              })
+            }
+          />
+          <DownloadSelectorCheckbox
+            optionText={t('attachments')}
+            isChecked={isDownloadAttachments}
+            onChange={() =>
+              setDownloadOptions({
+                ...downloadOptions,
+                isDownloadAttachments: !isDownloadAttachments,
+              })
+            }
+          />
+          <DownloadSelectorCheckbox
+            optionText={t('pdfs')}
+            isChecked={isDownloadPdf}
+            onChange={() =>
+              setDownloadOptions({
+                ...downloadOptions,
+                isDownloadPdf: !isDownloadPdf,
+              })
+            }
+          />
+        </Stack>
+      </CheckboxGroup>
+      <Flex m="1rem" justify="flex-end">
+        <Button
+          isDisabled={!isDownloadOptionSelected}
+          onClick={onlyDownloadCsv ? onDownload : onClickNext}
+        >
+          {onlyDownloadCsv ? 'Start download' : 'Next'}
+        </Button>
+      </Flex>
+    </Stack>
+  )
+}
+
+export const DownloadButton = ({
+  isIconOnly,
+}: {
+  isIconOnly?: boolean
+}): JSX.Element => {
+  const { formId } = useParams()
+  const isDelightfulDashboard = useIsDelightfulDashboard()
+  const {
+    visibleSubmissionIds,
+    isFullyLoaded,
+    columnFilters,
+    sortColumnId,
+    sortDirection,
+    hiddenColumnIds,
+    columnOptions,
+    isShowingRecentOnly,
+    savedViews,
+    selectedViewId,
+    currentViewState,
+  } = useUnlockedResponses()
+
+  const exportSubmissionIds =
+    isDelightfulDashboard &&
+    isFullyLoaded &&
+    visibleSubmissionIds &&
+    visibleSubmissionIds.length <= CSV_BUFFER_MAX_RESPONSES
+      ? visibleSubmissionIds
+      : undefined
+
+  // The generator holds every record until download, so it can order and
+  // project them however the table is showing them, at any response count.
+  //
+  // The id list is what the table itself matched, against rendered cells rather
+  // than stored answers, so it decides the rows whenever it is there and the
+  // generator's own search stands in only past the count it can be built for.
+  const csvView = useMemo((): CsvExportView | undefined => {
+    if (!isDelightfulDashboard) return undefined
+    return {
+      ...(exportSubmissionIds ? {} : { columnFilters }),
+      sortColumnId,
+      sortDirection,
+      hiddenColumnIds,
+      // Until the table has reported its columns there is no list to hold
+      // the export to, and an empty one would drop every reserved column.
+      ...(columnOptions.length
+        ? { tableColumnIds: columnOptions.map(({ id }) => id) }
+        : {}),
+    }
+  }, [
+    columnFilters,
+    columnOptions,
+    exportSubmissionIds,
+    hiddenColumnIds,
+    isDelightfulDashboard,
+    sortColumnId,
+    sortDirection,
+  ])
+
+  const DEFAULT_DOWNLOAD_OPTIONS: DownloadOptions = useMemo(
+    () => ({
+      isDownloadAttachments: false,
+      isDownloadCsv: false,
+      isDownloadPdf: false,
+    }),
+    [],
+  )
+  const [downloadOptions, setDownloadOptions] = useState<DownloadOptions>(
+    DEFAULT_DOWNLOAD_OPTIONS,
+  )
+  const resetDownloadOptions = useCallback(() => {
+    setDownloadOptions(DEFAULT_DOWNLOAD_OPTIONS)
+  }, [DEFAULT_DOWNLOAD_OPTIONS])
+
+  const {
+    isOpen: isDownloadModalOpen,
+    onClose: onDownloadModalClose,
+    onOpen: onDownloadModalOpen,
+  } = useDisclosure({
+    // Reset metadata if it exists.
+    onOpen: () => resetDownloadMetadataAndProgress(),
+  })
+  const { isOpen: isProgressModalOpen, onClose: onProgressModalClose } =
+    useDisclosure({
+      // Reset metadata if it exists.
+      onOpen: () => resetDownloadMetadataAndProgress(),
+    })
+
+  const toast = useToast({
+    isClosable: true,
+  })
+
+  const { downloadParams, dateRangeResponsesCount: totalResponsesInRange } =
+    useStorageResponsesContext()
+
+  const dateRangeResponsesCount =
+    exportSubmissionIds?.length ?? totalResponsesInRange
+
+  const isResponsesCountHidden =
+    isDelightfulDashboard &&
+    isShowingRecentOnly &&
+    isCsvOnlyDownload(downloadOptions)
+
+  const [_downloadCount, setDownloadCount] = useState(0)
+  const [_pdfGenerationCount, setPdfGenerationCount] = useState(0)
+  const downloadCount = useThrottle(_downloadCount, 1000)
+  const pdfGenerationCount = useThrottle(_pdfGenerationCount, 1000)
+
+  const downloadPercentage = useMemo(() => {
+    if (!dateRangeResponsesCount) return 0
+    const currentDecryptAndPdfCount = downloadCount + pdfGenerationCount
+    const totalDecryptAndPdfCount = downloadOptions.isDownloadPdf
+      ? dateRangeResponsesCount * 2
+      : dateRangeResponsesCount
+    return Math.floor(
+      (currentDecryptAndPdfCount / totalDecryptAndPdfCount) * 100,
+    )
+  }, [
+    downloadCount,
+    pdfGenerationCount,
+    dateRangeResponsesCount,
+    downloadOptions.isDownloadPdf,
+  ])
+
+  const [downloadMetadata, setDownloadMetadata] = useState<
+    DownloadResult | CanceledResult
+  >()
+
+  const resetDownloadProgress = useCallback(() => {
+    setDownloadCount(0)
+    setPdfGenerationCount(0)
+  }, [])
+  const resetDownloadMetadataAndProgress = useCallback(() => {
+    setDownloadMetadata(undefined)
+    resetDownloadProgress()
+  }, [resetDownloadProgress])
+
+  const { handleBulkDownloadMutation, abortDecryption } = useDecryptionWorkers({
+    onDecryptionProgress: setDownloadCount,
+    onPdfGenerationProgress: setPdfGenerationCount,
+    mutateProps: {
+      onMutate: () => {
+        resetDownloadMetadataAndProgress()
+      },
+      onSuccess: ({ successCount, expectedCount, errorCount }) => {
+        if (downloadParams?.responsesCount === 0) {
+          toast({
+            description: 'No responses to download',
+          })
+          return
+        }
+        if (errorCount > 0) {
+          toast({
+            status: 'warning',
+            description: simplur`Partial success. ${successCount}/${expectedCount} ${[
+              successCount,
+            ]}response[|s] [was|were] decrypted. ${errorCount} failed.`,
+          })
+          return
+        }
+        toast({
+          description: simplur`Success. ${successCount}/${expectedCount} ${[
+            successCount,
+          ]}response[|s] [was|were] decrypted.`,
+        })
+      },
+      onError: () => {
+        toast({
+          status: 'danger',
+          description: 'Failed to start download. Please try again later.',
+        })
+      },
+      onSettled: (decryptResult) => {
+        setDownloadMetadata(decryptResult)
+        resetDownloadProgress()
+        resetDownloadOptions()
+      },
+    },
+  })
+
+  const handleBulkDownload = useCallback(() => {
+    if (!downloadParams) return
+    const selectedSavedView = isDelightfulDashboard
+      ? savedViews.find(({ _id }) => _id === selectedViewId)
+      : undefined
+    logAnalyticsEvent(formId, {
+      type: AnalyticsEventType.ResultsDownload,
+      content: {
+        dashboardVersion: isDelightfulDashboard ? 'v2' : 'v1',
+        formats: toDownloadFormats(downloadOptions),
+        scope: 'bulk',
+        ...(selectedSavedView
+          ? {
+              savedViewId: selectedSavedView._id,
+              isSavedViewModified: !matchesSavedView(
+                currentViewState,
+                [selectedSavedView],
+                columnOptions,
+              ),
+            }
+          : {}),
+        ...(dateRangeResponsesCount !== undefined
+          ? { responsesCount: dateRangeResponsesCount }
+          : {}),
+      },
+    })
+    datadogLogs.logger.info('Bulk download used', {
+      meta: {
+        action: 'bulkDownload',
+        isDownloadCsv: downloadOptions.isDownloadCsv,
+        isDownloadAttachments: downloadOptions.isDownloadAttachments,
+        isDownloadPdf: downloadOptions.isDownloadPdf,
+      },
+    })
+    return handleBulkDownloadMutation.mutate({
+      ...downloadParams,
+      ...(exportSubmissionIds
+        ? { visibleSubmissionIds: exportSubmissionIds }
+        : {}),
+      ...(csvView ? { csvView } : {}),
+      downloadAttachments: downloadOptions.isDownloadAttachments,
+      isDownloadCsv: downloadOptions.isDownloadCsv,
+      isDownloadPdf: downloadOptions.isDownloadPdf,
+    })
+  }, [
+    downloadParams,
+    isDelightfulDashboard,
+    savedViews,
+    formId,
+    downloadOptions,
+    dateRangeResponsesCount,
+    handleBulkDownloadMutation,
+    exportSubmissionIds,
+    csvView,
+    selectedViewId,
+    currentViewState,
+    columnOptions,
+  ])
+
+  const resetDownload = useCallback(() => {
+    resetDownloadProgress()
+    abortDecryption()
+    onProgressModalClose()
+  }, [abortDecryption, onProgressModalClose, resetDownloadProgress])
+
+  const handleModalClose = useCallback(() => {
+    resetDownload()
+    onDownloadModalClose()
+    onProgressModalClose()
+    resetDownloadMetadataAndProgress()
+  }, [
+    onDownloadModalClose,
+    onProgressModalClose,
+    resetDownload,
+    resetDownloadMetadataAndProgress,
+  ])
+
+  const handleNoAttachmentsDownloadCancel = useCallback(() => {
+    handleModalClose()
+    toast({
+      status: 'warning',
+      description: 'Responses download has been canceled.',
+    })
+    setDownloadMetadata({ isCanceled: true })
+  }, [handleModalClose, toast])
+
+  const handleAttachmentsDownloadCancel = useCallback(() => {
+    resetDownload()
+    setDownloadMetadata({ isCanceled: true })
+  }, [resetDownload])
+
+  const { t } = useTranslation()
+
+  return (
+    <>
+      <NavigationPrompt
+        title={t(
+          'features.adminForm.responses.responsesPage.storage.unlockedResponses.downloadButton.navigateAwayPrompt.title',
+        )}
+        description={t(
+          'features.adminForm.responses.responsesPage.storage.unlockedResponses.downloadButton.navigateAwayPrompt.description',
+        )}
+        confirmButtonText={t(
+          'features.adminForm.responses.responsesPage.storage.unlockedResponses.downloadButton.navigateAwayPrompt.confirmButtonText',
+        )}
+        when={handleBulkDownloadMutation.isLoading}
+      />
+      {dateRangeResponsesCount !== undefined && (
+        <DownloadWithAttachmentModal
+          responsesCount={dateRangeResponsesCount}
+          isOpen={isDownloadModalOpen}
+          onClose={handleModalClose}
+          onDownload={handleBulkDownload}
+          onCancel={handleAttachmentsDownloadCancel}
+          downloadPercentage={downloadPercentage}
+          isDownloading={handleBulkDownloadMutation.isLoading}
+          downloadMetadata={downloadMetadata}
+          downloadOptions={downloadOptions}
+          isCsvFollowingTable={isDelightfulDashboard}
+          isResponsesCountHidden={isResponsesCountHidden}
+        />
+      )}
+      {dateRangeResponsesCount !== undefined && (
+        <ProgressModal
+          isOpen={isProgressModalOpen}
+          onClose={handleModalClose}
+          onCancel={handleNoAttachmentsDownloadCancel}
+          downloadPercentage={downloadPercentage}
+          downloadMetadata={downloadMetadata}
+        >
+          <Text mb="1rem">
+            {t(
+              'features.adminForm.responses.responsesPage.storage.unlockedResponses.downloadButton.progressModalContent',
+            )}
+          </Text>
+        </ProgressModal>
+      )}
+      <Box>
+        <Menu closeOnSelect={false} placement="bottom-end">
+          {({ isOpen, onClose }) => (
+            <>
+              {isIconOnly ? (
+                <MenuButton
+                  as={IconButton}
+                  isDisabled={!downloadParams}
+                  isLoading={handleBulkDownloadMutation.isLoading}
+                  isActive={isOpen}
+                  aria-label={t(
+                    'features.adminForm.responses.responsesPage.storage.unlockedResponses.downloadButton.label',
+                  )}
+                  icon={<BiDownload fontSize="1.25rem" />}
+                />
+              ) : (
+                <MenuButton
+                  as={Button}
+                  isDisabled={!downloadParams}
+                  isLoading={handleBulkDownloadMutation.isLoading}
+                  isActive={isOpen}
+                  aria-label={t(
+                    'features.adminForm.responses.responsesPage.storage.unlockedResponses.downloadButton.label',
+                  )}
+                  leftIcon={<BiDownload fontSize="1.25rem" />}
+                  rightIcon={isOpen ? <BxsChevronUp /> : <BxsChevronDown />}
+                >
+                  {t('features.common.download')}
+                </MenuButton>
+              )}
+              <MenuList>
+                <DownloadSelector
+                  onClickNext={() => {
+                    onClose()
+                    onDownloadModalOpen()
+                  }}
+                  onDownload={() => {
+                    onClose()
+                    handleBulkDownload()
+                  }}
+                  downloadOptions={downloadOptions}
+                  setDownloadOptions={setDownloadOptions}
+                  isCsvConfirmed={isDelightfulDashboard}
+                />
+              </MenuList>
+            </>
+          )}
+        </Menu>
+      </Box>
+    </>
+  )
+}

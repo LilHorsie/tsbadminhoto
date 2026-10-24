@@ -1,0 +1,139 @@
+import { Controller, useForm } from 'react-hook-form'
+import {
+  FormControl,
+  FormErrorMessage,
+  FormLabel,
+  SimpleGrid,
+  Text,
+} from '@chakra-ui/react'
+import { Meta, StoryFn } from '@storybook/react-vite'
+
+import { viewportModes } from '~utils/storybook'
+import Button from '~components/Button'
+
+import { YesNo, YesNoProps } from './YesNo'
+
+export default {
+  title: 'Components/Field/YesNo',
+  component: YesNo,
+  decorators: [],
+} as Meta
+
+const Template: StoryFn<YesNoProps> = (args) => <YesNo {...args} />
+export const Default = Template.bind({})
+Default.parameters = { argos: { modes: viewportModes('tablet', 'mobile') } }
+Default.args = {
+  name: 'testInput',
+}
+
+const TemplateGroup: StoryFn<YesNoProps> = (args) => (
+  <SimpleGrid
+    columns={2}
+    spacing={8}
+    templateColumns="max-content auto"
+    alignItems="center"
+  >
+    <Text>primary</Text>
+    <YesNo {...args} colorScheme="primary" />
+    <Text>theme-green</Text>
+    <YesNo {...args} colorScheme="theme-green" />
+    <Text>theme-teal</Text>
+    <YesNo {...args} colorScheme="theme-teal" />
+    <Text>theme-purple</Text>
+    <YesNo {...args} colorScheme="theme-purple" />
+    <Text>theme-grey</Text>
+    <YesNo {...args} colorScheme="theme-grey" />
+    <Text>theme-yellow</Text>
+    <YesNo {...args} colorScheme="theme-yellow" />
+    <Text>theme-orange</Text>
+    <YesNo {...args} colorScheme="theme-orange" />
+    <Text>theme-red</Text>
+    <YesNo {...args} colorScheme="theme-red" />
+    <Text>theme-brown</Text>
+    <YesNo {...args} colorScheme="theme-brown" />
+  </SimpleGrid>
+)
+export const Selected = TemplateGroup.bind({})
+Selected.args = {
+  name: 'testInput',
+  defaultValue: 'Yes',
+}
+Selected.parameters = {
+  controls: {
+    include: ['name', 'isDisabled'],
+  },
+}
+
+export const Disabled = TemplateGroup.bind({})
+Disabled.args = {
+  name: 'testInput',
+  defaultValue: 'No',
+  isDisabled: true,
+}
+Disabled.parameters = {
+  controls: {
+    include: ['name', 'isDisabled'],
+  },
+}
+
+export const DisabledHighContrast = TemplateGroup.bind({})
+DisabledHighContrast.args = {
+  name: 'testInput',
+  defaultValue: 'No',
+  isDisabled: true,
+  isHighContrast: true,
+}
+DisabledHighContrast.parameters = {
+  controls: {
+    include: ['name', 'isDisabled', 'isHighContrast'],
+  },
+}
+
+export const Playground: StoryFn = ({
+  name,
+  label,
+  isDisabled,
+  isRequired,
+  ...args
+}) => {
+  const {
+    handleSubmit,
+    control,
+    formState: { errors },
+  } = useForm()
+  const onSubmit = (data: unknown) => alert(JSON.stringify(data))
+
+  return (
+    <form onSubmit={handleSubmit(onSubmit)} noValidate>
+      <FormControl
+        isRequired={isRequired}
+        isDisabled={isDisabled}
+        isInvalid={!!errors[name]}
+        mb={6}
+      >
+        <FormLabel>{label}</FormLabel>
+        <Controller
+          control={control}
+          rules={{
+            required: isRequired
+              ? { value: true, message: 'Required field' }
+              : false,
+          }}
+          name={name}
+          render={({ field }) => (
+            <YesNo {...args} isDisabled={isDisabled} {...field} />
+          )}
+        />
+        <FormErrorMessage>{String(errors[name]?.message)}</FormErrorMessage>
+      </FormControl>
+      <Button type="submit">Submit</Button>
+    </form>
+  )
+}
+Playground.tags = ['playground']
+Playground.args = {
+  name: 'Test playground input',
+  label: 'YesNo field label',
+  isRequired: false,
+  isDisabled: false,
+}

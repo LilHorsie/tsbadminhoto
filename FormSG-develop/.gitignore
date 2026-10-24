@@ -1,0 +1,88 @@
+# OS generated file
+# =================
+.DS_Store
+
+# Node and related ecosystem
+# ==========================
+.nodemonignore
+npm-debug.log
+node_modules/
+lib/
+mockgoose/
+.pnpm-store/
+
+# MEAN.js app and assets
+# ======================
+dist/
+
+# API keys file
+# ==============
+!.ebextensions/*.config
+*.env
+*.pem
+*.cert
+*spcp-cert.pem
+*formsg-cert.pem
+*formsg-key.pem
+*passphrase*
+*.key
+
+# VSCode
+# ==============
+.dccache
+
+# Sublime editor
+# ==============
+*.sublime-project
+*.sublime-workspace
+
+# IntelliJ editor
+# ==============
+.idea/
+
+# General
+# =======
+*.log
+*.csv
+*.dat
+*.out
+*.pid
+*.gz
+*.tmp
+*.bak
+*.swp
+logs/
+build/
+tmp/
+
+# Elastic Beanstalk Files
+# =======
+.elasticbeanstalk/*
+!.elasticbeanstalk/*.cfg.yml
+!.elasticbeanstalk/*.global.yml
+
+# Localstack
+# =======
+.localstack
+
+# Tests
+# =======
+coverage/
+/test-results/
+/playwright-report/
+/playwright/.cache/
+
+# AI Configurations
+# =======
+.claude
+.agents
+
+# Scratch files (usually used for AI state/context handoff)
+# =======
+.scratch
+
+# Storybook builds
+storybook-static
+
+# Argos screenshots from the Storybook Vitest project
+screenshots

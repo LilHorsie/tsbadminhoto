@@ -1,0 +1,281 @@
+import React, { useCallback, useEffect, useMemo } from 'react'
+import { useTranslation } from 'react-i18next'
+import { BiCommentDetail } from 'react-icons/bi'
+import { useMutation } from 'react-query'
+import { Link as ReactLink } from 'react-router-dom'
+import {
+  As,
+  Box,
+  chakra,
+  Flex,
+  FlexProps,
+  HStack,
+  Icon,
+  useDisclosure,
+} from '@chakra-ui/react'
+import { delay } from 'lodash'
+
+import { BxsHelpCircle } from '~assets/icons/BxsHelpCircle'
+import { BxsRocket } from '~assets/icons/BxsRocket'
+import BrandMarkSvg from '~assets/svgs/brand/brand-mark-colour.svg?react'
+import {
+  FEATURE_REQUEST,
+  FORM_GUIDE,
+  FORM_GUIDE_WHATS_NEW,
+} from '~constants/links'
+import {
+  EMERGENCY_CONTACT_KEY_PREFIX,
+  ROLLOUT_ANNOUNCEMENT_KEY_PREFIX,
+} from '~constants/localStorage'
+import { DASHBOARD_ROUTE } from '~constants/routes'
+import { useIsMobile } from '~hooks/useIsMobile'
+import { useLocalStorage } from '~hooks/useLocalStorage'
+import { useToast } from '~hooks/useToast'
+import { getWogadLogoutUrl, logout } from '~services/AuthService'
+import IconButton from '~components/IconButton'
+import Link from '~components/Link'
+import { AvatarMenu, AvatarMenuDivider } from '~templates/AvatarMenu/AvatarMenu'
+
+import { EmergencyContactModal } from '~features/user/emergency-contact/EmergencyContactModal'
+import { useUser } from '~features/user/queries'
+import { TransferOwnershipModal } from '~features/user/transfer-ownership/TransferOwnershipModal'
+import { useAdminFeedbackStore } from '~features/workspace/components/AdminFeedbackContainer/adminFeedbackStore'
+
+import Menu from '../../components/Menu'
+
+const BrandSmallLogo = chakra(BrandMarkSvg)
+
+type AdminNavBarLinkProps = {
+  label: string
+  href: string
+  MobileIcon: As
+}
+
+const AdminNavBarLink = ({ MobileIcon, href, label }: AdminNavBarLinkProps) => {
+  const isMobile = useIsMobile()
+
+  if (isMobile && MobileIcon) {
+    return (
+      <Box position="relative">
+        <IconButton
+          variant="clear"
+          as="a"
+          href={href}
+          aria-label={label}
+          icon={<Icon as={MobileIcon} fontSize="1.25rem" color="primary.500" />}
+        />
+      </Box>
+    )
+  }
+
+  return (
+    <Box position="relative">
+      <Link
+        w="fit-content"
+        variant="standalone"
+        color="secondary.500"
+        href={href}
+        aria-label={label}
+        target="_blank"
+      >
+        {label}
+      </Link>
+    </Box>
+  )
+}
+
+export interface AdminNavBarProps {
+  /* This prop is only for testing to show expanded menu state */
+  isMenuOpen?: boolean
+}
+
+export const AdminNavBar = ({ isMenuOpen }: AdminNavBarProps): JSX.Element => {
+  const { user, removeQuery } = useUser()
+  const toast = useToast({ status: 'success', isClosable: true })
+
+  const ROLLOUT_ANNOUNCEMENT_KEY = useMemo(
+    () => ROLLOUT_ANNOUNCEMENT_KEY_PREFIX + user?._id,
+    [user],
+  )
+  const [hasSeenAnnouncement] = useLocalStorage<boolean>(
+    ROLLOUT_ANNOUNCEMENT_KEY,
+    false,
+  )
+
+  // Only want to show the emergency contact modal if user id exists but user has no emergency contact
+  const emergencyContactKey = useMemo(
+    () =>
+      user && user._id && !user.contact
+        ? EMERGENCY_CONTACT_KEY_PREFIX + user._id
+        : null,
+    [user],
+  )
+
+  const [hasSeenContactModal, setHasSeenContactModal] =
+    useLocalStorage<boolean>(emergencyContactKey, false)
+
+  const {
+    isOpen: isContactModalOpen,
+    onClose: onContactModalClose,
+    onOpen: onContactModalOpen,
+  } = useDisclosure({
+    onClose: () => {
+      setHasSeenContactModal(true)
+    },
+  })
+
+  const {
+    isOpen: isTransferOwnershipModalOpen,
+    onClose: onTransferOwnershipModalClose,
+    onOpen: onTransferOwnershipModalOpen,
+  } = useDisclosure()
+
+  // Emergency contact modal appears after the rollout announcement modal
+  useEffect(() => {
+    if (
+      hasSeenContactModal === false &&
+      user &&
+      !user.contact &&
+      hasSeenAnnouncement === true
+    ) {
+      onContactModalOpen()
+    }
+  }, [hasSeenContactModal, onContactModalOpen, user, hasSeenAnnouncement])
+
+  const getWogadLogoutUrlMutation = useMutation(getWogadLogoutUrl)
+
+  const handleWogadLogout = useCallback(async () => {
+    const { logoutUrl: wogadLogoutUrl } =
+      await getWogadLogoutUrlMutation.mutateAsync()
+    window.location.assign(wogadLogoutUrl)
+  }, [getWogadLogoutUrlMutation])
+
+  const handleLogout = useCallback(() => {
+    // `logout` is an API call, not a page load, so the in-memory feedback store
+    // survives it. Clear it so the next admin in this tab does not inherit the
+    // previous admin's eligibility, triggerSource and formId.
+    useAdminFeedbackStore.getState().reset()
+    logout()
+    removeQuery()
+    if (emergencyContactKey) {
+      localStorage.removeItem(emergencyContactKey)
+    }
+    if (user?.grantSource === 'sso') {
+      toast({
+        title: 'You have been logged out of FormSG.',
+        description: 'To log out from SSO, visit https://sso.open.gov.sg',
+        status: 'success',
+      })
+    }
+    // v1 one.gov.sg logout is local-only (suite ADR-0003), so tell the user
+    // their IdP session is still live rather than silently leaving it open.
+    if (user?.grantSource === 'one') {
+      toast({
+        title: 'You have been logged out of FormSG.',
+        description: 'To log out from one.gov.sg, visit https://one.gov.sg',
+        status: 'success',
+      })
+    }
+    if (user?.grantSource === 'wogad') {
+      toast({
+        description:
+          'You have been logged out of FormSG. Redirecting to WOG AD to logout...',
+        status: 'success',
+      })
+      delay(handleWogadLogout, 1000) // Delay to allow user to read toast before redirecting.
+    }
+  }, [emergencyContactKey, handleWogadLogout, removeQuery, toast, user])
+
+  const { t } = useTranslation()
+
+  const navLinks: AdminNavBarLinkProps[] = [
+    {
+      label: t('features.app.adminNavBar.linkLabel.featureRequest'),
+      href: FEATURE_REQUEST,
+      MobileIcon: BiCommentDetail,
+    },
+    {
+      label: t('features.app.adminNavBar.linkLabel.formGuide'),
+      href: FORM_GUIDE,
+      MobileIcon: BxsHelpCircle,
+    },
+    {
+      label: t('features.app.adminNavBar.whatsNew'),
+      href: FORM_GUIDE_WHATS_NEW,
+      MobileIcon: BxsRocket,
+    },
+  ]
+
+  return (
+    <>
+      <AdminNavBar.Container>
+        <ReactLink
+          title={t('features.app.adminNavBar.logoTitle')}
+          to={DASHBOARD_ROUTE}
+        >
+          {<BrandSmallLogo w="2rem" />}
+        </ReactLink>
+        <HStack
+          textStyle="subhead-1"
+          spacing={{ base: '0.75rem', md: '1.5rem' }}
+        >
+          {navLinks.map((link, index) => (
+            <AdminNavBarLink key={index} {...link} />
+          ))}
+          <AvatarMenu
+            name={user?.email}
+            menuUsername={user?.email}
+            defaultIsOpen={isMenuOpen}
+            menuListProps={{ maxWidth: '19rem' }}
+          >
+            <Menu.Item as={ReactLink} to="/billing">
+              {t('features.app.adminNavBar.avatarMenuItem.billing')}
+            </Menu.Item>
+            <Menu.Item onClick={onContactModalOpen}>
+              {t('features.app.adminNavBar.avatarMenuItem.emergencyContact')}
+            </Menu.Item>
+            <Menu.Item onClick={onTransferOwnershipModalOpen}>
+              {t('features.app.adminNavBar.avatarMenuItem.transferAllForms')}
+            </Menu.Item>
+            <AvatarMenuDivider />
+            <Menu.Item onClick={handleLogout}>
+              {t('features.common.logout')}
+            </Menu.Item>
+          </AvatarMenu>
+        </HStack>
+      </AdminNavBar.Container>
+      <EmergencyContactModal
+        onClose={onContactModalClose}
+        isOpen={isContactModalOpen}
+      />
+      <TransferOwnershipModal
+        onClose={onTransferOwnershipModalClose}
+        isOpen={isTransferOwnershipModalOpen}
+      />
+    </>
+  )
+}
+
+interface AdminNavBarContainerProps extends FlexProps {
+  children: React.ReactNode
+}
+
+AdminNavBar.Container = ({
+  children,
+  ...props
+}: AdminNavBarContainerProps): JSX.Element => {
+  return (
+    <Flex
+      justify="space-between"
+      align="center"
+      px={{ base: '1.5rem', md: '1.8rem', xl: '2rem' }}
+      py="0.75rem"
+      bg="white"
+      borderBottom="1px"
+      borderBottomColor="neutral.300"
+      {...props}
+    >
+      {children}
+    </Flex>
+  )
+}

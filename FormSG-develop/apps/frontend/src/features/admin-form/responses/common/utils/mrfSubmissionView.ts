@@ -1,0 +1,148 @@
+import {
+  AdminFormDto,
+  FormResponseMode,
+  StrippedFormWorkflowDto,
+  SubmissionMetadata,
+  SubmissionMrfMetadata,
+  SubmittedStep,
+  WorkflowStatus,
+} from 'formsg-shared/types'
+
+/**
+ * A multi-respondent form with no steps has nothing to route, so none of the
+ * workflow readings mean anything for it.
+ */
+export const hasWorkflowSteps = (form?: AdminFormDto): boolean =>
+  form?.responseMode === FormResponseMode.Multirespondent &&
+  (form.workflow?.length ?? 0) > 0
+
+export const hasWorkflowSubmission = (
+  metadata: Pick<SubmissionMetadata, 'mrf'>[],
+): boolean => metadata.some(({ mrf }) => (mrf?.workflowNumTotalSteps ?? 0) > 0)
+
+export enum MRF_STATUS {
+  COMPLETED = 'Completed',
+  PENDING = 'Pending',
+  APPROVED = 'Approved',
+  REJECTED = 'Not approved',
+  STOPPED = 'Stopped',
+}
+
+interface CurrentWorkflowInfo {
+  workflowStatus: WorkflowStatus
+  workflowCurrentStepNumber: number // note that this is 1-indexed
+  workflowNumTotalSteps: number
+}
+
+/** Gets the business friendly message for the current pending step of the workflow.  */
+export const getPendingResponseAtString = ({
+  workflowStatus,
+  workflowCurrentStepNumber,
+  workflowNumTotalSteps,
+}: CurrentWorkflowInfo) => {
+  const isPending =
+    workflowStatus === WorkflowStatus.PENDING &&
+    workflowCurrentStepNumber < workflowNumTotalSteps
+  if (!isPending) {
+    return '-'
+  }
+
+  // The form is currently completed until step N.
+  // Thus, it should mean that it is pending the response of N+1
+  const pendingStep = workflowCurrentStepNumber + 1
+
+  return getCurrentStepString({
+    workflowCurrentStepNumber: pendingStep,
+    workflowNumTotalSteps,
+  })
+}
+
+/** Gets the business friendly string for current step of workflow. */
+const getCurrentStepString = ({
+  workflowCurrentStepNumber,
+  workflowNumTotalSteps,
+}: Pick<
+  CurrentWorkflowInfo,
+  'workflowNumTotalSteps' | 'workflowCurrentStepNumber'
+>) => {
+  return workflowCurrentStepNumber && workflowNumTotalSteps
+    ? `Step ${workflowCurrentStepNumber} of ${workflowNumTotalSteps}`
+    : ''
+}
+
+const WORKFLOW_STATUS_TEXT: Record<WorkflowStatus, MRF_STATUS> = {
+  [WorkflowStatus.PENDING]: MRF_STATUS.PENDING,
+  [WorkflowStatus.COMPLETED]: MRF_STATUS.COMPLETED,
+  [WorkflowStatus.APPROVED]: MRF_STATUS.APPROVED,
+  [WorkflowStatus.REJECTED]: MRF_STATUS.REJECTED,
+}
+
+/**
+ * The status as the responses table shows it, so search can match it. A stop
+ * overrides the workflow status, as in the CSV export. Unlike
+ * getStatusFromWorkflowStatus, an unknown or missing status reads as empty
+ * instead of throwing during render.
+ */
+export const getWorkflowStatusText = (
+  mrf?: Pick<
+    NonNullable<SubmissionMrfMetadata>,
+    'workflowStatus' | 'stoppedAt'
+  >,
+): MRF_STATUS | '' => {
+  if (!mrf?.workflowStatus) return ''
+  if (mrf.stoppedAt) return MRF_STATUS.STOPPED
+  return WORKFLOW_STATUS_TEXT[mrf.workflowStatus] ?? ''
+}
+
+/** Gets the business friendly string for MRF submission status. */
+export const getStatusFromWorkflowStatus = (
+  workflowStatus: WorkflowStatus,
+): MRF_STATUS => {
+  switch (workflowStatus) {
+    case WorkflowStatus.COMPLETED:
+      return MRF_STATUS.COMPLETED
+    case WorkflowStatus.APPROVED:
+      return MRF_STATUS.APPROVED
+    case WorkflowStatus.REJECTED:
+      return MRF_STATUS.REJECTED
+    case WorkflowStatus.PENDING:
+      return MRF_STATUS.PENDING
+    default: {
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      const _: never = workflowStatus
+      throw new Error('Invalid WorkflowStatus encountered.')
+    }
+  }
+}
+
+export type getWorkflowStatusFromFormResponseProps = {
+  index: number
+  workflow: StrippedFormWorkflowDto
+  submittedSteps: SubmittedStep[]
+}
+
+/** Gets a step's workflow status from workflow steps and MRF submmission steps */
+export const getWorkflowStatusFromFormResponse = ({
+  index,
+  workflow,
+  submittedSteps,
+}: getWorkflowStatusFromFormResponseProps): WorkflowStatus => {
+  const submittedStep = submittedSteps[index]
+
+  // Steps that haven't been submitted must be PENDING
+  if (index >= submittedSteps.length) {
+    return WorkflowStatus.PENDING
+  }
+
+  // Return the ApprovalStatus of approval steps (either APPROVED or REJECTED)
+  if (
+    workflow[index].approval_field &&
+    submittedStep !== undefined &&
+    'status' in submittedStep
+  ) {
+    return submittedStep.status
+  }
+
+  // Otherwise, the step is COMPLETED
+  return WorkflowStatus.COMPLETED
+}

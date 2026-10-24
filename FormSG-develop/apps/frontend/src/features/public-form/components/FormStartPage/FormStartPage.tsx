@@ -1,0 +1,50 @@
+import { useMemo } from 'react'
+
+import { usePublicFormContext } from '~features/public-form/PublicFormContext'
+
+import { useFormSections } from '../FormFields/FormSectionsContext'
+
+import { FormHeader } from './FormHeader'
+import { useFormHeader } from './useFormHeader'
+
+interface FormStartPageProps {
+  hasStickyPreviewBanner?: boolean
+}
+export const FormStartPage = ({
+  hasStickyPreviewBanner,
+}: FormStartPageProps): JSX.Element => {
+  const {
+    form,
+    spcpSession,
+    submissionData,
+    miniHeaderRef,
+    onMobileDrawerOpen,
+    handleLogout,
+  } = usePublicFormContext()
+  const { activeSectionId } = useFormSections()
+
+  const showHeaderAndMiniHeader = useMemo(
+    () => !submissionData,
+    [submissionData],
+  )
+
+  const formHeaderProps = useFormHeader({
+    startPage: form?.startPage,
+    closeAt: form?.closeAt,
+  })
+
+  return (
+    <FormHeader
+      title={form?.title}
+      showHeader={showHeaderAndMiniHeader}
+      loggedInId={spcpSession?.userName}
+      showMiniHeader={showHeaderAndMiniHeader}
+      activeSectionId={activeSectionId}
+      miniHeaderRef={miniHeaderRef}
+      onMobileDrawerOpen={onMobileDrawerOpen}
+      handleLogout={handleLogout}
+      hasStickyPreviewBanner={hasStickyPreviewBanner}
+      {...formHeaderProps}
+    />
+  )
+}

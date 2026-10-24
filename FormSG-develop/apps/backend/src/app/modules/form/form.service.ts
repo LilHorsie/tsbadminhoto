@@ -1,0 +1,974 @@
+import {
+  BasicField,
+  FormAuthType,
+  FormField,
+  FormFieldDto,
+  FormResponseMode,
+  FormStatus,
+  Language,
+  PublicFormDto,
+  SubmissionType,
+} from 'formsg-shared/types'
+import { encryptString } from 'formsg-shared/utils/crypto'
+import moment from 'moment-timezone'
+import mongoose from 'mongoose'
+import { err, errAsync, ok, okAsync, Result, ResultAsync } from 'neverthrow'
+import { decodeBase64 } from 'tweetnacl-util'
+
+import {
+  IEmailFormModel,
+  IEncryptedFormModel,
+  IFormSchema,
+  IMultirespondentFormModel,
+  IPopulatedForm,
+} from '../../../types'
+import { smsConfig } from '../../config/features/sms.config'
+import { createLoggerWithLabel } from '../../config/logger'
+import { TIMEZONE } from '../../constants/timezone'
+import getFormModel, {
+  getEmailFormModel,
+  getEncryptedFormModel,
+  getMultirespondentFormModel,
+} from '../../models/form.server.model'
+import getFormWhitelistSubmitterIdsModel from '../../models/form_whitelist.server.model'
+import getSubmissionModel from '../../models/submission.server.model'
+import MailService from '../../services/mail/mail.service'
+import * as SmsService from '../../services/sms/sms.service'
+import {
+  getMongoErrorMessage,
+  transformMongoError,
+} from '../../utils/handle-mongo-error'
+import {
+  ApplicationError,
+  DatabaseError,
+  PossibleDatabaseError,
+} from '../core/core.errors'
+import { IntranetService } from '../intranet/intranet.service'
+import { getMyInfoFieldOptions } from '../myinfo/myinfo.util'
+import { MissingSubmitterIdError } from '../submission/submission.errors'
+import * as SubmissionService from '../submission/submission.service'
+
+import {
+  FormDeletedError,
+  FormNotFoundError,
+  FormWhitelistSettingNotFoundError,
+  PrivateFormError,
+} from './form.errors'
+import {
+  getCollabEmailsWithPermission,
+  hasVerifiableMobileFieldformFields,
+} from './form.utils'
+
+const logger = createLoggerWithLabel(module)
+const FormModel = getFormModel(mongoose)
+const EmailFormModel = getEmailFormModel(mongoose)
+const EncryptedFormModel = getEncryptedFormModel(mongoose)
+const MultirespondentFormModel = getMultirespondentFormModel(mongoose)
+const SubmissionModel = getSubmissionModel(mongoose)
+const FormWhitelistSubmitterIdsModel =
+  getFormWhitelistSubmitterIdsModel(mongoose)
+
+/**
+ * Deactivates a given form by its id
+ * @param formId the id of the form to deactivate
+ * @returns ok(true) if the form has been deactivated successfully
+ * @returns err(PossibleDatabaseError) if an error occurred while trying to deactivate the form
+ * @returns err(FormNotFoundError) if there is no form with the given formId
+ */
+export const deactivateForm = (
+  formId: string,
+): ResultAsync<IFormSchema, PossibleDatabaseError | FormNotFoundError> => {
+  return ResultAsync.fromPromise(FormModel.deactivateById(formId), (error) => {
+    logger.error({
+      message: 'Error deactivating form by id',
+      meta: {
+        action: 'deactivateForm',
+        form: formId,
+      },
+      error,
+    })
+
+    return transformMongoError(error)
+  }).andThen((deactivatedForm) => {
+    if (!deactivatedForm) {
+      logger.error({
+        message:
+          'Attempted to deactivate form that cannot be found in the database',
+        meta: {
+          action: 'deactivateForm',
+          form: formId,
+        },
+      })
+      return errAsync(new FormNotFoundError())
+    }
+    // Successfully deactivated.
+    return okAsync(deactivatedForm)
+  })
+}
+
+/**
+ * Retrieves the fully populated form of the given formId.
+ * @param formId the id of the form to retrieve
+ * @returns ok(fully populated form) if form exists
+ * @returns err(FormNotFoundError) if the form or form admin does not exist
+ * @returns err(DatabaseError) if error occurs whilst querying the database
+ */
+export const retrieveFullFormById = (
+  formId: string,
+): ResultAsync<IPopulatedForm, FormNotFoundError | DatabaseError> => {
+  if (!mongoose.Types.ObjectId.isValid(formId)) {
+    return errAsync(new FormNotFoundError())
+  }
+
+  return ResultAsync.fromPromise(FormModel.getFullFormById(formId), (error) => {
+    logger.error({
+      message: 'Error retrieving form from database',
+      meta: {
+        action: 'retrieveFullFormById',
+      },
+      error,
+    })
+    return new DatabaseError()
+  }).andThen((result) => {
+    // Either form not found, or form admin is not in the database anymore.
+    // The latter is less likely, but guarding it just in case. Treat as form
+    // not found since form has no ownership.
+    if (!result || !result.admin) {
+      return errAsync(new FormNotFoundError())
+    }
+
+    return okAsync(result)
+  })
+}
+
+/**
+ * Retrieves the specified form fields of the given formId
+ * @param formId the id of the form
+ * @param fields an array of field names to retrieve
+ * @returns ok(form) if form exists
+ * @returns err(FormNotFoundError) if the form or form admin does not exist
+ * @returns err(DatabaseError) if error occurs whilst querying the database
+ */
+export const retrieveFormKeysById = (
+  formId: string,
+  fields: (keyof IPopulatedForm)[],
+): ResultAsync<IPopulatedForm, FormNotFoundError | DatabaseError> => {
+  if (!mongoose.Types.ObjectId.isValid(formId)) {
+    return errAsync(new FormNotFoundError())
+  }
+
+  return ResultAsync.fromPromise(
+    FormModel.getFullFormById(formId, fields),
+    (error) => {
+      logger.error({
+        message: 'Error retrieving form from database',
+        meta: {
+          action: 'retrieveFormKeysById',
+        },
+        error,
+      })
+      return new DatabaseError()
+    },
+  ).andThen((result) =>
+    result ? okAsync(result) : errAsync(new FormNotFoundError()),
+  )
+}
+
+/**
+ * Retrieves (non-populated) form document of the given formId.
+ * @param formId the id of the form to retrieve
+ * @returns ok(form) if form exists
+ * @returns err(FormNotFoundError) if the form or form admin does not exist
+ * @returns err(DatabaseError) if error occurs whilst querying the database
+ */
+export const retrieveFormById = (
+  formId: string,
+): ResultAsync<IFormSchema, FormNotFoundError | DatabaseError> => {
+  if (!mongoose.Types.ObjectId.isValid(formId)) {
+    return errAsync(new FormNotFoundError())
+  }
+
+  return ResultAsync.fromPromise(FormModel.findById(formId).exec(), (error) => {
+    logger.error({
+      message: 'Error retrieving form from database',
+      meta: {
+        action: 'retrieveFormById',
+        formId,
+      },
+      error,
+    })
+    return new DatabaseError(getMongoErrorMessage(error))
+  }).andThen((result) => {
+    // Either form not found, or form admin is not in the database anymore.
+    // The latter is less likely, but guarding it just in case. Treat as form
+    // not found since form has no ownership.
+    if (!result || !result.admin) {
+      return errAsync(new FormNotFoundError())
+    }
+
+    return okAsync(result)
+  })
+}
+
+const hasPassedCloseAt = (form: IPopulatedForm): boolean =>
+  !!form.closeAt && new Date(form.closeAt) <= new Date()
+
+/**
+ * Method to ensure given form is available to the public.
+ *
+ * The closeAt check is what enforces a deadline; the sweep only lags behind it.
+ * Unlike the submission limit check this does not deactivate the form, which
+ * would drop it from the sweep's `status: Public` query and leave the admin
+ * unnotified.
+ *
+ * @param form the form to check
+ * @returns ok(true) if form is public
+ * @returns err(ApplicationError) if form has an invalid state
+ * @returns err(FormDeletedError) if form has been deleted
+ * @returns err(PrivateFormError) if form is private or past its scheduled
+ * expiry; the message will be the form inactive message
+ */
+export const isFormPublic = (
+  form: IPopulatedForm,
+): Result<true, FormDeletedError | PrivateFormError | ApplicationError> => {
+  if (!form.status) {
+    return err(new ApplicationError())
+  }
+  switch (form.status) {
+    case FormStatus.Public:
+      return hasPassedCloseAt(form)
+        ? err(new PrivateFormError(form.inactiveMessage, form.title))
+        : ok(true)
+    case FormStatus.Archived:
+      return err(new FormDeletedError())
+    case FormStatus.Private:
+      return err(new PrivateFormError(form.inactiveMessage, form.title))
+  }
+}
+
+/**
+ * Maximum number of forms closed in a single sweep. The remainder is picked up
+ * by the next run.
+ */
+export const CLOSE_EXPIRED_FORMS_BATCH_LIMIT = 500
+
+export type ClosedExpiredForm = {
+  formId: string
+  title: string
+  closeAt: Date
+  /** Admin plus collaborators. */
+  emailRecipients: string[]
+}
+
+/**
+ * Closes every public form whose scheduled expiry has passed. Idempotent: a
+ * closed form no longer matches the query.
+ *
+ * @param now the instant to evaluate deadlines against
+ * @param limit maximum forms to close in this sweep
+ * @returns ok(closed forms) listing what this sweep closed, capped at the batch limit
+ * @returns err(PossibleDatabaseError) if the query or update failed
+ */
+export const closeExpiredForms = (
+  now: Date = new Date(),
+  limit: number = CLOSE_EXPIRED_FORMS_BATCH_LIMIT,
+): ResultAsync<ClosedExpiredForm[], PossibleDatabaseError> => {
+  const logMeta = {
+    action: 'closeExpiredForms',
+    now: now.toISOString(),
+    limit,
+  }
+
+  return ResultAsync.fromPromise(
+    // Read before updating, so the caller learns which forms closed and can
+    // notify their admins. An updateMany alone would only yield a count.
+    FormModel.find({
+      status: FormStatus.Public,
+      // `$type: 'date'` rather than `$ne: null`, so the query provably matches
+      // the partial index's filter expression and is eligible to use it.
+      closeAt: { $type: 'date', $lte: now },
+    })
+      .select('_id title closeAt admin permissionList')
+      .populate({ path: 'admin', select: 'email' })
+      .limit(limit)
+      .lean()
+      .exec(),
+    (error) => {
+      logger.error({
+        message: 'Error finding forms past their scheduled closure',
+        meta: logMeta,
+        error,
+      })
+      return transformMongoError(error)
+    },
+  ).andThen((expiredForms) => {
+    if (expiredForms.length === 0) return okAsync([])
+
+    const formIds = expiredForms.map((form) => form._id)
+
+    return ResultAsync.fromPromise(
+      // Re-assert `status` so a form reopened between the read and the write
+      // is left alone.
+      FormModel.updateMany(
+        { _id: { $in: formIds }, status: FormStatus.Public },
+        { $set: { status: FormStatus.Private } },
+      ).exec(),
+      (error) => {
+        logger.error({
+          message: 'Error closing forms past their scheduled closure',
+          meta: { ...logMeta, formIds },
+          error,
+        })
+        return transformMongoError(error)
+      },
+    ).map((result) => {
+      logger.info({
+        message: 'Closed forms past their scheduled closure',
+        meta: {
+          ...logMeta,
+          matchedCount: expiredForms.length,
+          modifiedCount: result.modifiedCount,
+          isBatchFull: expiredForms.length === limit,
+        },
+      })
+
+      return expiredForms.map((form) => {
+        const adminEmail = (form.admin as unknown as { email?: string })?.email
+        return {
+          formId: String(form._id),
+          title: form.title,
+          // A wire-format DateString on the shared type, a BSON date here.
+          closeAt: new Date(form.closeAt as unknown as string | Date),
+          emailRecipients: adminEmail
+            ? [
+                adminEmail,
+                ...getCollabEmailsWithPermission(form.permissionList),
+              ]
+            : [],
+        }
+      })
+    })
+  })
+}
+
+/**
+ * Notifies each form's admin and collaborators that their form has closed.
+ *
+ * Never rejects: the forms are already closed, so a failed send must not fail
+ * the sweep. At-most-once — a closed form no longer matches the sweep, so a
+ * failure here is logged and counted rather than retried.
+ *
+ * @param closedForms the forms closed by this sweep
+ * @returns ok with how many notifications were sent and how many failed
+ */
+export const notifyFormsClosed = (
+  closedForms: ClosedExpiredForm[],
+): ResultAsync<{ sentCount: number; failedCount: number }, never> => {
+  const sends = closedForms.map((form) => {
+    if (form.emailRecipients.length === 0) {
+      logger.warn({
+        message: 'Closed form has no notification recipients',
+        meta: {
+          action: 'notifyFormsClosed',
+          formId: form.formId,
+        },
+      })
+      return okAsync(false)
+    }
+
+    return MailService.sendFormScheduledClosureNotification({
+      emailRecipients: form.emailRecipients,
+      formTitle: form.title,
+      formId: form.formId,
+      // 12-hour with the zone spelled out, since the email is read outside
+      // the app where nothing else establishes it.
+      closedAt: moment(form.closeAt)
+        .tz(TIMEZONE)
+        .format('D MMM YYYY, h:mm A [(SGT)]'),
+    })
+      .map(() => true)
+      .orElse((error) => {
+        logger.error({
+          message: 'Failed to send scheduled closure notification',
+          meta: {
+            action: 'notifyFormsClosed',
+            formId: form.formId,
+          },
+          error,
+        })
+        return okAsync(false)
+      })
+  })
+
+  return ResultAsync.combine(sends).map((results) => {
+    const sentCount = results.filter(Boolean).length
+    return {
+      sentCount,
+      failedCount: results.length - sentCount,
+    }
+  })
+}
+
+/**
+ * Method to check whether a form has reached submission limits, and deactivate the form if necessary
+ * @param form the form to check
+ * @returns ok(form) if submission is allowed because the form has not reached limits
+ * @returns err(PossibleDatabaseError) if an error occurred while querying the database for the specified form
+ * @returns err(FormNotFoundError) if the form has exceeded the submission limits but could not be found and deactivated
+ * @returns err(PrivateFormError) if the count of the form has been exceeded and the form has been deactivated
+ */
+export const checkFormSubmissionLimitAndDeactivateForm = (
+  form: IPopulatedForm,
+): ResultAsync<
+  IPopulatedForm,
+  PossibleDatabaseError | PrivateFormError | FormNotFoundError
+> => {
+  const logMeta = {
+    action: 'checkFormSubmissionLimitAndDeactivateForm',
+    formId: form._id,
+  }
+  const { submissionLimit } = form
+  const formId = String(form._id)
+  // Not using falsey check as submissionLimit === 0 can result in incorrectly
+  // returning form without any actions.
+  if (submissionLimit === null) return okAsync(form)
+
+  return SubmissionService.getFormSubmissionsCount({
+    formId,
+    formResponseMode: form.responseMode,
+  })
+    .mapErr((error) => {
+      logger.error({
+        message: 'Error while counting submissions for form',
+        meta: logMeta,
+        error,
+      })
+      return transformMongoError(error)
+    })
+    .andThen((currentCount) => {
+      // Limit has not been hit yet, passthrough.
+      if (currentCount < submissionLimit) return okAsync(form)
+
+      logger.info({
+        message: 'Form reached maximum submission count, deactivating.',
+        meta: logMeta,
+      })
+
+      // Map success case back into error to display to client as form has been
+      // deactivated.
+      return deactivateForm(formId).andThen(() =>
+        errAsync(
+          new PrivateFormError(
+            'Submission made after form submission limit was reached',
+            form.title,
+          ),
+        ),
+      )
+    })
+}
+
+export const checkHasRespondentNotWhitelistedFailure = (
+  form: IPopulatedForm,
+  submitterId?: string,
+): ResultAsync<boolean, ApplicationError> => {
+  // check since whitelist is only for encrypt mode and multirespondent mode forms
+  if (
+    form.responseMode !== FormResponseMode.Encrypt &&
+    form.responseMode !== FormResponseMode.Multirespondent
+  ) {
+    return okAsync(false)
+  }
+  if (form.authType === FormAuthType.NIL) {
+    return okAsync(false)
+  }
+
+  const { isWhitelistEnabled, encryptedWhitelistedSubmitterIds: whitelistId } =
+    form.getWhitelistedSubmitterIds()
+
+  if (!isWhitelistEnabled) {
+    return okAsync(false)
+  }
+  if (isWhitelistEnabled && !whitelistId) {
+    return errAsync(new FormWhitelistSettingNotFoundError())
+  }
+  if (!submitterId) {
+    return errAsync(new MissingSubmitterIdError())
+  }
+
+  const formPublicKey = form.publicKey
+  if (!formPublicKey) {
+    logger.error({
+      message: 'Encrypt mode form does not have a public key',
+      meta: {
+        action: 'checkHasRespondentNotWhitelistedFailure',
+        formId: form._id,
+      },
+    })
+    return errAsync(
+      new ApplicationError('Encrypt mode form does not have a public key'),
+    )
+  }
+  return ResultAsync.fromPromise(
+    FormWhitelistSubmitterIdsModel.findEncryptionPropertiesById(
+      whitelistId,
+    ).then(({ myPublicKey, myPrivateKey, nonce }) => {
+      const myKeyPair = {
+        publicKey: myPublicKey,
+        privateKey: myPrivateKey,
+      }
+      const usedNonce = decodeBase64(nonce)
+
+      const upperCaseSubmitterId = submitterId.toUpperCase()
+
+      const submitterIdForLookup = encryptString(
+        upperCaseSubmitterId,
+        formPublicKey,
+        usedNonce,
+        myKeyPair,
+      ).cipherText
+
+      return FormWhitelistSubmitterIdsModel.checkIfSubmitterIdIsWhitelisted(
+        whitelistId,
+        submitterIdForLookup,
+      ).then((isWhitelisted) => !isWhitelisted)
+    }),
+    (err) => {
+      logger.error({
+        message: 'Error while checking if submitterId is whitelisted',
+        meta: {
+          action: 'checkHasRespondentNotWhitelistedFailure',
+          formId: form._id,
+          err,
+        },
+      })
+      return new ApplicationError(
+        'Error while checking if submitterId is whitelisted',
+      )
+    },
+  )
+}
+
+/**
+ * Verify that if the form is a single submission per submitterId form, the submitterId does not exist.
+ * @param form the form to check for
+ * @param submitterId submitterId of current submitter
+ * @returns ok(true) if the form is not a single submission per submitterId form or the submitterId has not responded before
+ * @returns ok(false) if the form is a single submission per submitterId form and submitterId has already responded
+ * @returns err(ApplicationError) if the submitterId is not found
+ * @returns err(PossibleDatabaseError) if an error occurred while querying the database to check for previous responses by same submitterId
+ */
+export const checkHasSingleSubmissionValidationFailure = (
+  form: PublicFormDto,
+  submitterId: string,
+): ResultAsync<boolean, ApplicationError | PossibleDatabaseError> => {
+  const logMeta = {
+    action: 'checkHasSingleSubmissionValidationFailure',
+    formId: form._id,
+  }
+  if (!form.isSingleSubmission || form.authType === FormAuthType.NIL) {
+    return okAsync(false)
+  }
+
+  if (!submitterId) {
+    return errAsync(
+      new MissingSubmitterIdError(
+        'Cannot find submitterId which is required for single submission per submitterId form',
+      ),
+    )
+  }
+
+  const mrfStepOneIndex = 0
+  // NOTE: Hardcoded to step one since single submission is only supported for step one for now.
+  const submitterIdKey = `submittedSteps.${mrfStepOneIndex}.submitterId`
+  const baseQuery = {
+    form: form._id,
+  }
+  const query =
+    form.responseMode === FormResponseMode.Multirespondent
+      ? {
+          ...baseQuery,
+          submissionType: SubmissionType.Multirespondent,
+          [submitterIdKey]: submitterId,
+        }
+      : {
+          ...baseQuery,
+          submitterId,
+        }
+
+  return ResultAsync.fromPromise(SubmissionModel.exists(query), (error) => {
+    logger.error({
+      message: 'Error while counting submissions for form',
+      meta: logMeta,
+      error,
+    })
+    return transformMongoError(error)
+  }).andThen((result) => okAsync(result !== null))
+}
+
+export const getFormModelByResponseMode = (
+  responseMode: FormResponseMode,
+): IEmailFormModel | IEncryptedFormModel | IMultirespondentFormModel => {
+  switch (responseMode) {
+    case FormResponseMode.Email:
+      return EmailFormModel
+    case FormResponseMode.Encrypt:
+      return EncryptedFormModel
+    case FormResponseMode.Multirespondent:
+      return MultirespondentFormModel
+  }
+}
+
+/**
+ * Checks if a form is accessed from within intranet and sets the property accordingly
+ * @param ip The ip of the request
+ * @param publicFormView The form to check
+ * @returns ok(PublicFormView) if the form is accessed from the internet
+ * @returns err(ApplicationError) if an error occured while checking if the ip of the request is from the intranet
+ */
+export const checkIsIntranetFormAccess = (
+  ip: string,
+  form: IPopulatedForm,
+): boolean => {
+  const isIntranetUser = IntranetService.isIntranetIp(ip)
+  // Warn if form is being accessed from within intranet
+  // and the form has authentication set
+  if (
+    isIntranetUser &&
+    [FormAuthType.SP, FormAuthType.CP, FormAuthType.MyInfo].includes(
+      form.authType,
+    )
+  ) {
+    logger.warn({
+      message:
+        'Attempting to access SingPass, CorpPass or MyInfo form from intranet',
+      meta: {
+        action: 'checkIsIntranetFormAccess',
+        formId: form._id,
+      },
+    })
+  }
+  return isIntranetUser
+}
+
+const SAMPLE_LOREM_WORDS = [
+  'lorem',
+  'ipsum',
+  'dolor',
+  'sit',
+  'amet',
+  'consectetur',
+  'adipiscing',
+  'elit',
+  'sed',
+  'eiusmod',
+  'tempor',
+  'incididunt',
+]
+
+const sampleInt = (min: number, max: number) =>
+  Math.floor(Math.random() * (max - min + 1)) + min
+
+const sampleArrayElement = <T>(items: readonly T[]): T =>
+  items[sampleInt(0, items.length - 1)]
+
+const sampleArrayElements = <T>(items: readonly T[]): T[] => {
+  const shuffled = [...items].sort(() => Math.random() - 0.5)
+  return shuffled.slice(0, sampleInt(1, items.length))
+}
+
+const sampleWords = (count: number) =>
+  Array.from({ length: count }, () =>
+    sampleArrayElement(SAMPLE_LOREM_WORDS),
+  ).join(' ')
+
+const sampleReplaceSymbols = (pattern: string) =>
+  pattern.replace(/#/g, () => sampleInt(0, 9).toString())
+
+export const createSingleSampleSubmissionAnswer = (field: FormFieldDto) => {
+  // Prefill dropdown MyInfo field options for faking
+  const { fieldType } = field
+  if (fieldType === BasicField.Dropdown && field.myInfo) {
+    field.fieldOptions = getMyInfoFieldOptions(field.myInfo.attr)
+  }
+
+  switch (fieldType) {
+    case BasicField.LongText: {
+      const sampleValue = sampleWords(20)
+      return {
+        id: field._id,
+        question: field.title,
+        answer: sampleValue,
+        fieldType: field.fieldType,
+      }
+    }
+
+    case BasicField.ShortText: {
+      const sampleValue = sampleWords(3)
+      return {
+        id: field._id,
+        question: field.title,
+        answer: sampleValue,
+        fieldType: field.fieldType,
+      }
+    }
+
+    case BasicField.Radio:
+    case BasicField.Dropdown: {
+      const sampleValue =
+        field.fieldOptions.length === 0
+          ? ''
+          : sampleArrayElement(field.fieldOptions)
+      return {
+        id: field._id,
+        question: field.title,
+        answer: sampleValue,
+        fieldType: field.fieldType,
+      }
+    }
+    case BasicField.Email: {
+      const sampleValue = sampleReplaceSymbols('sample####@example.com')
+      return {
+        id: field._id,
+        question: field.title,
+        answer: sampleValue,
+        fieldType: field.fieldType,
+      }
+    }
+
+    case BasicField.Decimal: {
+      const sampleValue = (sampleInt(0, 10) / 10).toString()
+      return {
+        id: field._id,
+        question: field.title,
+        answer: sampleValue,
+        fieldType: field.fieldType,
+      }
+    }
+
+    case BasicField.Number: {
+      const sampleValue = sampleInt(0, 100).toString()
+      return {
+        id: field._id,
+        question: field.title,
+        answer: sampleValue,
+        fieldType: field.fieldType,
+      }
+    }
+
+    case BasicField.Mobile: {
+      const sampleValue = sampleReplaceSymbols('+659#######')
+      return {
+        id: field._id,
+        question: field.title,
+        answer: sampleValue,
+        fieldType: field.fieldType,
+      }
+    }
+
+    case BasicField.HomeNo: {
+      const sampleValue = sampleReplaceSymbols('+656#######')
+      return {
+        id: field._id,
+        question: field.title,
+        answer: sampleValue,
+        fieldType: field.fieldType,
+      }
+    }
+
+    case BasicField.YesNo: {
+      const sampleValue = sampleArrayElement(['Yes', 'No'])
+      return {
+        id: field._id,
+        question: field.title,
+        answer: sampleValue,
+        fieldType: field.fieldType,
+      }
+    }
+
+    case BasicField.Rating: {
+      const sampleValue = sampleInt(1, field.ratingOptions.steps).toString()
+      return {
+        id: field._id,
+        question: field.title,
+        answer: sampleValue,
+        fieldType: field.fieldType,
+      }
+    }
+
+    case BasicField.Attachment: {
+      return {
+        id: field._id,
+        question: field.title,
+        answer: 'attachmentFileName',
+        fieldType: field.fieldType,
+      }
+    }
+
+    case BasicField.Table: {
+      const noOfTableRows = field.minimumRows || 0
+      const noOfTableCols = field.columns.length
+      const tableSampleValue = []
+      for (let row = 0; row < noOfTableRows; row++) {
+        const rowSampleValue = []
+        for (let col = 0; col < noOfTableCols; col++) {
+          rowSampleValue.push(`row${row + 1}col${col + 1}`)
+        }
+        tableSampleValue.push(rowSampleValue)
+      }
+      return {
+        id: field._id,
+        question: field.title,
+        answerArray: tableSampleValue,
+        fieldType: field.fieldType,
+      }
+    }
+    case BasicField.Checkbox: {
+      const sampleValue =
+        field.fieldOptions.length === 0
+          ? []
+          : sampleArrayElements(field.fieldOptions)
+      return {
+        id: field._id,
+        question: field.title,
+        answerArray: sampleValue,
+        fieldType: field.fieldType,
+      }
+    }
+    case BasicField.Date: {
+      const sampleValue = new Date().toLocaleDateString(Language.ENGLISH, {
+        day: '2-digit',
+        month: 'short',
+        year: 'numeric',
+      })
+      return {
+        id: field._id,
+        question: field.title,
+        answer: sampleValue,
+        fieldType: field.fieldType,
+      }
+    }
+
+    case BasicField.Nric: {
+      return {
+        id: field._id,
+        question: field.title,
+        answer: sampleReplaceSymbols('S9######A'),
+        fieldType: field.fieldType,
+      }
+    }
+    case BasicField.Uen: {
+      return {
+        id: field._id,
+        question: field.title,
+        answer: sampleReplaceSymbols('#########A'),
+        fieldType: field.fieldType,
+      }
+    }
+    case BasicField.Address: {
+      const sampleValue: string[] = []
+      return {
+        id: field._id,
+        question: field.title,
+        answerArray: sampleValue,
+        fieldType: field.fieldType,
+      }
+    }
+    case BasicField.Signature:
+    case BasicField.Section:
+    case BasicField.Statement:
+    case BasicField.Image:
+    case BasicField.CountryRegion:
+    case BasicField.Children:
+      return {
+        id: field._id,
+        question: field.title,
+        answer: null,
+        fieldType: field.fieldType,
+      }
+    default: {
+      // Force TS to emit an error if the cases above are not exhaustive
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      const exhaustiveCheck: never = fieldType
+      break
+    }
+  }
+}
+
+export const createSampleSubmissionResponses = (
+  formFields: FormFieldDto<FormField>[],
+) => {
+  const sampleData: Record<
+    string,
+    ReturnType<typeof createSingleSampleSubmissionAnswer>
+  > = {}
+  formFields.forEach((field) => {
+    const answer = createSingleSampleSubmissionAnswer(field)
+    if (!answer) return
+    sampleData[field._id] = answer
+  })
+  return sampleData
+}
+
+/**
+ * Method to check whether a form has reached sms threshold, and deactivate the form if necessary
+ * @param form the form to check
+ * @returns ok(form) if submission is allowed because the form sms limits has not reached limits
+ * @returns err(PossibleDatabaseError) if an error occurred while querying the database for the specified form
+ * @returns err(FormNotFoundError) if the form has exceeded the submission limits but could not be found and deactivated
+ * @returns err(PrivateFormError) if the count of the form has been exceeded and the form has been deactivated
+ */
+export const checkFormSmsLimitAndDeactivateForm = (
+  form: IPopulatedForm,
+): ResultAsync<
+  IPopulatedForm,
+  PossibleDatabaseError | PrivateFormError | FormNotFoundError
+> => {
+  const formId = String(form._id)
+  const logMeta = {
+    action: 'checkFormSmsLimitAndDeactivateForm',
+    formId: formId,
+  }
+
+  if (!hasVerifiableMobileFieldformFields(form.form_fields) || form.noSmsLimit)
+    return okAsync(form)
+
+  return SmsService.retrieveSmsCounts(formId)
+    .mapErr((error) => {
+      logger.error({
+        message: 'Error while counting sms threshold for form',
+        meta: logMeta,
+        error,
+      })
+      return transformMongoError(error)
+    })
+    .andThen((currentCount) => {
+      if (currentCount < smsConfig.smsVerificationLimit) return okAsync(form)
+
+      logger.info({
+        message: 'Form reached maximum sms threshold, deactivating.',
+        meta: logMeta,
+      })
+
+      return deactivateForm(formId).andThen(() => {
+        void MailService.sendFormDeactivatedNotification({
+          emailRecipients: form.admin.email
+            ? [form.admin.email, ...form.permissionList.map((x) => x.email)]
+            : [],
+          formTitle: form.title,
+          formId,
+        }).mapErr((error) =>
+          logger.error({
+            message: 'Failed to send form deactivated notification email',
+            meta: logMeta,
+            error,
+          }),
+        )
+        return errAsync(
+          new PrivateFormError(
+            'Sms Verification made after form submission limit was reached',
+            form.title,
+          ),
+        )
+      })
+    })
+}

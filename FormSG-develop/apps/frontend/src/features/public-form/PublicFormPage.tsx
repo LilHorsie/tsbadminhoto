@@ -1,0 +1,59 @@
+import { useParams } from 'react-router-dom'
+import { Flex } from '@chakra-ui/react'
+
+import { fillMinHeightCss } from '~utils/fillHeightCss'
+
+import FloatingToolbar from './components/FloatingToolBar'
+import { FormBanner } from './components/FormBanner'
+import FormEndPage from './components/FormEndPage'
+import FormFields from './components/FormFields'
+import { FormSectionsProvider } from './components/FormFields/FormSectionsContext'
+import { FormFooter } from './components/FormFooter'
+import FormInstructions from './components/FormInstructions'
+import { PublicFormLogo } from './components/FormLogo'
+import FormStartPage from './components/FormStartPage'
+import LanguageControl from './components/LanguageControl'
+import { PublicFormWrapper } from './components/PublicFormWrapper'
+import { useAuthFormMismatch } from './hooks/useAuthFormMismatch'
+import { PublicFormProvider } from './PublicFormProvider'
+
+export const PublicFormPage = (): JSX.Element => {
+  const { formId, submissionId } = useParams()
+  const isResolvingAuthFormMismatch = useAuthFormMismatch(formId)
+
+  if (!formId) throw new Error('No formId provided')
+
+  if (isResolvingAuthFormMismatch) {
+    return <></>
+  }
+
+  // Get date time in miliseconds when user first loads the form
+  const startTime = Date.now()
+
+  return (
+    <PublicFormProvider
+      formId={formId}
+      submissionId={submissionId}
+      startTime={startTime}
+      isPublicFormPage
+    >
+      <FormSectionsProvider>
+        <Flex direction="column" css={fillMinHeightCss}>
+          <FormBanner />
+          <PublicFormLogo />
+          <FormStartPage />
+          <LanguageControl />
+          <PublicFormWrapper>
+            <FormInstructions />
+            <FormFields />
+            <FloatingToolbar />
+            <FormEndPage />
+            <FormFooter />
+          </PublicFormWrapper>
+        </Flex>
+      </FormSectionsProvider>
+    </PublicFormProvider>
+  )
+}
+
+export default PublicFormPage

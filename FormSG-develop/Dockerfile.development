@@ -1,0 +1,63 @@
+FROM node:22.23.4-alpine3.23
+LABEL maintainer=FormSG<form@open.gov.sg>
+
+WORKDIR /opt/formsg
+
+RUN mkdir /mongodb_data
+RUN chown 1001:1001 /mongodb_data
+ENV PNPM_HOME="/pnpm"
+ENV PATH="$PNPM_HOME:$PATH"
+ENV NODE_ENV=development
+
+ENV NODE_OPTIONS="--max-old-space-size=2048"
+
+# Install pnpm
+RUN npm install -g pnpm@10.30.3
+# Build dependencies for node_modules
+RUN apk add --virtual native-deps \
+    # Python version must be specified starting in alpine3.12
+    py3-pip \
+    g++ gcc libgcc libstdc++ linux-headers autoconf automake make nasm python3 git curl \
+    # Runtime dependencies
+    nss \
+    freetype \
+    freetype-dev \
+    harfbuzz \
+    ca-certificates \
+    ttf-freefont \
+    tini \
+    # Localstack - these are necessary in order to initialise local S3 buckets
+    # jq is a package for easily parsing Localstack health endpoint's JSON output
+    jq \
+    build-base \
+    cairo-dev \
+    pango-dev \
+    giflib-dev \
+    libjpeg-turbo-dev \
+    librsvg-dev && \
+    apk add --no-cache \
+    cairo pango librsvg && \
+    pnpm add -g node-gyp@12.2.0 && \
+    # [ver1] ensures that the underlying AWS CLI version is also installed
+    pip install awscli-local[ver1]==0.22.2 --break-system-packages
+
+# Avoid using globs as there seems to be some inconsistency in the way dockerfile handles globs
+# * https://github.com/moby/moby/issues/15858
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY patches ./patches/
+COPY apps/backend/package.json ./apps/backend/
+COPY packages/shared/package.json ./packages/shared/
+COPY packages/sdk/package.json ./packages/sdk/
+COPY apps/frontend/package.json ./apps/frontend/
+
+RUN CXXFLAGS="-include cstdint" pnpm install --frozen-lockfile --filter "!services/*" --filter "!packages/react-email-preview/*"
+
+COPY . ./
+
+EXPOSE 5000
+
+# tini is the init process that will adopt orphaned zombie processes
+# e.g. chromium when launched to create a new PDF
+ENTRYPOINT [ "tini", "--" ]
+# Create local AWS resources before building the app
+CMD sh init-localstack.sh && pnpm dev:backend

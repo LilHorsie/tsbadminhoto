@@ -1,0 +1,249 @@
+import convict, { Path, Schema } from 'convict'
+import { url } from 'convict-format-with-validator'
+
+import {
+  validateIacStringParam,
+  validateNonIacStringParam,
+} from '../../utils/iac'
+import { resetToApplicationDefaultForUndefinedSsmValues } from '../schema'
+
+const HOUR_IN_MILLIS = 1000 * 60 * 60
+const DAY_IN_MILLIS = 24 * HOUR_IN_MILLIS
+
+type ISpcpConfig = {
+  isSPMaintenance: string
+  isCPMaintenance: string
+  myInfoBannerContent: string
+  spCookieMaxAge: number
+  spCookieMaxAgePreserved: number
+  spcpCookieDomain: string
+  cpCookieMaxAge: number
+  spOidcNdiDiscoveryEndpoint: string
+  spOidcNdiJwksEndpoint: string
+  spOidcRpClientId: string
+  spOidcRpRedirectUrl: string
+  spOidcRpJwksPublic: string
+  spOidcRpJwksSecret: string
+  spOidcRpJwksPublicPath: string
+  spOidcRpJwksSecretPath: string
+  cpOidcNdiDiscoveryEndpoint: string
+  cpOidcNdiJwksEndpoint: string
+  cpOidcRpClientId: string
+  cpOidcRpRedirectUrl: string
+  cpOidcRpJwksPublic: string
+  cpOidcRpJwksSecret: string
+  cpOidcRpJwksPublicPath: string
+  cpOidcRpJwksSecretPath: string
+}
+
+type IMyInfoConfig = {
+  myInfoJwtSecret: string
+  myInfoFapiIssuer: string
+  myInfoFapiClientId: string
+  myInfoFapiRpJwksPublic: string
+  myInfoFapiRpJwksSecret: string
+  myInfoFapiRpJwksPublicPath: string
+  myInfoFapiRpJwksSecretPath: string
+}
+
+// Config of MyInfo is coupled to that of Singpass
+// due to MyInfo's sharing of spCookieMaxAge. Therefore
+// export both together.
+export type ISpcpMyInfo = ISpcpConfig & IMyInfoConfig
+
+convict.addFormat(url)
+
+const optionalValuesFromSsm: Path<ISpcpMyInfo>[] = ['spcpCookieDomain']
+
+const spcpMyInfoSchema: Schema<ISpcpMyInfo> = {
+  isSPMaintenance: {
+    doc: 'If set, displays a banner message on SingPass forms. Overrides IS_CP_MAINTENANCE',
+    format: '*',
+    default: null,
+    env: 'IS_SP_MAINTENANCE',
+  },
+  isCPMaintenance: {
+    doc: 'If set, displays a banner message on CorpPass forms',
+    format: '*',
+    default: null,
+    env: 'IS_CP_MAINTENANCE',
+  },
+  myInfoBannerContent: {
+    doc: 'If set, displays a banner message on MyInfo forms',
+    format: '*',
+    default: null,
+    env: 'MYINFO_BANNER_CONTENT',
+  },
+  spCookieMaxAge: {
+    doc: 'Max SingPass cookie age with remember me unchecked',
+    format: 'int',
+    default: 3 * HOUR_IN_MILLIS,
+    env: 'SP_COOKIE_MAX_AGE',
+  },
+  spCookieMaxAgePreserved: {
+    doc: 'Max SingPass cookie age with remember me checked',
+    format: 'int',
+    default: 30 * DAY_IN_MILLIS,
+    env: 'SPCP_COOKIE_MAX_AGE_PRESERVED',
+  },
+  spcpCookieDomain: {
+    doc: 'Domain name set on cookie that holds the SPCP jwt',
+    format: String,
+    default: '',
+    env: 'SPCP_COOKIE_DOMAIN',
+  },
+  cpCookieMaxAge: {
+    doc: 'Max CorpPass cookie age',
+    format: 'int',
+    default: 6 * HOUR_IN_MILLIS,
+    env: 'CP_COOKIE_MAX_AGE',
+  },
+  myInfoJwtSecret: {
+    doc: 'Secret for signing MyInfo JWT.',
+    format: String,
+    default: null,
+    env: 'MYINFO_JWT_SECRET',
+  },
+  myInfoFapiIssuer: {
+    doc: "Issuer identifier of Singpass' MyInfo FAPI 2.0 authorization server. Discovery is performed against <issuer>/.well-known/openid-configuration.",
+    format: String,
+    default: null,
+    env: 'MYINFO_FAPI_ISSUER',
+  },
+  myInfoFapiClientId: {
+    doc: "The Relying Party's client ID as registered in the Singpass Developer Portal for MyInfo FAPI 2.0.",
+    format: String,
+    default: null,
+    env: 'MYINFO_FAPI_CLIENT_ID',
+  },
+  myInfoFapiRpJwksPublic: {
+    doc: "The Relying Party's public JSON Web Key Set for MyInfo FAPI 2.0. Hosted at /mi/fapi/.well-known/jwks.json.",
+    format: validateIacStringParam,
+    default: null,
+    env: 'MYINFO_FAPI_RP_JWKS_PUBLIC',
+  },
+  myInfoFapiRpJwksSecret: {
+    doc: "The Relying Party's secret JSON Web Key Set for MyInfo FAPI 2.0. Signs client assertions and decrypts ID tokens and userinfo.",
+    format: validateIacStringParam,
+    default: null,
+    env: 'MYINFO_FAPI_RP_JWKS_SECRET',
+  },
+  myInfoFapiRpJwksPublicPath: {
+    doc: "Path to the Relying Party's public JSON Web Key Set for MyInfo FAPI 2.0.",
+    format: validateNonIacStringParam,
+    default: null,
+    env: 'MYINFO_FAPI_RP_JWKS_PUBLIC_PATH',
+  },
+  myInfoFapiRpJwksSecretPath: {
+    doc: "Path to the Relying Party's secret JSON Web Key Set for MyInfo FAPI 2.0.",
+    format: validateNonIacStringParam,
+    default: null,
+    env: 'MYINFO_FAPI_RP_JWKS_SECRET_PATH',
+  },
+  spOidcNdiDiscoveryEndpoint: {
+    doc: "NDI's Singpass OIDC Discovery Endpoint",
+    format: String,
+    default: null,
+    env: 'SP_OIDC_NDI_DISCOVERY_ENDPOINT',
+  },
+  spOidcNdiJwksEndpoint: {
+    doc: "NDI's Singpass OIDC JWKS Endpoint",
+    format: String,
+    default: null,
+    env: 'SP_OIDC_NDI_JWKS_ENDPOINT',
+  },
+  spOidcRpClientId: {
+    doc: "The Relying Party's Singpass Client ID as registered with NDI",
+    format: String,
+    default: null,
+    env: 'SP_OIDC_RP_CLIENT_ID',
+  },
+  spOidcRpRedirectUrl: {
+    doc: "The Relying Party's Singpass Redirect URL",
+    format: String,
+    default: null,
+    env: 'SP_OIDC_RP_REDIRECT_URL',
+  },
+  spOidcRpJwksPublic: {
+    doc: "The Relying Party's Public Json Web Key Set used for Singpass-related communication with NDI. This will be hosted at /sp/.well-known/jwks.json endpoint.",
+    format: validateIacStringParam,
+    default: null,
+    env: 'SP_OIDC_RP_JWKS_PUBLIC',
+  },
+  spOidcRpJwksSecret: {
+    doc: "The Relying Party's Secret Json Web Key Set used for Singpass-related communication with NDI",
+    format: validateIacStringParam,
+    default: null,
+    env: 'SP_OIDC_RP_JWKS_SECRET',
+  },
+  spOidcRpJwksPublicPath: {
+    doc: "Path to the Relying Party's Public Json Web Key Set used for Singpass-related communication with NDI. This will be hosted at /sp/.well-known/jwks.json endpoint.",
+    format: validateNonIacStringParam,
+    default: null,
+    env: 'SP_OIDC_RP_JWKS_PUBLIC_PATH',
+  },
+  spOidcRpJwksSecretPath: {
+    doc: "Path to the Relying Party's Secret Json Web Key Set used for Singpass-related communication with NDI",
+    format: validateNonIacStringParam,
+    default: null,
+    env: 'SP_OIDC_RP_JWKS_SECRET_PATH',
+  },
+  cpOidcNdiDiscoveryEndpoint: {
+    doc: "NDI's Corppass OIDC Discovery Endpoint",
+    format: String,
+    default: null,
+    env: 'CP_OIDC_NDI_DISCOVERY_ENDPOINT',
+  },
+  cpOidcNdiJwksEndpoint: {
+    doc: "NDI's Corppass OIDC JWKS Endpoint",
+    format: String,
+    default: null,
+    env: 'CP_OIDC_NDI_JWKS_ENDPOINT',
+  },
+  cpOidcRpClientId: {
+    doc: "The Relying Party's Corppass Client ID as registered with NDI",
+    format: String,
+    default: null,
+    env: 'CP_OIDC_RP_CLIENT_ID',
+  },
+  cpOidcRpRedirectUrl: {
+    doc: "The Relying Party's Corppass Redirect URL",
+    format: String,
+    default: null,
+    env: 'CP_OIDC_RP_REDIRECT_URL',
+  },
+  cpOidcRpJwksPublic: {
+    doc: "The Relying Party's Public Json Web Key Set used for Corppass-related communication with NDI. This will be hosted at api/v3/corppass/.well-known/jwks.json",
+    format: validateIacStringParam,
+    default: null,
+    env: 'CP_OIDC_RP_JWKS_PUBLIC',
+  },
+  cpOidcRpJwksSecret: {
+    doc: "The Relying Party's Secret Json Web Key Set used for Singpass-related communication with NDI",
+    format: validateIacStringParam,
+    default: null,
+    env: 'CP_OIDC_RP_JWKS_SECRET',
+  },
+  cpOidcRpJwksPublicPath: {
+    doc: "Path to the Relying Party's Public Json Web Key Set used for Singpass-related communication with NDI. This will be hosted at /sp/.well-known/jwks.json endpoint.",
+    format: validateNonIacStringParam,
+    default: null,
+    env: 'CP_OIDC_RP_JWKS_PUBLIC_PATH',
+  },
+  cpOidcRpJwksSecretPath: {
+    doc: "Path to the Relying Party's Secret Json Web Key Set used for Singpass-related communication with NDI",
+    format: validateNonIacStringParam,
+    default: null,
+    env: 'CP_OIDC_RP_JWKS_SECRET_PATH',
+  },
+}
+
+const spcpMyInfoConfigIntermediate = convict(spcpMyInfoSchema)
+resetToApplicationDefaultForUndefinedSsmValues(
+  spcpMyInfoConfigIntermediate,
+  optionalValuesFromSsm,
+)
+
+export const spcpMyInfoConfig = spcpMyInfoConfigIntermediate
+  .validate({ allowed: 'strict' })
+  .getProperties()

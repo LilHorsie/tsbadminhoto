@@ -1,0 +1,1639 @@
+import expressHandler from '__tests__/unit/backend/helpers/jest-express'
+import { ObjectId } from 'bson'
+import { Request } from 'express'
+import { ErrorCode, FormAuthType, MyInfoAttribute } from 'formsg-shared/types'
+import { StatusCodes } from 'http-status-codes'
+import { errAsync, okAsync } from 'neverthrow'
+
+import { DatabaseError } from 'src/app/modules/core/core.errors'
+import { MyInfoData } from 'src/app/modules/myinfo/myinfo.adapter'
+import { IPersonResponse } from 'src/app/modules/myinfo/myinfo.person.types'
+import { MOCK_LOGIN_DOC } from 'src/app/modules/spcp/__tests__/spcp.test.constants'
+import { JwtPayload, SpcpForm } from 'src/app/modules/spcp/spcp.types'
+import {
+  IFormDocument,
+  IPopulatedEncryptedForm,
+  IPopulatedForm,
+  IPopulatedUser,
+  PublicForm,
+} from 'src/types'
+
+import * as AuthService from '../../../auth/auth.service'
+import * as BillingService from '../../../billing/billing.service'
+import {
+  MYINFO_FAPI_SESSION_COOKIE_IDENTITY,
+  MYINFO_FAPI_SESSION_COOKIE_NAME,
+  MYINFO_FAPI_SESSION_MAX_AGE_MS,
+} from '../../../myinfo/fapi/myinfo.fapi.constants'
+import {
+  MyInfoFapiIncompleteLoginError,
+  MyInfoFapiMissingSessionError,
+  MyInfoFapiSessionFormMismatchError,
+} from '../../../myinfo/fapi/myinfo.fapi.errors'
+import * as MyInfoFapiService from '../../../myinfo/fapi/myinfo.fapi.service'
+import { MYINFO_LOGIN_COOKIE_NAME } from '../../../myinfo/myinfo.constants'
+import { MyInfoService } from '../../../myinfo/myinfo.service'
+import {
+  CreateRedirectUrlError,
+  MissingJwtError,
+} from '../../../spcp/spcp.errors'
+import { CpOidcServiceClass } from '../../../spcp/spcp.oidc.service/spcp.oidc.service.cp'
+import { SpOidcServiceClass } from '../../../spcp/spcp.oidc.service/spcp.oidc.service.sp'
+import { CodeVerifierCookieName, JwtName } from '../../../spcp/spcp.types'
+import { generateHashedSubmitterId } from '../../../submission/submission.utils'
+import { FormNotFoundError, PrivateFormError } from '../../form.errors'
+import * as FormService from '../../form.service'
+import * as PublicFormController from '../public-form.controller'
+import * as PublicFormService from '../public-form.service'
+import { getCookieNameByAuthType } from '../public-form.service'
+
+jest.mock('../public-form.service')
+jest.mock('../../form.service')
+jest.mock('../../../auth/auth.service')
+jest.mock('../../../spcp/spcp.oidc.service/spcp.oidc.service.sp')
+jest.mock('../../../spcp/spcp.oidc.service/spcp.oidc.service.cp')
+jest.mock('../../../myinfo/myinfo.service')
+jest.mock('../../../myinfo/fapi/myinfo.fapi.service')
+jest.mock('../../../billing/billing.service')
+
+const { SpcpOidcServiceClass: ActualSpcpOidcServiceClass } = jest.requireActual(
+  '../../../spcp/spcp.oidc.service/spcp.oidc.service.base',
+) as typeof import('../../../spcp/spcp.oidc.service/spcp.oidc.service.base')
+
+const MockFormService = jest.mocked(FormService)
+const MockPublicFormService = jest.mocked(PublicFormService)
+const MockAuthService = jest.mocked(AuthService)
+
+const MockMyInfoService = jest.mocked(MyInfoService)
+const MockMyInfoFapiService = jest.mocked(MyInfoFapiService)
+const MockBillingService = jest.mocked(BillingService)
+
+describe('public-form.controller', () => {
+  afterEach(() => jest.clearAllMocks())
+
+  describe('handleGetPublicForm', () => {
+    const MOCK_FORM_ID = new ObjectId().toHexString()
+    const MOCK_USER_ID = new ObjectId().toHexString()
+    const MOCK_USER = {
+      _id: MOCK_USER_ID,
+      email: 'randomrandomtest@example.com',
+    } as IPopulatedUser
+
+    const MOCK_SCRUBBED_FORM = {
+      _id: MOCK_FORM_ID,
+      title: 'mock title',
+      admin: { _id: MOCK_USER_ID },
+    } as unknown as PublicForm
+
+    const BASE_FORM = {
+      admin: MOCK_USER,
+      _id: MOCK_FORM_ID,
+      title: MOCK_SCRUBBED_FORM.title,
+      getUniqueMyInfoAttrs: jest.fn().mockReturnValue([MyInfoAttribute.Name]),
+      getPublicView: jest.fn().mockReturnValue(MOCK_SCRUBBED_FORM),
+    }
+
+    const MOCK_REQ = expressHandler.mockRequest({
+      params: {
+        formId: MOCK_FORM_ID,
+      },
+      others: {
+        cookies: {},
+      },
+    })
+
+    const MOCK_FAPI_SESSION_ID = 'mock-fapi-session-id'
+
+    let mockReqWithFapiCookie: Request<{
+      formId: string
+    }>
+
+    beforeEach(() => {
+      mockReqWithFapiCookie = expressHandler.mockRequest({
+        params: {
+          formId: MOCK_FORM_ID,
+        },
+        others: {
+          cookies: {},
+          signedCookies: {
+            [MYINFO_FAPI_SESSION_COOKIE_NAME]: MOCK_FAPI_SESSION_ID,
+          },
+        },
+      })
+    })
+
+    describe('submission limit checks', () => {
+      const MOCK_SUBMISSION_LIMIT_NIL_AUTH_FORM = {
+        ...BASE_FORM,
+        submissionLimit: 1,
+        authType: FormAuthType.NIL,
+        inactiveMessage:
+          'Submission made after form submission limit was reached',
+      } as unknown as IPopulatedForm
+
+      beforeAll(() => {
+        MockFormService.checkIsIntranetFormAccess.mockReturnValue(false)
+        MockAuthService.getFormIfPublic.mockReturnValue(
+          okAsync(MOCK_SUBMISSION_LIMIT_NIL_AUTH_FORM),
+        )
+        MockFormService.checkFormSmsLimitAndDeactivateForm.mockReturnValue(
+          okAsync(MOCK_SUBMISSION_LIMIT_NIL_AUTH_FORM),
+        )
+      })
+
+      it('should check for submission limit and return 200 when form not reached submission limit', async () => {
+        // Arrange
+        const mockRes = expressHandler.mockResponse()
+        MockFormService.checkFormSubmissionLimitAndDeactivateForm.mockReturnValueOnce(
+          okAsync(MOCK_SUBMISSION_LIMIT_NIL_AUTH_FORM),
+        )
+
+        // Act
+        await PublicFormController.handleGetPublicForm(
+          MOCK_REQ,
+          mockRes,
+          jest.fn(),
+        )
+
+        // Assert
+        expect(
+          MockFormService.checkFormSubmissionLimitAndDeactivateForm,
+        ).toHaveBeenCalledWith(MOCK_SUBMISSION_LIMIT_NIL_AUTH_FORM)
+        expect(mockRes.json).toHaveBeenCalledWith({
+          form: MOCK_SUBMISSION_LIMIT_NIL_AUTH_FORM.getPublicView(),
+          isIntranetUser: false,
+        })
+      })
+
+      it('should check for submission limit and return 404 not found when form has reached submission limit', async () => {
+        // Arrange
+        const mockRes = expressHandler.mockResponse()
+        MockFormService.checkFormSubmissionLimitAndDeactivateForm.mockReturnValueOnce(
+          errAsync(
+            new PrivateFormError(
+              MOCK_SUBMISSION_LIMIT_NIL_AUTH_FORM.inactiveMessage,
+              MOCK_SUBMISSION_LIMIT_NIL_AUTH_FORM.title,
+            ),
+          ),
+        )
+
+        // Act
+        await PublicFormController.handleGetPublicForm(
+          MOCK_REQ,
+          mockRes,
+          jest.fn(),
+        )
+
+        // Assert
+        expect(
+          MockFormService.checkFormSubmissionLimitAndDeactivateForm,
+        ).toHaveBeenCalledWith(MOCK_SUBMISSION_LIMIT_NIL_AUTH_FORM)
+        expect(mockRes.status).toHaveBeenCalledWith(StatusCodes.NOT_FOUND)
+        expect(mockRes.json).toHaveBeenCalledWith({
+          isPageFound: true,
+          message: MOCK_SUBMISSION_LIMIT_NIL_AUTH_FORM.inactiveMessage,
+          formTitle: MOCK_SUBMISSION_LIMIT_NIL_AUTH_FORM.title,
+        })
+      })
+    })
+
+    // Success
+    describe('valid form id', () => {
+      const MOCK_JWT_PAYLOAD: JwtPayload = {
+        userName: 'mock',
+        rememberMe: false,
+      }
+
+      beforeAll(() => {
+        MockFormService.checkIsIntranetFormAccess.mockReturnValue(false)
+        MockFormService.checkHasSingleSubmissionValidationFailure.mockReturnValue(
+          okAsync(false),
+        )
+        MockFormService.checkHasRespondentNotWhitelistedFailure.mockReturnValue(
+          okAsync(false),
+        )
+      })
+
+      it('should return 200 when there is no FormAuthType on the request', async () => {
+        // Arrange
+        const MOCK_NIL_AUTH_FORM = {
+          ...BASE_FORM,
+          authType: FormAuthType.NIL,
+        } as unknown as IPopulatedForm
+        const mockRes = expressHandler.mockResponse()
+
+        MockAuthService.getFormIfPublic.mockReturnValueOnce(
+          okAsync(MOCK_NIL_AUTH_FORM),
+        )
+        MockFormService.checkFormSubmissionLimitAndDeactivateForm.mockReturnValueOnce(
+          okAsync(MOCK_NIL_AUTH_FORM),
+        )
+        MockFormService.checkFormSmsLimitAndDeactivateForm.mockReturnValueOnce(
+          okAsync(MOCK_NIL_AUTH_FORM),
+        )
+
+        // Act
+        await PublicFormController.handleGetPublicForm(
+          MOCK_REQ,
+          mockRes,
+          jest.fn(),
+        )
+
+        // Assert
+        expect(mockRes.json).toHaveBeenCalledWith({
+          form: MOCK_NIL_AUTH_FORM.getPublicView(),
+          isIntranetUser: false,
+        })
+      })
+
+      it('should return 200 when client authenticates using SP', async () => {
+        // Arrange
+        const MOCK_SPCP_SESSION = {
+          userName: MOCK_JWT_PAYLOAD.userName,
+          exp: 1000000000,
+          iat: 100000000,
+          rememberMe: false,
+        }
+        const MOCK_SP_AUTH_FORM = {
+          ...BASE_FORM,
+          authType: FormAuthType.SP,
+        } as unknown as IPopulatedForm
+        const mockRes = expressHandler.mockResponse()
+
+        MockAuthService.getFormIfPublic.mockReturnValueOnce(
+          okAsync(MOCK_SP_AUTH_FORM),
+        )
+        MockFormService.checkFormSubmissionLimitAndDeactivateForm.mockReturnValueOnce(
+          okAsync(MOCK_SP_AUTH_FORM),
+        )
+
+        MockFormService.checkFormSmsLimitAndDeactivateForm.mockReturnValueOnce(
+          okAsync(MOCK_SP_AUTH_FORM),
+        )
+
+        jest
+          .spyOn(SpOidcServiceClass.prototype, 'extractJwtPayloadFromRequest')
+          .mockReturnValueOnce(okAsync(MOCK_SPCP_SESSION))
+
+        // Act
+        await PublicFormController.handleGetPublicForm(
+          MOCK_REQ,
+          mockRes,
+          jest.fn(),
+        )
+
+        // Assert
+        expect(mockRes.json).toHaveBeenCalledWith({
+          form: MOCK_SP_AUTH_FORM.getPublicView(),
+          isIntranetUser: false,
+          spcpSession: MOCK_SPCP_SESSION,
+        })
+      })
+
+      it('should return 200 when client authenticates using CP', async () => {
+        // Arrange
+        const MOCK_SPCP_SESSION = {
+          userName: MOCK_JWT_PAYLOAD.userName,
+          exp: 1000000000,
+          iat: 100000000,
+          rememberMe: false,
+        }
+        const MOCK_CP_AUTH_FORM = {
+          ...BASE_FORM,
+          authType: FormAuthType.CP,
+        } as unknown as IPopulatedForm
+        const mockRes = expressHandler.mockResponse()
+
+        MockAuthService.getFormIfPublic.mockReturnValueOnce(
+          okAsync(MOCK_CP_AUTH_FORM),
+        )
+        MockFormService.checkFormSubmissionLimitAndDeactivateForm.mockReturnValueOnce(
+          okAsync(MOCK_CP_AUTH_FORM),
+        )
+        MockFormService.checkFormSmsLimitAndDeactivateForm.mockReturnValueOnce(
+          okAsync(MOCK_CP_AUTH_FORM),
+        )
+        jest
+          .spyOn(CpOidcServiceClass.prototype, 'extractJwtPayloadFromRequest')
+          .mockReturnValueOnce(okAsync(MOCK_SPCP_SESSION))
+        // Act
+        await PublicFormController.handleGetPublicForm(
+          MOCK_REQ,
+          mockRes,
+          jest.fn(),
+        )
+
+        // Assert
+        expect(mockRes.json).toHaveBeenCalledWith({
+          form: MOCK_CP_AUTH_FORM.getPublicView(),
+          isIntranetUser: false,
+          spcpSession: MOCK_SPCP_SESSION,
+        })
+      })
+
+      it('should return 200 when client authenticates using MyInfo', async () => {
+        // Arrange
+        const MOCK_MYINFO_AUTH_FORM = {
+          ...BASE_FORM,
+          esrvcId: 'thing',
+          authType: FormAuthType.MyInfo,
+          toJSON: jest.fn().mockReturnValue(BASE_FORM),
+        } as unknown as IPopulatedForm
+        const MOCK_MYINFO_DATA = new MyInfoData({
+          uinFin: 'i am a fish',
+        } as IPersonResponse)
+        const MOCK_SPCP_SESSION = { userName: MOCK_MYINFO_DATA.getUinFin() }
+        const mockRes = expressHandler.mockResponse({
+          clearCookie: jest.fn().mockReturnThis(),
+          cookie: jest.fn().mockReturnThis(),
+        })
+        MockAuthService.getFormIfPublic.mockReturnValueOnce(
+          okAsync(MOCK_MYINFO_AUTH_FORM),
+        )
+        MockFormService.checkFormSubmissionLimitAndDeactivateForm.mockReturnValueOnce(
+          okAsync(MOCK_MYINFO_AUTH_FORM),
+        )
+        MockFormService.checkFormSmsLimitAndDeactivateForm.mockReturnValueOnce(
+          okAsync(MOCK_MYINFO_AUTH_FORM),
+        )
+        MockMyInfoFapiService.loadPersonForSession.mockReturnValueOnce(
+          okAsync(MOCK_MYINFO_DATA),
+        )
+        MockBillingService.recordLoginByForm.mockReturnValueOnce(
+          okAsync(MOCK_LOGIN_DOC),
+        )
+        MockMyInfoService.prefillAndSaveMyInfoFields.mockReturnValueOnce(
+          okAsync([]),
+        )
+
+        // Act
+        await PublicFormController.handleGetPublicForm(
+          mockReqWithFapiCookie,
+          mockRes,
+          jest.fn(),
+        )
+
+        // Assert
+        expect(mockRes.cookie).toHaveBeenCalled()
+        expect(mockRes.json).toHaveBeenCalledWith({
+          form: { ...MOCK_MYINFO_AUTH_FORM.getPublicView(), form_fields: [] },
+          spcpSession: MOCK_SPCP_SESSION,
+          isIntranetUser: false,
+        })
+      })
+    })
+
+    describe('success cases for submitterId whitelisting', () => {
+      it('should return 200 ok without any failure flags when user is whitelisted', async () => {
+        // Arrange
+        MockFormService.checkHasRespondentNotWhitelistedFailure.mockReturnValueOnce(
+          okAsync(false),
+        )
+        const MOCK_MYINFO_AUTH_FORM_WITH_WHITELIST_ENABLED = {
+          ...BASE_FORM,
+          esrvcId: 'mockEsrvcId',
+          authType: FormAuthType.MyInfo,
+          whitelistedSubmitterIds: {
+            isWhitelistEnabled: true,
+          },
+          toJSON: jest.fn().mockReturnValue(BASE_FORM),
+        } as unknown as IPopulatedEncryptedForm
+        const MOCK_MYINFO_DATA = new MyInfoData({
+          uinFin: 'mockUinFin',
+        } as IPersonResponse)
+        const MOCK_SPCP_SESSION = { userName: MOCK_MYINFO_DATA.getUinFin() }
+        const mockRes = expressHandler.mockResponse({
+          clearCookie: jest.fn().mockReturnThis(),
+          cookie: jest.fn().mockReturnThis(),
+        })
+        MockAuthService.getFormIfPublic.mockReturnValueOnce(
+          okAsync(MOCK_MYINFO_AUTH_FORM_WITH_WHITELIST_ENABLED),
+        )
+        MockFormService.checkFormSubmissionLimitAndDeactivateForm.mockReturnValueOnce(
+          okAsync(MOCK_MYINFO_AUTH_FORM_WITH_WHITELIST_ENABLED),
+        )
+        MockFormService.checkFormSmsLimitAndDeactivateForm.mockReturnValueOnce(
+          okAsync(MOCK_MYINFO_AUTH_FORM_WITH_WHITELIST_ENABLED),
+        )
+        MockMyInfoFapiService.loadPersonForSession.mockReturnValueOnce(
+          okAsync(MOCK_MYINFO_DATA),
+        )
+        MockBillingService.recordLoginByForm.mockReturnValueOnce(
+          okAsync(MOCK_LOGIN_DOC),
+        )
+        MockMyInfoService.prefillAndSaveMyInfoFields.mockReturnValueOnce(
+          okAsync([]),
+        )
+
+        // Act
+        await PublicFormController.handleGetPublicForm(
+          mockReqWithFapiCookie,
+          mockRes,
+          jest.fn(),
+        )
+
+        // Assert
+        expect(mockRes.cookie).toHaveBeenCalled()
+        expect(mockRes.json).toHaveBeenCalledWith({
+          form: {
+            ...MOCK_MYINFO_AUTH_FORM_WITH_WHITELIST_ENABLED.getPublicView(),
+            form_fields: [],
+          },
+          spcpSession: MOCK_SPCP_SESSION,
+          isIntranetUser: false,
+        })
+      })
+    })
+
+    // Errors
+    describe('errors in myInfo', () => {
+      const MOCK_MYINFO_FORM = {
+        ...BASE_FORM,
+        toJSON: jest.fn().mockReturnThis(),
+        authType: FormAuthType.MyInfo,
+      } as unknown as IPopulatedForm
+
+      // Setup because this gets invoked at the start of the controller to decide which branch to take
+      beforeEach(() => {
+        MockAuthService.getFormIfPublic.mockReturnValue(
+          okAsync(MOCK_MYINFO_FORM),
+        )
+
+        MockFormService.checkIsIntranetFormAccess.mockReturnValue(false)
+        MockFormService.checkFormSubmissionLimitAndDeactivateForm.mockReturnValue(
+          okAsync(MOCK_MYINFO_FORM),
+        )
+        MockFormService.checkFormSmsLimitAndDeactivateForm.mockReturnValue(
+          okAsync(MOCK_MYINFO_FORM),
+        )
+
+        MockBillingService.recordLoginByForm.mockReturnValue(
+          okAsync(MOCK_LOGIN_DOC),
+        )
+      })
+
+      it('should return 200 with cookies cleared and no myInfoError when the request has no FAPI session cookie', async () => {
+        const mockRes = expressHandler.mockResponse({
+          clearCookie: jest.fn().mockReturnThis(),
+        })
+
+        await PublicFormController.handleGetPublicForm(
+          MOCK_REQ,
+          mockRes,
+          jest.fn(),
+        )
+
+        expect(mockRes.clearCookie).toHaveBeenCalled()
+        expect(mockRes.json).toHaveBeenCalledWith({
+          form: MOCK_MYINFO_FORM.getPublicView(),
+          isIntranetUser: false,
+        })
+      })
+
+      it('should return 200 with the unreadable FAPI cookie cleared and no myInfoError', async () => {
+        const mockRes = expressHandler.mockResponse({
+          clearCookie: jest.fn().mockReturnThis(),
+        })
+        const mockReq = expressHandler.mockRequest({
+          params: {
+            formId: MOCK_FORM_ID,
+          },
+          others: {
+            cookies: {
+              [MYINFO_FAPI_SESSION_COOKIE_NAME]: 'unreadable',
+            },
+          },
+        })
+
+        await PublicFormController.handleGetPublicForm(
+          mockReq,
+          mockRes,
+          jest.fn(),
+        )
+
+        expect(mockRes.clearCookie).toHaveBeenCalledWith(
+          MYINFO_FAPI_SESSION_COOKIE_NAME,
+          MYINFO_FAPI_SESSION_COOKIE_IDENTITY,
+        )
+        expect(mockRes.json).toHaveBeenCalledWith({
+          form: MOCK_MYINFO_FORM.getPublicView(),
+          isIntranetUser: false,
+        })
+      })
+
+      it('should return 200 with myInfoError if a database error occurs while saving hashes', async () => {
+        const MOCK_MYINFO_DATA = new MyInfoData({
+          uinFin: 'i am a fish',
+        } as IPersonResponse)
+        const expected = new DatabaseError('fish error')
+        const mockRes = expressHandler.mockResponse({
+          clearCookie: jest.fn().mockReturnThis(),
+        })
+        MockMyInfoFapiService.loadPersonForSession.mockReturnValueOnce(
+          okAsync(MOCK_MYINFO_DATA),
+        )
+        MockMyInfoService.prefillAndSaveMyInfoFields.mockReturnValueOnce(
+          errAsync(expected),
+        )
+
+        await PublicFormController.handleGetPublicForm(
+          mockReqWithFapiCookie,
+          mockRes,
+          jest.fn(),
+        )
+
+        expect(mockRes.clearCookie).toHaveBeenCalled()
+        expect(mockRes.json).toHaveBeenCalledWith({
+          form: MOCK_MYINFO_FORM.getPublicView(),
+          isIntranetUser: false,
+          errorCodes: [ErrorCode.myInfo],
+        })
+      })
+    })
+
+    describe('myInfo FAPI login', () => {
+      const MOCK_MYINFO_FORM = {
+        ...BASE_FORM,
+        toJSON: jest.fn().mockReturnThis(),
+        authType: FormAuthType.MyInfo,
+      } as unknown as IPopulatedForm
+
+      const MOCK_FAPI_SESSION_ID = 'mock-fapi-session-id'
+
+      let mockReqWithFapiCookie: Request<{ formId: string }>
+
+      beforeEach(() => {
+        MockAuthService.getFormIfPublic.mockReturnValue(
+          okAsync(MOCK_MYINFO_FORM),
+        )
+        MockFormService.checkIsIntranetFormAccess.mockReturnValue(false)
+        MockFormService.checkFormSubmissionLimitAndDeactivateForm.mockReturnValue(
+          okAsync(MOCK_MYINFO_FORM),
+        )
+        MockFormService.checkFormSmsLimitAndDeactivateForm.mockReturnValue(
+          okAsync(MOCK_MYINFO_FORM),
+        )
+        MockBillingService.recordLoginByForm.mockReturnValue(
+          okAsync(MOCK_LOGIN_DOC),
+        )
+
+        mockReqWithFapiCookie = expressHandler.mockRequest({
+          params: { formId: MOCK_FORM_ID },
+          others: {
+            cookies: {},
+            signedCookies: {
+              [MYINFO_FAPI_SESSION_COOKIE_NAME]: MOCK_FAPI_SESSION_ID,
+            },
+          },
+        })
+      })
+
+      it('should return 200 with no errorCodes and not log an error when the callback is still in flight', async () => {
+        MockMyInfoFapiService.loadPersonForSession.mockReturnValueOnce(
+          errAsync(new MyInfoFapiIncompleteLoginError()),
+        )
+        const mockRes = expressHandler.mockResponse({
+          clearCookie: jest.fn().mockReturnThis(),
+        })
+
+        await PublicFormController.handleGetPublicForm(
+          mockReqWithFapiCookie,
+          mockRes,
+          jest.fn(),
+        )
+
+        expect(mockRes.clearCookie).toHaveBeenCalledWith(
+          MYINFO_FAPI_SESSION_COOKIE_NAME,
+          MYINFO_FAPI_SESSION_COOKIE_IDENTITY,
+        )
+        expect(mockRes.json).toHaveBeenCalledWith({
+          form: MOCK_MYINFO_FORM.getPublicView(),
+          isIntranetUser: false,
+        })
+      })
+
+      it('should return 200 with myInfoError when the login genuinely failed', async () => {
+        MockMyInfoFapiService.loadPersonForSession.mockReturnValueOnce(
+          errAsync(new MyInfoFapiMissingSessionError()),
+        )
+        const mockRes = expressHandler.mockResponse({
+          clearCookie: jest.fn().mockReturnThis(),
+        })
+
+        await PublicFormController.handleGetPublicForm(
+          mockReqWithFapiCookie,
+          mockRes,
+          jest.fn(),
+        )
+
+        expect(mockRes.clearCookie).toHaveBeenCalledWith(
+          MYINFO_FAPI_SESSION_COOKIE_NAME,
+          MYINFO_FAPI_SESSION_COOKIE_IDENTITY,
+        )
+        expect(mockRes.json).toHaveBeenCalledWith({
+          form: MOCK_MYINFO_FORM.getPublicView(),
+          isIntranetUser: false,
+          errorCodes: [ErrorCode.myInfo],
+        })
+      })
+
+      it('should leave a session belonging to another form untouched', async () => {
+        MockMyInfoFapiService.loadPersonForSession.mockReturnValueOnce(
+          errAsync(new MyInfoFapiSessionFormMismatchError()),
+        )
+        const mockRes = expressHandler.mockResponse({
+          clearCookie: jest.fn().mockReturnThis(),
+        })
+
+        await PublicFormController.handleGetPublicForm(
+          mockReqWithFapiCookie,
+          mockRes,
+          jest.fn(),
+        )
+
+        expect(MockMyInfoFapiService.loadPersonForSession).toHaveBeenCalledWith(
+          {
+            sessionId: MOCK_FAPI_SESSION_ID,
+            formId: MOCK_FORM_ID,
+          },
+        )
+        expect(mockRes.clearCookie).not.toHaveBeenCalledWith(
+          MYINFO_FAPI_SESSION_COOKIE_NAME,
+          MYINFO_FAPI_SESSION_COOKIE_IDENTITY,
+        )
+        expect(mockRes.json).toHaveBeenCalledWith({
+          form: MOCK_MYINFO_FORM.getPublicView(),
+          isIntranetUser: false,
+        })
+      })
+    })
+
+    describe('errors in spcp', () => {
+      const MOCK_SP_FORM = {
+        ...BASE_FORM,
+        authType: FormAuthType.SP,
+      } as unknown as IPopulatedForm
+      const MOCK_CP_FORM = {
+        ...BASE_FORM,
+        authType: FormAuthType.CP,
+      } as unknown as IPopulatedForm
+      it('should return 200 with the form but without a spcpSession when the JWT token could not be found for SP form', async () => {
+        // Arrange
+        // 1. Mock the response and calls
+        const mockRes = expressHandler.mockResponse()
+
+        MockAuthService.getFormIfPublic.mockReturnValueOnce(
+          okAsync(MOCK_SP_FORM),
+        )
+        MockFormService.checkFormSubmissionLimitAndDeactivateForm.mockReturnValueOnce(
+          okAsync(MOCK_SP_FORM),
+        )
+        MockFormService.checkFormSmsLimitAndDeactivateForm.mockReturnValueOnce(
+          okAsync(MOCK_SP_FORM),
+        )
+        jest
+          .spyOn(SpOidcServiceClass.prototype, 'extractJwtPayloadFromRequest')
+          .mockReturnValueOnce(errAsync(new MissingJwtError()))
+
+        // Act
+        // 2. GET the endpoint
+        await PublicFormController.handleGetPublicForm(
+          MOCK_REQ,
+          mockRes,
+          jest.fn(),
+        )
+
+        // Assert
+        // Status should be 200
+        // json object should only have form property
+        expect(mockRes.json).toHaveBeenCalledWith({
+          form: MOCK_SP_FORM.getPublicView(),
+          isIntranetUser: false,
+        })
+      })
+
+      it('should return 200 with the form but without a spcpSession when the JWT token could not be found for CP form', async () => {
+        // Arrange
+        // 1. Mock the response and calls
+        const mockRes = expressHandler.mockResponse()
+
+        MockAuthService.getFormIfPublic.mockReturnValueOnce(
+          okAsync(MOCK_CP_FORM),
+        )
+        MockFormService.checkFormSubmissionLimitAndDeactivateForm.mockReturnValueOnce(
+          okAsync(MOCK_CP_FORM),
+        )
+        MockFormService.checkFormSmsLimitAndDeactivateForm.mockReturnValueOnce(
+          okAsync(MOCK_CP_FORM),
+        )
+        jest
+          .spyOn(CpOidcServiceClass.prototype, 'extractJwtPayloadFromRequest')
+          .mockReturnValueOnce(errAsync(new MissingJwtError()))
+
+        // Act
+        // 2. GET the endpoint
+        await PublicFormController.handleGetPublicForm(
+          MOCK_REQ,
+          mockRes,
+          jest.fn(),
+        )
+
+        // Assert
+        // Status should be 200
+        // json object should only have form property
+        expect(mockRes.json).toHaveBeenCalledWith({
+          form: MOCK_CP_FORM.getPublicView(),
+          isIntranetUser: false,
+        })
+      })
+    })
+
+    describe('errors due to submitterId whitelisting', () => {
+      it('should return 200 but with respondent not whitelisted failure flag when submitterId is not in whitelist', async () => {
+        // Arrange
+        MockFormService.checkHasRespondentNotWhitelistedFailure.mockReturnValueOnce(
+          okAsync(true),
+        )
+        const MOCK_MYINFO_AUTH_FORM_WITH_WHITELIST_ENABLED = {
+          ...BASE_FORM,
+          esrvcId: 'mockEsrvcId',
+          authType: FormAuthType.MyInfo,
+          whitelistedSubmitterIds: {
+            isWhitelistEnabled: true,
+          },
+          toJSON: jest.fn().mockReturnValue(BASE_FORM),
+        } as unknown as IPopulatedEncryptedForm
+        const MOCK_MYINFO_DATA = new MyInfoData({
+          uinFin: 'mockUinFin',
+        } as IPersonResponse)
+        const mockRes = expressHandler.mockResponse({
+          clearCookie: jest.fn().mockReturnThis(),
+          cookie: jest.fn().mockReturnThis(),
+        })
+        MockAuthService.getFormIfPublic.mockReturnValueOnce(
+          okAsync(MOCK_MYINFO_AUTH_FORM_WITH_WHITELIST_ENABLED),
+        )
+        MockFormService.checkFormSubmissionLimitAndDeactivateForm.mockReturnValueOnce(
+          okAsync(MOCK_MYINFO_AUTH_FORM_WITH_WHITELIST_ENABLED),
+        )
+        MockFormService.checkFormSmsLimitAndDeactivateForm.mockReturnValueOnce(
+          okAsync(MOCK_MYINFO_AUTH_FORM_WITH_WHITELIST_ENABLED),
+        )
+        MockMyInfoFapiService.loadPersonForSession.mockReturnValueOnce(
+          okAsync(MOCK_MYINFO_DATA),
+        )
+        MockBillingService.recordLoginByForm.mockReturnValueOnce(
+          okAsync(MOCK_LOGIN_DOC),
+        )
+        MockMyInfoService.prefillAndSaveMyInfoFields.mockReturnValueOnce(
+          okAsync([]),
+        )
+
+        // Act
+        await PublicFormController.handleGetPublicForm(
+          mockReqWithFapiCookie,
+          mockRes,
+          jest.fn(),
+        )
+
+        // Assert that user is logged out and myInfo fields are not passed
+        expect(mockRes.json).toHaveBeenCalledWith({
+          form: {
+            ...MOCK_MYINFO_AUTH_FORM_WITH_WHITELIST_ENABLED.getPublicView(),
+          },
+          isIntranetUser: false,
+          errorCodes: [ErrorCode.respondentNotWhitelisted],
+        })
+      })
+    })
+
+    describe('errors due to single submission per submitterId violation', () => {
+      const MOCK_SP_FORM = {
+        ...BASE_FORM,
+        authType: FormAuthType.SP,
+      } as unknown as IPopulatedForm
+      const MOCK_SPCP_SESSION = {
+        userName: 'submitterId',
+        exp: 1000000000,
+        iat: 100000000,
+        rememberMe: false,
+      }
+      it('should return 200 but with single submission validation failure flag when submitterId already submitted for form id', async () => {
+        MockAuthService.getFormIfPublic.mockReturnValueOnce(
+          okAsync(MOCK_SP_FORM),
+        )
+        MockFormService.checkFormSubmissionLimitAndDeactivateForm.mockReturnValueOnce(
+          okAsync(MOCK_SP_FORM),
+        )
+        MockFormService.checkFormSmsLimitAndDeactivateForm.mockReturnValueOnce(
+          okAsync(MOCK_SP_FORM),
+        )
+        jest
+          .spyOn(SpOidcServiceClass.prototype, 'extractJwtPayloadFromRequest')
+          .mockReturnValueOnce(okAsync(MOCK_SPCP_SESSION))
+
+        const checkHasSingleSubmissionValidationFailureSpy = jest
+          .spyOn(MockFormService, 'checkHasSingleSubmissionValidationFailure')
+          .mockResolvedValueOnce(okAsync(true))
+
+        const mockRes = expressHandler.mockResponse()
+
+        // Act
+        await PublicFormController.handleGetPublicForm(
+          MOCK_REQ,
+          mockRes,
+          jest.fn(),
+        )
+
+        // Assert that the submitterId is upper cased and then hashed when compared
+        expect(
+          checkHasSingleSubmissionValidationFailureSpy.mock.calls[0][1],
+        ).toEqual(
+          generateHashedSubmitterId(
+            MOCK_SPCP_SESSION.userName.toUpperCase(),
+            MOCK_SP_FORM._id,
+          ),
+        )
+
+        // Assert that status is not set, which defaults to intended 200 ok
+        expect(mockRes.status).not.toHaveBeenCalled()
+        // Assert that the form details is still returned so that FE can populate the title
+        expect((mockRes.json as jest.Mock).mock.calls[0][0].form).toEqual(
+          MOCK_SP_FORM.getPublicView(),
+        )
+        // Assert that the response contains the single submission validation failure flag
+        expect((mockRes.json as jest.Mock).mock.calls[0][0].errorCodes).toEqual(
+          [ErrorCode.respondentSingleSubmissionValidationFailure],
+        )
+
+        // Assert user is logged out
+        expect((mockRes.json as jest.Mock).mock.calls[0][0]).not.toContainKey(
+          'spcpSession',
+        )
+        expect(mockRes.clearCookie).toHaveBeenCalledExactlyOnceWith(
+          getCookieNameByAuthType(FormAuthType.SP),
+        )
+      })
+    })
+
+    describe('errors in form retrieval', () => {
+      const MOCK_ERROR_STRING = 'mockingbird'
+
+      it('should return 500 when a database error occurs', async () => {
+        // Arrange
+        // 1. Mock the response
+        const mockRes = expressHandler.mockResponse()
+
+        // 2. Mock the call to retrieve the form
+        MockAuthService.getFormIfPublic.mockReturnValueOnce(
+          errAsync(new DatabaseError(MOCK_ERROR_STRING)),
+        )
+
+        // Act
+        await PublicFormController.handleGetPublicForm(
+          MOCK_REQ,
+          mockRes,
+          jest.fn(),
+        )
+
+        // Assert
+        // 1. Check args of mocked services
+        expect(MockAuthService.getFormIfPublic).toHaveBeenCalledWith(
+          MOCK_FORM_ID,
+        )
+        // 2. Check that error is correct
+        expect(
+          MockFormService.checkFormSubmissionLimitAndDeactivateForm,
+        ).not.toHaveBeenCalled()
+        expect(mockRes.status).toHaveBeenCalledWith(500)
+        expect(mockRes.json).toHaveBeenCalledWith({
+          message: MOCK_ERROR_STRING,
+        })
+      })
+
+      it('should return 404 when the form is not found', async () => {
+        // Arrange
+        // 1. Mock the response
+        const mockRes = expressHandler.mockResponse()
+
+        // 2. Mock the call to retrieve the form
+        MockAuthService.getFormIfPublic.mockReturnValueOnce(
+          errAsync(new FormNotFoundError()),
+        )
+
+        // Act
+        await PublicFormController.handleGetPublicForm(
+          MOCK_REQ,
+          mockRes,
+          jest.fn(),
+        )
+
+        // Assert
+        // 1. Check args of mocked services
+        expect(MockAuthService.getFormIfPublic).toHaveBeenCalledWith(
+          MOCK_FORM_ID,
+        )
+        // 2. Check that error is correct
+        expect(
+          MockFormService.checkFormSubmissionLimitAndDeactivateForm,
+        ).not.toHaveBeenCalled()
+        expect(mockRes.status).toHaveBeenCalledWith(404)
+        expect(mockRes.json).toHaveBeenCalledWith({
+          message: 'Form not found',
+        })
+      })
+
+      it('should return 404 when the form is private and not accessible by the public', async () => {
+        // Arrange
+        // 1. Mock the response
+        const mockRes = expressHandler.mockResponse()
+        const MOCK_FORM_TITLE = 'private form'
+
+        // 2. Mock the call to retrieve the form
+        MockAuthService.getFormIfPublic.mockReturnValueOnce(
+          errAsync(new PrivateFormError(MOCK_ERROR_STRING, MOCK_FORM_TITLE)),
+        )
+
+        // Act
+        await PublicFormController.handleGetPublicForm(
+          MOCK_REQ,
+          mockRes,
+          jest.fn(),
+        )
+
+        // Assert
+        // 1. Check args of mocked services
+        expect(MockAuthService.getFormIfPublic).toHaveBeenCalledWith(
+          MOCK_FORM_ID,
+        )
+        // 2. Check that error is correct
+        expect(
+          MockFormService.checkFormSubmissionLimitAndDeactivateForm,
+        ).not.toHaveBeenCalled()
+        expect(mockRes.status).toHaveBeenCalledWith(404)
+        expect(mockRes.json).toHaveBeenCalledWith({
+          message: MOCK_ERROR_STRING,
+          formTitle: MOCK_FORM_TITLE,
+          isPageFound: true,
+        })
+      })
+    })
+
+    describe('errors in form access', () => {
+      const MOCK_SPCP_SESSION = {
+        userName: 'mock',
+        exp: 1000000000,
+        iat: 100000000,
+        rememberMe: false,
+      }
+
+      it('should return 200 with isIntranetUser set to false when a user accesses a form from outside intranet', async () => {
+        // Arrange
+        const MOCK_NIL_AUTH_FORM = {
+          ...BASE_FORM,
+          authType: FormAuthType.NIL,
+        } as unknown as IPopulatedForm
+        const mockRes = expressHandler.mockResponse()
+
+        MockAuthService.getFormIfPublic.mockReturnValueOnce(
+          okAsync(MOCK_NIL_AUTH_FORM),
+        )
+        MockFormService.checkFormSubmissionLimitAndDeactivateForm.mockReturnValueOnce(
+          okAsync(MOCK_NIL_AUTH_FORM),
+        )
+        MockFormService.checkFormSmsLimitAndDeactivateForm.mockReturnValueOnce(
+          okAsync(MOCK_NIL_AUTH_FORM),
+        )
+        MockFormService.checkIsIntranetFormAccess.mockReturnValueOnce(false)
+
+        // Act
+        await PublicFormController.handleGetPublicForm(
+          MOCK_REQ,
+          mockRes,
+          jest.fn(),
+        )
+
+        // Assert
+        expect(mockRes.json).toHaveBeenCalledWith({
+          form: MOCK_NIL_AUTH_FORM.getPublicView(),
+          isIntranetUser: false,
+        })
+      })
+
+      it('should return 200 with isIntranetUser set to true when a intranet user accesses an FormAuthType.SP form', async () => {
+        // Arrange
+        const MOCK_SP_AUTH_FORM = {
+          ...BASE_FORM,
+          authType: FormAuthType.SP,
+        } as unknown as IPopulatedForm
+
+        const mockRes = expressHandler.mockResponse()
+
+        jest
+          .spyOn(SpOidcServiceClass.prototype, 'extractJwtPayloadFromRequest')
+          .mockReturnValueOnce(okAsync(MOCK_SPCP_SESSION))
+        MockFormService.checkIsIntranetFormAccess.mockReturnValueOnce(true)
+        MockAuthService.getFormIfPublic.mockReturnValueOnce(
+          okAsync(MOCK_SP_AUTH_FORM),
+        )
+        MockFormService.checkFormSubmissionLimitAndDeactivateForm.mockReturnValueOnce(
+          okAsync(MOCK_SP_AUTH_FORM),
+        )
+        MockFormService.checkFormSmsLimitAndDeactivateForm.mockReturnValueOnce(
+          okAsync(MOCK_SP_AUTH_FORM),
+        )
+
+        // Act
+        await PublicFormController.handleGetPublicForm(
+          MOCK_REQ,
+          mockRes,
+          jest.fn(),
+        )
+
+        // Assert
+        expect(mockRes.json).toHaveBeenCalledWith({
+          form: MOCK_SP_AUTH_FORM.getPublicView(),
+          spcpSession: MOCK_SPCP_SESSION,
+          isIntranetUser: true,
+        })
+      })
+
+      it('should return 200 with isIntranetUser set to true when a intranet user accesses an FormAuthType.CP form', async () => {
+        // Arrange
+        const MOCK_CP_AUTH_FORM = {
+          ...BASE_FORM,
+          authType: FormAuthType.CP,
+        } as unknown as IPopulatedForm
+
+        const mockRes = expressHandler.mockResponse()
+
+        MockFormService.checkIsIntranetFormAccess.mockReturnValueOnce(true)
+        jest
+          .spyOn(CpOidcServiceClass.prototype, 'extractJwtPayloadFromRequest')
+          .mockReturnValueOnce(okAsync(MOCK_SPCP_SESSION))
+        MockAuthService.getFormIfPublic.mockReturnValueOnce(
+          okAsync(MOCK_CP_AUTH_FORM),
+        )
+        MockFormService.checkFormSubmissionLimitAndDeactivateForm.mockReturnValueOnce(
+          okAsync(MOCK_CP_AUTH_FORM),
+        )
+        MockFormService.checkFormSmsLimitAndDeactivateForm.mockReturnValueOnce(
+          okAsync(MOCK_CP_AUTH_FORM),
+        )
+
+        // Act
+        await PublicFormController.handleGetPublicForm(
+          MOCK_REQ,
+          mockRes,
+          jest.fn(),
+        )
+
+        // Assert
+        expect(mockRes.json).toHaveBeenCalledWith({
+          form: MOCK_CP_AUTH_FORM.getPublicView(),
+          spcpSession: MOCK_SPCP_SESSION,
+          isIntranetUser: true,
+        })
+      })
+
+      it('should return 200 with isIntranetUser set to true when a intranet user accesses an FormAuthType.MyInfo form', async () => {
+        // Arrange
+        const MOCK_MYINFO_AUTH_FORM = {
+          ...BASE_FORM,
+          esrvcId: 'thing',
+          authType: FormAuthType.MyInfo,
+          toJSON: jest.fn().mockReturnValue(BASE_FORM),
+        } as unknown as IPopulatedForm
+        const mockRes = expressHandler.mockResponse({
+          clearCookie: jest.fn().mockReturnThis(),
+          cookie: jest.fn().mockReturnThis(),
+        })
+
+        const MOCK_MYINFO_DATA = new MyInfoData({
+          uinFin: 'i am a fish',
+        } as IPersonResponse)
+
+        MockAuthService.getFormIfPublic.mockReturnValueOnce(
+          okAsync(MOCK_MYINFO_AUTH_FORM),
+        )
+        MockFormService.checkFormSubmissionLimitAndDeactivateForm.mockReturnValueOnce(
+          okAsync(MOCK_MYINFO_AUTH_FORM),
+        )
+        MockFormService.checkFormSmsLimitAndDeactivateForm.mockReturnValueOnce(
+          okAsync(MOCK_MYINFO_AUTH_FORM),
+        )
+        MockFormService.checkIsIntranetFormAccess.mockReturnValueOnce(true)
+        MockMyInfoFapiService.loadPersonForSession.mockReturnValueOnce(
+          okAsync(MOCK_MYINFO_DATA),
+        )
+        MockBillingService.recordLoginByForm.mockReturnValueOnce(
+          okAsync(MOCK_LOGIN_DOC),
+        )
+        MockMyInfoService.prefillAndSaveMyInfoFields.mockReturnValueOnce(
+          okAsync([]),
+        )
+
+        // Act
+        await PublicFormController.handleGetPublicForm(
+          mockReqWithFapiCookie,
+          mockRes,
+          jest.fn(),
+        )
+
+        // Assert
+        expect(mockRes.cookie).toHaveBeenCalled()
+        expect(mockRes.json).toHaveBeenCalledWith({
+          form: { ...MOCK_MYINFO_AUTH_FORM.getPublicView(), form_fields: [] },
+          spcpSession: { userName: MOCK_MYINFO_DATA.getUinFin() },
+          isIntranetUser: true,
+        })
+      })
+    })
+  })
+
+  describe('_handleFormAuthRedirect', () => {
+    const MOCK_REQ = expressHandler.mockRequest({
+      params: {
+        formId: new ObjectId().toHexString(),
+      },
+      query: {
+        isPersistentLogin: true,
+      },
+      others: {
+        growthbook: {
+          isOn: jest.fn(() => false),
+          getAttributes: jest.fn(() => ({})),
+          setAttributes: jest.fn().mockResolvedValue(undefined),
+        },
+      },
+    })
+    // retrieveFullFormById populates admin and errors when it is absent,
+    // so a form reaching the controller always has one.
+    const MOCK_ADMIN = { email: 'mock@example.com' }
+    const MOCK_REDIRECT_URL = 'www.mockata.com'
+    const MOCK_CODE_VERIFIER = 'mockCodeVerifier'
+
+    const MOCK_CODE_VERIFIER_COOKIE_OPTIONS = {
+      httpOnly: true as const,
+      secure: true,
+      sameSite: 'lax' as const,
+      path: '/',
+    }
+
+    beforeEach(() => {
+      SpOidcServiceClass.prototype.codeVerifierCookieName =
+        CodeVerifierCookieName.SP
+      CpOidcServiceClass.prototype.codeVerifierCookieName =
+        CodeVerifierCookieName.CP
+      jest
+        .spyOn(SpOidcServiceClass.prototype, 'getCodeVerifierCookieOptions')
+        .mockReturnValue(MOCK_CODE_VERIFIER_COOKIE_OPTIONS)
+      jest
+        .spyOn(CpOidcServiceClass.prototype, 'getCodeVerifierCookieOptions')
+        .mockReturnValue(MOCK_CODE_VERIFIER_COOKIE_OPTIONS)
+      jest
+        .spyOn(SpOidcServiceClass.prototype, 'getCodeVerifierCookieName')
+        .mockImplementation(
+          ActualSpcpOidcServiceClass.prototype.getCodeVerifierCookieName,
+        )
+      jest
+        .spyOn(CpOidcServiceClass.prototype, 'getCodeVerifierCookieName')
+        .mockImplementation(
+          ActualSpcpOidcServiceClass.prototype.getCodeVerifierCookieName,
+        )
+    })
+
+    it('should return 200 with the redirect url when the request is valid and the form has authType SP', async () => {
+      // Arrange
+      const MOCK_FORM = {
+        admin: MOCK_ADMIN,
+        authType: FormAuthType.SP,
+        esrvcId: '12345',
+      } as SpcpForm<IFormDocument>
+      const mockRes = expressHandler.mockResponse()
+      MockFormService.retrieveFullFormById.mockReturnValueOnce(
+        okAsync(MOCK_FORM),
+      )
+      const createRedirectUrlSpy = jest
+        .spyOn(SpOidcServiceClass.prototype, 'createRedirectUrl')
+        .mockReturnValueOnce(
+          okAsync({
+            redirectUrl: MOCK_REDIRECT_URL,
+            codeVerifier: MOCK_CODE_VERIFIER,
+          }),
+        )
+
+      // Act
+      await PublicFormController._handleFormAuthRedirect(
+        MOCK_REQ,
+        mockRes,
+        jest.fn(),
+      )
+
+      // Assert
+      expect(createRedirectUrlSpy).toHaveBeenCalledWith(
+        expect.any(String),
+        MOCK_FORM.esrvcId,
+      )
+      expect(mockRes.status).toHaveBeenCalledWith(200)
+      expect(mockRes.json).toHaveBeenCalledWith({
+        redirectURL: MOCK_REDIRECT_URL,
+      })
+      expect(mockRes.cookie).toHaveBeenCalledWith(
+        CodeVerifierCookieName.SP,
+        MOCK_CODE_VERIFIER,
+        expect.anything(),
+      )
+    })
+
+    it('should return 200 with the redirect url when the request is valid, form has authType SP and isPersistentLogin is undefined', async () => {
+      // Arrange
+      const MOCK_REQ_WITHOUT_PERSISTENT_LOGIN = expressHandler.mockRequest({
+        params: {
+          formId: new ObjectId().toHexString(),
+        },
+      })
+      const MOCK_FORM = {
+        admin: MOCK_ADMIN,
+        authType: FormAuthType.SP,
+        esrvcId: '12345',
+      } as SpcpForm<IFormDocument>
+      const mockRes = expressHandler.mockResponse()
+      MockFormService.retrieveFullFormById.mockReturnValueOnce(
+        okAsync(MOCK_FORM),
+      )
+      jest
+        .spyOn(SpOidcServiceClass.prototype, 'createRedirectUrl')
+        .mockReturnValueOnce(
+          okAsync({
+            redirectUrl: MOCK_REDIRECT_URL,
+            codeVerifier: MOCK_CODE_VERIFIER,
+          }),
+        )
+
+      // Act
+      await PublicFormController._handleFormAuthRedirect(
+        MOCK_REQ_WITHOUT_PERSISTENT_LOGIN,
+        mockRes,
+        jest.fn(),
+      )
+
+      // Assert
+      expect(mockRes.status).toHaveBeenCalledWith(200)
+      expect(mockRes.json).toHaveBeenCalledWith({
+        redirectURL: MOCK_REDIRECT_URL,
+      })
+    })
+
+    it('should return 200 with the redirect url when the request is valid, form has authType SP and isPersistentLogin is false', async () => {
+      // Arrange
+      const MOCK_REQ_WITH_FALSE_PERSISTENT_LOGIN = expressHandler.mockRequest({
+        params: {
+          formId: new ObjectId().toHexString(),
+        },
+        query: {
+          isPersistentLogin: false,
+        },
+      })
+      const MOCK_FORM = {
+        admin: MOCK_ADMIN,
+        authType: FormAuthType.SP,
+        esrvcId: '12345',
+      } as SpcpForm<IFormDocument>
+      const mockRes = expressHandler.mockResponse()
+      MockFormService.retrieveFullFormById.mockReturnValueOnce(
+        okAsync(MOCK_FORM),
+      )
+      jest
+        .spyOn(SpOidcServiceClass.prototype, 'createRedirectUrl')
+        .mockReturnValueOnce(
+          okAsync({
+            redirectUrl: MOCK_REDIRECT_URL,
+            codeVerifier: MOCK_CODE_VERIFIER,
+          }),
+        )
+
+      // Act
+      await PublicFormController._handleFormAuthRedirect(
+        MOCK_REQ_WITH_FALSE_PERSISTENT_LOGIN,
+        mockRes,
+        jest.fn(),
+      )
+
+      // Assert
+      expect(mockRes.status).toHaveBeenCalledWith(200)
+      expect(mockRes.json).toHaveBeenCalledWith({
+        redirectURL: MOCK_REDIRECT_URL,
+      })
+    })
+
+    it('should return 200 with the redirect url when the request is valid and the form has authType CP', async () => {
+      // Arrange
+      const MOCK_FORM = {
+        admin: MOCK_ADMIN,
+        authType: FormAuthType.CP,
+        esrvcId: '12345',
+      } as SpcpForm<IFormDocument>
+
+      const mockRes = expressHandler.mockResponse()
+      MockFormService.retrieveFullFormById.mockReturnValueOnce(
+        okAsync(MOCK_FORM),
+      )
+      jest
+        .spyOn(CpOidcServiceClass.prototype, 'createRedirectUrl')
+        .mockReturnValueOnce(
+          okAsync({
+            redirectUrl: MOCK_REDIRECT_URL,
+            codeVerifier: MOCK_CODE_VERIFIER,
+          }),
+        )
+
+      // Act
+      await PublicFormController._handleFormAuthRedirect(
+        MOCK_REQ,
+        mockRes,
+        jest.fn(),
+      )
+
+      // Assert
+      expect(mockRes.status).toHaveBeenCalledWith(200)
+      expect(mockRes.json).toHaveBeenCalledWith({
+        redirectURL: MOCK_REDIRECT_URL,
+      })
+      expect(mockRes.cookie).toHaveBeenCalledWith(
+        CodeVerifierCookieName.CP,
+        MOCK_CODE_VERIFIER,
+        expect.anything(),
+      )
+    })
+
+    it('should return 200 with the FAPI redirect url and set the FAPI session cookie when the form has authType MyInfo', async () => {
+      const MOCK_FORM = {
+        admin: MOCK_ADMIN,
+        authType: FormAuthType.MyInfo,
+        getUniqueMyInfoAttrs: jest.fn().mockReturnValue([]),
+      } as unknown as IFormDocument
+      const MOCK_SESSION_ID = 'mockSessionId'
+
+      const mockRes = expressHandler.mockResponse()
+      MockFormService.retrieveFullFormById.mockReturnValueOnce(
+        okAsync(MOCK_FORM),
+      )
+      MockMyInfoFapiService.startLogin.mockReturnValueOnce(
+        okAsync({
+          sessionId: MOCK_SESSION_ID,
+          redirectUrl: MOCK_REDIRECT_URL,
+        }),
+      )
+
+      await PublicFormController._handleFormAuthRedirect(
+        MOCK_REQ,
+        mockRes,
+        jest.fn(),
+      )
+
+      expect(MockMyInfoFapiService.startLogin).toHaveBeenCalledWith({
+        formId: MOCK_REQ.params.formId,
+        encodedQuery: undefined,
+        requestedAttributes: [],
+        includeSponsoredChildren: false,
+      })
+      expect(mockRes.cookie).toHaveBeenCalledWith(
+        MYINFO_FAPI_SESSION_COOKIE_NAME,
+        MOCK_SESSION_ID,
+        {
+          ...MYINFO_FAPI_SESSION_COOKIE_IDENTITY,
+          maxAge: MYINFO_FAPI_SESSION_MAX_AGE_MS,
+        },
+      )
+      expect(mockRes.status).toHaveBeenCalledWith(200)
+      expect(mockRes.json).toHaveBeenCalledWith({
+        redirectURL: MOCK_REDIRECT_URL,
+      })
+    })
+
+    it('should return 400 when the form has authType NIL', async () => {
+      // Arrange
+      const MOCK_FORM = {
+        admin: MOCK_ADMIN,
+        authType: FormAuthType.NIL,
+        esrvcId: '12345',
+      } as IFormDocument
+
+      const mockRes = expressHandler.mockResponse()
+      MockFormService.retrieveFullFormById.mockReturnValueOnce(
+        okAsync(MOCK_FORM),
+      )
+
+      // Act
+      await PublicFormController._handleFormAuthRedirect(
+        MOCK_REQ,
+        mockRes,
+        jest.fn(),
+      )
+
+      // Assert
+      expect(mockRes.status).toHaveBeenCalledWith(400)
+      expect(mockRes.json).toHaveBeenCalledWith({
+        message:
+          'Please ensure that the form has authentication enabled. Please refresh and try again.',
+      })
+    })
+
+    it('should return 400 when the form has authType CP and is missing esrvcId', async () => {
+      // Arrange
+      const MOCK_FORM = {
+        admin: MOCK_ADMIN,
+        authType: FormAuthType.CP,
+      } as unknown as SpcpForm<IFormDocument>
+
+      const mockRes = expressHandler.mockResponse()
+      MockFormService.retrieveFullFormById.mockReturnValueOnce(
+        okAsync(MOCK_FORM),
+      )
+
+      // Act
+      await PublicFormController._handleFormAuthRedirect(
+        MOCK_REQ,
+        mockRes,
+        jest.fn(),
+      )
+
+      // Assert
+      expect(mockRes.status).toHaveBeenCalledWith(400)
+      expect(mockRes.json).toHaveBeenCalledWith({
+        message:
+          'This form does not have a valid eServiceId. Please refresh and try again.',
+      })
+    })
+
+    it('should return 500 when the form could not be retrieved from the database', async () => {
+      // Arrange
+
+      const mockRes = expressHandler.mockResponse()
+      MockFormService.retrieveFullFormById.mockReturnValueOnce(
+        errAsync(new DatabaseError()),
+      )
+
+      // Act
+      await PublicFormController._handleFormAuthRedirect(
+        MOCK_REQ,
+        mockRes,
+        jest.fn(),
+      )
+
+      // Assert
+      expect(mockRes.status).toHaveBeenCalledWith(500)
+      expect(mockRes.json).toHaveBeenCalledWith({
+        message: 'Sorry, something went wrong. Please try again.',
+      })
+    })
+
+    it('should return 500 when the redirectURL could not be created for SP form', async () => {
+      // Arrange
+      const MOCK_FORM = {
+        admin: MOCK_ADMIN,
+        esrvcId: '234',
+        authType: FormAuthType.SP,
+      } as unknown as SpcpForm<IFormDocument>
+
+      const mockRes = expressHandler.mockResponse()
+      MockFormService.retrieveFullFormById.mockReturnValueOnce(
+        okAsync(MOCK_FORM),
+      )
+      jest
+        .spyOn(SpOidcServiceClass.prototype, 'createRedirectUrl')
+        .mockReturnValue(errAsync(new CreateRedirectUrlError()))
+
+      // Act
+      await PublicFormController._handleFormAuthRedirect(
+        MOCK_REQ,
+        mockRes,
+        jest.fn(),
+      )
+
+      // Assert
+      expect(mockRes.status).toHaveBeenCalledWith(500)
+      expect(mockRes.json).toHaveBeenCalledWith({
+        message: 'Sorry, something went wrong. Please try again.',
+      })
+    })
+
+    it('should return 500 when the redirectURL could not be created for CP form', async () => {
+      // Arrange
+      const MOCK_FORM = {
+        admin: MOCK_ADMIN,
+        esrvcId: '234',
+        authType: FormAuthType.CP,
+      } as unknown as SpcpForm<IFormDocument>
+
+      const mockRes = expressHandler.mockResponse()
+      MockFormService.retrieveFullFormById.mockReturnValueOnce(
+        okAsync(MOCK_FORM),
+      )
+      jest
+        .spyOn(CpOidcServiceClass.prototype, 'createRedirectUrl')
+        .mockReturnValueOnce(errAsync(new CreateRedirectUrlError()))
+
+      // Act
+      await PublicFormController._handleFormAuthRedirect(
+        MOCK_REQ,
+        mockRes,
+        jest.fn(),
+      )
+
+      // Assert
+      expect(mockRes.status).toHaveBeenCalledWith(500)
+      expect(mockRes.json).toHaveBeenCalledWith({
+        message: 'Sorry, something went wrong. Please try again.',
+      })
+    })
+  })
+
+  describe('handlePublicAuthLogout', () => {
+    it('should return 200 if authType is SP and call clearCookie()', async () => {
+      const authType = FormAuthType.SP as const
+      MockPublicFormService.getCookieNameByAuthType.mockReturnValueOnce(
+        JwtName[authType],
+      )
+      const mockReq = expressHandler.mockRequest({
+        params: {
+          authType,
+        },
+      })
+      const mockRes = expressHandler.mockResponse({
+        clearCookie: jest.fn().mockReturnThis(),
+      })
+
+      await PublicFormController._handlePublicAuthLogout(
+        mockReq,
+        mockRes,
+        jest.fn(),
+      )
+
+      expect(mockRes.status).toHaveBeenCalledWith(200)
+      expect(mockRes.clearCookie).toHaveBeenCalledWith(JwtName[authType])
+      expect(mockRes.json).toHaveBeenCalledWith({
+        message: 'Successfully logged out.',
+      })
+    })
+
+    it('should return 200 if authType is CP and call clearCookie()', async () => {
+      const authType = FormAuthType.CP as const
+      MockPublicFormService.getCookieNameByAuthType.mockReturnValueOnce(
+        JwtName[authType],
+      )
+      const mockReq = expressHandler.mockRequest({
+        params: {
+          authType,
+        },
+      })
+      const mockRes = expressHandler.mockResponse({
+        clearCookie: jest.fn().mockReturnThis(),
+      })
+
+      await PublicFormController._handlePublicAuthLogout(
+        mockReq,
+        mockRes,
+        jest.fn(),
+      )
+
+      expect(mockRes.status).toHaveBeenCalledWith(200)
+      expect(mockRes.clearCookie).toHaveBeenCalledWith(JwtName[authType])
+      expect(mockRes.json).toHaveBeenCalledWith({
+        message: 'Successfully logged out.',
+      })
+    })
+
+    it('should return 200 if authType is MyInfo and call clearCookie()', async () => {
+      const authType = FormAuthType.MyInfo as const
+      MockPublicFormService.getCookieNameByAuthType.mockReturnValueOnce(
+        MYINFO_LOGIN_COOKIE_NAME,
+      )
+      const mockReq = expressHandler.mockRequest({
+        params: {
+          authType,
+        },
+      })
+      const mockRes = expressHandler.mockResponse({
+        clearCookie: jest.fn().mockReturnThis(),
+      })
+
+      await PublicFormController._handlePublicAuthLogout(
+        mockReq,
+        mockRes,
+        jest.fn(),
+      )
+
+      expect(mockRes.status).toHaveBeenCalledWith(200)
+      expect(mockRes.clearCookie).toHaveBeenCalledWith(MYINFO_LOGIN_COOKIE_NAME)
+      expect(mockRes.clearCookie).toHaveBeenCalledWith(
+        MYINFO_FAPI_SESSION_COOKIE_NAME,
+        MYINFO_FAPI_SESSION_COOKIE_IDENTITY,
+      )
+      expect(mockRes.json).toHaveBeenCalledWith({
+        message: 'Successfully logged out.',
+      })
+    })
+  })
+})

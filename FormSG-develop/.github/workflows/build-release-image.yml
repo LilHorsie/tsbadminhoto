@@ -1,0 +1,89 @@
+name: Build Release Image
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: 'Version tag to build (e.g., v7.4.5)'
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Version tag to build (e.g., v7.4.5)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE_NAME: ghcr.io/opengovsg/formsg
+
+jobs:
+  ensure-base-images:
+    name: Ensure base images
+    uses: ./.github/workflows/build-base-images.yml
+    permissions:
+      contents: read
+      packages: write
+
+  build-release:
+    name: Build release image
+    needs: ensure-base-images
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          # Build the tagged release commit. Both the workflow_call (from the
+          # release workflow) and workflow_dispatch paths supply the tag.
+          ref: ${{ inputs.tag }}
+
+      - name: Determine version tag
+        id: version
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Building release image for $TAG"
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check if release image already exists
+        id: check-exists
+        run: |
+          IMAGE="${{ env.IMAGE_NAME }}:release-${{ steps.version.outputs.tag }}"
+          if docker manifest inspect "$IMAGE" > /dev/null 2>&1; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Release image already exists: $IMAGE"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Docker Buildx
+        if: steps.check-exists.outputs.skip != 'true'
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - name: Build and push release image
+        if: steps.check-exists.outputs.skip != 'true'
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: Dockerfile.production
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:release-${{ steps.version.outputs.tag }}
+          build-args: |
+            BUILD_BASE_IMAGE=${{ needs.ensure-base-images.outputs.build-base-image }}
+            APP_VERSION=${{ steps.version.outputs.tag }}
+            DD_RUM_APP_ID=${{ secrets.DD_RUM_APP_ID }}
+            DD_RUM_CLIENT_TOKEN=${{ secrets.DD_RUM_CLIENT_TOKEN }}
+          cache-from: |
+            type=registry,ref=${{ env.IMAGE_NAME }}:build-latest

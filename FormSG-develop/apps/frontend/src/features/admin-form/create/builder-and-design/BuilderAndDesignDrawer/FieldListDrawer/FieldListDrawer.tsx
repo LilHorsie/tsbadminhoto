@@ -1,0 +1,166 @@
+import { useState } from 'react'
+import { useTranslation } from 'react-i18next'
+import { BiSearch } from 'react-icons/bi'
+import {
+  Box,
+  Divider,
+  Flex,
+  Icon,
+  Input,
+  InputGroup,
+  InputLeftElement,
+  TabList,
+  TabPanel,
+  TabPanels,
+  Tabs,
+  Text,
+} from '@chakra-ui/react'
+import { useFeatureIsOn } from '@growthbook/growthbook-react'
+
+import { featureFlags } from 'formsg-shared/constants'
+import { isLoginIdentityResponseMode } from 'formsg-shared/utils/login-identity'
+
+import { Tab } from '~components/Tabs'
+
+import { useCreatePageSidebar } from '~features/admin-form/create/common/CreatePageSidebarContext'
+
+import { useCreateTabForm } from '../../../builder-and-design/useCreateTabForm'
+import { CreatePageDrawerCloseButton } from '../../../common'
+import { FieldListTabIndex } from '../../constants'
+import MagicFormBuilderSmallButton from '../../MagicFormBuilder/components/MagicFormBuilderSmallButton'
+import { useMagicFormBuilder } from '../../MagicFormBuilder/useMagicFormBuilder'
+
+import {
+  BasicFieldPanel,
+  CorppassFieldPanel,
+  MyInfoFieldPanel,
+  PaymentsInputPanel,
+} from './field-panels'
+
+const FieldSearchBar = ({
+  searchValue,
+  onChange,
+  placeholder,
+}: {
+  searchValue: string
+  onChange: (e: React.ChangeEvent<HTMLInputElement>) => void
+  placeholder: string
+}) => {
+  const { toggleIsModalOpen, isModalOpen } = useMagicFormBuilder()
+
+  return (
+    <>
+      <InputGroup>
+        <InputLeftElement>
+          <Icon as={BiSearch} color="secondary.500" fontSize="1.25rem" />
+        </InputLeftElement>
+        <Input
+          mr="0.5rem"
+          value={searchValue}
+          onChange={onChange}
+          placeholder={placeholder}
+        />
+        <MagicFormBuilderSmallButton
+          onClick={toggleIsModalOpen}
+          isActive={isModalOpen}
+        />
+      </InputGroup>
+    </>
+  )
+}
+
+export const FieldListDrawer = (): JSX.Element => {
+  const { t } = useTranslation('translation', {
+    keyPrefix: 'features.adminForm.sidebar.fields',
+  })
+  const { fieldListTabIndex, setFieldListTabIndex } = useCreatePageSidebar()
+  const { data: form, isLoading } = useCreateTabForm()
+  const isNricFieldEnabled = useFeatureIsOn(featureFlags.isNricFieldEnabled)
+  const [searchValue, setSearchValue] = useState('')
+
+  const tabsDataList = [
+    {
+      header: t('builder.tabs.basic'),
+      component: BasicFieldPanel,
+      isHidden: false,
+      isDisabled: isLoading,
+      key: FieldListTabIndex.Basic,
+    },
+    {
+      header: t('builder.tabs.myInfo'),
+      component: MyInfoFieldPanel,
+      isHidden: false,
+      isDisabled: isLoading,
+      key: FieldListTabIndex.MyInfo,
+    },
+    {
+      header: t('builder.tabs.corppass'),
+      component: CorppassFieldPanel,
+      // Login identity fields are available in Storage and MRF.
+      isHidden:
+        !isNricFieldEnabled ||
+        !form ||
+        !isLoginIdentityResponseMode(form.responseMode),
+      isDisabled: isLoading,
+      key: FieldListTabIndex.Corppass,
+    },
+    {
+      header: t('builder.tabs.payments'),
+      component: PaymentsInputPanel,
+      isHidden: false,
+      isDisabled: isLoading,
+      key: FieldListTabIndex.Payments,
+    },
+  ].filter((tab) => !tab.isHidden) as {
+    header: string
+    component: (props: { searchValue?: string }) => JSX.Element
+    isDisabled: boolean
+    key: FieldListTabIndex
+  }[]
+  // Tabs index by position, so translate to and from the stable tab keys.
+  const tabPosition = Math.max(
+    tabsDataList.findIndex((tab) => tab.key === fieldListTabIndex),
+    0,
+  )
+
+  return (
+    <Tabs
+      pos="relative"
+      h="100%"
+      display="flex"
+      flexDir="column"
+      index={tabPosition}
+      onChange={(position) => setFieldListTabIndex(tabsDataList[position].key)}
+      isLazy
+    >
+      <Box pt="1rem" px="1.5rem" bg="white">
+        <Flex justify="space-between">
+          <Text textStyle="subhead-3" color="secondary.500" mb="1rem">
+            {t('builder.title')}
+          </Text>
+          <CreatePageDrawerCloseButton />
+        </Flex>
+        <FieldSearchBar
+          searchValue={searchValue}
+          onChange={(e) => setSearchValue(e.target.value)}
+          placeholder={t('builder.searchPlaceholder')}
+        />
+        <TabList mt="0.5rem" mx="-0.25rem" w="100%">
+          {tabsDataList.map((tab) => (
+            <Tab key={tab.key} isDisabled={tab.isDisabled}>
+              {tab.header}
+            </Tab>
+          ))}
+        </TabList>
+        <Divider w="auto" mx="-1.5rem" />
+      </Box>
+      <TabPanels pb="1rem" flex={1} overflowY="auto">
+        {tabsDataList.map((tab) => (
+          <TabPanel key={tab.key}>
+            <tab.component searchValue={searchValue} />
+          </TabPanel>
+        ))}
+      </TabPanels>
+    </Tabs>
+  )
+}

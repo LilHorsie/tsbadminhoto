@@ -1,0 +1,148 @@
+import { ResponsesResponsesPage } from '.'
+
+export const enSG: ResponsesResponsesPage = {
+  emptyResponses: {
+    title: "You don't have any responses yet.",
+    subtitle: 'Try using {link} to send out your form links!',
+  },
+  emailResponsesTab: {
+    responsesToDate:
+      '{responsesCount, plural, =1 {response} other {responses}} to date',
+    responsesNotStoredInEmailMode:
+      'FormSG does not store responses in Email mode.',
+  },
+  storage: {
+    unlockedResponses: {
+      downloadWithAttachmentModal: {
+        canceledScreen: {
+          downloadStopped: 'Download stopped',
+          title:
+            'Your responses and attachments have not been downloaded successfully.',
+          backToResponses: 'Back to responses',
+        },
+        confirmationScreen: {
+          pdfsDescription:
+            'For PDFs, all files will be bundled into a <strong>single zip</strong>.',
+          attachmentsDescription:
+            'For attachments, <strong>a separate zip file</strong> will be downloaded for each response.',
+          downloadTitle: 'Download {downloadItems}',
+          csvTitle: 'Download CSV',
+          csvAppliesTableView:
+            'The CSV includes the filters, sorting and columns applied to the table.',
+          responsesText: 'responses',
+          pdfsText: 'PDFs',
+          attachmentsText: 'attachments',
+          andText: 'and',
+          numberOfResponses: 'Number of responses',
+          estimatedTime: 'Estimated time',
+          estimatedTimeReference: '30-50 mins per 1,000 responses',
+          filterResponsesCountHelperText:
+            'You can reduce the number of downloads at one go by adjusting the date range.',
+          intensiveOperationWarning: {
+            title: 'Downloading many files can be an intensive operation.',
+            doNotUseIE: 'Do not use Internet Explorer',
+            ensureStrongNetworkConnectivity:
+              'Ensure network connectivity is strong',
+            ensureEnoughDiskSpace:
+              'Ensure device has sufficient disk space for the download',
+          },
+          noResponsesInSelectedDateRange:
+            'The date range you selected does not contain any responses. Please select a date range containing responses and try again.',
+          startDownload: 'Start download',
+        },
+        modal: {
+          progressMessage:
+            'Up to {responsesCount} files are being downloaded into your destination folder. Navigating away from this page will stop the download.',
+        },
+      },
+      progressModal: {
+        completeScreen: {
+          downloadComplete: 'Download complete',
+          backToResponses: 'Back to responses',
+        },
+        content: {
+          title: 'Downloading...',
+          percentCompleted: '% completed',
+          stopDownload: 'Stop download',
+        },
+      },
+      responsesTable: {
+        sendReminderButton: {
+          sendReminder: 'Send reminder',
+          reminderSent: 'Reminder sent',
+        },
+      },
+      submissionSearchbarPlaceholder: 'Search by response ID',
+      searchResponsesPlaceholder: 'Search responses...',
+      filterMenu: {
+        dateRange: 'Date range',
+        columns: 'Filter by column',
+        filterApplied: 'Filter applied',
+        filterPlaceholder: 'Contains...',
+        clearFilter: 'Clear filter',
+        clearAllFilters: 'Clear all filters',
+      },
+      views: {
+        allResponses: 'All responses',
+        saveAsNewView: 'Save as new view',
+        saveView: 'Save view',
+        viewLimitReached: 'You can only save up to {MAX_VIEWS} views.',
+        viewName: 'View name',
+        viewNamePlaceholder: 'e.g. Pending approvals',
+        viewNameRequired: 'View name is required',
+        viewNameMinLength: 'View name must be at least {MIN_LENGTH} characters',
+        viewNameMaxLength: 'View name must be at most {MAX_LENGTH} characters',
+        deleteView: 'Delete view {VIEW_NAME}',
+        deleteViewTitle: 'Delete {VIEW_NAME}?',
+        deleteViewDescription:
+          'This view will be removed for everyone with access to the form. The responses themselves are not deleted.',
+        deleteViewSuccess: 'Your view has been successfully deleted.',
+        saveViewSuccess: 'Your view has been successfully saved.',
+      },
+      sortMenu: {
+        column: 'Column',
+        direction: 'Direction',
+        responseNumber: 'Response #',
+        ascending: 'Ascending',
+        descending: 'Descending',
+      },
+      toolbar: {
+        filter: 'Filter',
+        sort: 'Sort',
+        columns: 'Columns',
+        all: 'All',
+      },
+      downloadButton: {
+        label: 'Download options',
+        navigateAwayPrompt: {
+          title: 'Stop downloading responses?',
+          description:
+            'You are currently downloading form responses. The download will be aborted if you leave this page.',
+          confirmButtonText: 'Yes, leave this page',
+        },
+        progressModalContent:
+          'All responses are being processed. Navigating away from this page will stop the download.',
+        menuItem: {
+          csv: 'Spreadsheet of responses (.csv)',
+          attachments: 'Respondent-uploaded attachments',
+          pdfs: 'PDF copies of responses (.pdf)',
+        },
+      },
+      unlockedResponses: {
+        resultsFound: '{count, plural, =1 {result} other {results}} found',
+        responsesToDate:
+          '{count, plural, =1 {response} other {responses}} to date',
+        recentOnly: 'Only showing the most recent {limit} responses',
+        recentOnlyWithView:
+          'Only applying filters and sorting to the most recent {limit} responses',
+        showMore: 'Show more',
+      },
+    },
+    storageResponsesTab: {
+      secretKeyVerification: {
+        ctaText: 'Unlock responses',
+        label: 'Enter or upload Secret Key',
+      },
+    },
+  },
+}

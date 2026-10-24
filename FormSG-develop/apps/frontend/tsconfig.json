@@ -1,0 +1,54 @@
+{
+  "compilerOptions": {
+    "target": "ES2021",
+    "lib": ["DOM", "DOM.Iterable", "ES2021"],
+    "allowJs": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "strict": true,
+    "forceConsistentCasingInFileNames": true,
+    "noFallthroughCasesInSwitch": true,
+    "module": "ESNext",
+    "moduleResolution": "node",
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "jsx": "react-jsx",
+    "downlevelIteration": true,
+    "baseUrl": ".",
+    "paths": {
+      "@storybook/react-vite": [
+        "./node_modules/@storybook/react-vite/dist/index.d.ts"
+      ],
+      "@storybook/addon-links": [
+        "./node_modules/@storybook/addon-links/dist/index.d.ts"
+      ],
+      "@storybook/addon-themes": [
+        "./node_modules/@storybook/addon-themes/dist/index.d.ts"
+      ],
+      "@storybook/react": ["./node_modules/@storybook/react/dist/index.d.ts"],
+      "storybook/internal/*": ["./node_modules/storybook/dist/*/index.d.ts"],
+      "storybook/*": ["./node_modules/storybook/dist/*/index.d.ts"],
+      "~assets/*": ["./src/assets/*"],
+      "~contexts/*": ["./src/contexts/*"],
+      "~constants/*": ["./src/constants/*"],
+      "~components/*": ["./src/components/*"],
+      "~templates/*": ["./src/templates/*"],
+      "~features/*": ["./src/features/*"],
+      "~hooks/*": ["./src/hooks/*"],
+      "~utils/*": ["./src/utils/*"],
+      "~pages/*": ["./src/pages/*"],
+      "~services/*": ["./src/services/*"],
+      "~theme/*": ["./src/theme/*"],
+      "~typings/*": ["./src/typings/*"],
+      "~/*": ["./src/*"]
+    }
+  },
+  "include": ["src/**/*", ".storybook/**/*", "./vitest-setup.ts"],
+  "references": [
+    {
+      "path": "./tsconfig.node.json"
+    }
+  ]
+}

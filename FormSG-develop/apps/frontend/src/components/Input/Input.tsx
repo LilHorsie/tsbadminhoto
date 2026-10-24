@@ -1,0 +1,153 @@
+import { useMemo } from 'react'
+import {
+  forwardRef,
+  Icon,
+  Input as ChakraInput,
+  InputGroup,
+  InputLeftAddon,
+  InputProps as ChakraInputProps,
+  InputRightElement,
+  useMultiStyleConfig,
+} from '@chakra-ui/react'
+import { omit } from '@chakra-ui/utils'
+import { merge } from 'lodash'
+
+import { BxsCheckCircle } from '~assets/icons/BxsCheckCircle'
+
+export interface InputProps extends ChakraInputProps {
+  /**
+   * Whether the input is in a prefilled state.
+   */
+  isPrefilled?: boolean
+  /**
+   * Whether the input is in a locked prefilled state.
+   */
+  isPrefillLocked?: boolean
+  /**
+   * Whether the input is in a success state.
+   */
+  isSuccess?: boolean
+  /**
+   * Whether to prevent default on user pressing the 'Enter' key.
+   */
+  preventDefaultOnEnter?: boolean
+  /**
+   * Whether there's an input right element. Used to provide additional padding
+   */
+  hasInputRightElement?: boolean
+  /**
+   * Better visibility of values in the disabled component when set to true.
+   */
+  isHighContrast?: boolean
+}
+
+export const Input = forwardRef<InputProps, 'input'>((props, ref) => {
+  // const inputStyles = useMultiStyleConfig('Input', props)
+  const inputStyles = useMultiStyleConfig('Input', {
+    ...props,
+    variant: props.isHighContrast ? 'highContrast' : props.variant,
+  })
+  // Omit extra props so they will not be passed into the DOM and trigger
+  // React warnings.
+  const inputProps = omit(props, [
+    'isSuccess',
+    'isPrefilled',
+    'isPrefillLocked',
+    'preventDefaultOnEnter',
+    'hasInputRightElement',
+    'isHighContrast',
+  ])
+
+  const preventDefault = useMemo(
+    () =>
+      // This flag should be set for form input fields, to prevent refresh on enter if form only has one input
+      props.preventDefaultOnEnter
+        ? {
+            onKeyDown: (e: React.KeyboardEvent<HTMLInputElement>) => {
+              if (e.key === 'Enter') {
+                e.preventDefault()
+              }
+            },
+          }
+        : {},
+    [props.preventDefaultOnEnter],
+  )
+
+  // Return normal input component if not success state.
+  if (!props.isSuccess) {
+    if (props.prefix) {
+      return (
+        <InputGroup>
+          <InputLeftAddon pointerEvents="none" children={props.prefix} />
+          <ChakraInput
+            ref={ref}
+            {...preventDefault}
+            {...inputProps}
+            {...(props.isPrefillLocked ? { isDisabled: true } : {})}
+            sx={props.sx ?? inputStyles.field}
+          />
+        </InputGroup>
+      )
+    } else {
+      if (props.isPrefillLocked) {
+        return (
+          <InputGroup>
+            <ChakraInput
+              ref={ref}
+              {...preventDefault}
+              {...inputProps}
+              isDisabled
+              sx={props.sx ?? inputStyles.field}
+            />
+          </InputGroup>
+        )
+      } else {
+        return (
+          <ChakraInput
+            ref={ref}
+            {...preventDefault}
+            {...inputProps}
+            {...(props.isHighContrast && {
+              variant: 'highContrast',
+            })}
+            sx={merge(
+              props.hasInputRightElement ? { pr: '2.75rem' } : {},
+              props.sx,
+            )}
+          />
+        )
+      }
+    }
+  }
+
+  return (
+    // InputGroup is required for InputRightElement to retrieve the correct
+    // style props. Will crash if not included.
+    <InputGroup>
+      <ChakraInput
+        ref={ref}
+        {...preventDefault}
+        {...inputProps}
+        sx={props.sx ?? inputStyles.field}
+      />
+      <InputRightElement
+        sx={{
+          pointerEvents: 'none',
+          fontSize: '1.25rem',
+          color: 'success.700',
+        }}
+      >
+        <Icon as={BxsCheckCircle} />
+      </InputRightElement>
+    </InputGroup>
+  )
+})
+
+/**
+ * This is used in by Chakra's `InputGroup` component to remove border radii
+ * when paired with `InputLeftAddon` or `InputRightAddon`.
+ *
+ * See https://github.com/chakra-ui/chakra-ui/blob/main/packages/input/src/input.tsx#L70 and
+ * https://github.com/chakra-ui/chakra-ui/blob/main/packages/input/src/input-group.tsx#L58.
+ */
+Input.id = 'Input'

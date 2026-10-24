@@ -1,0 +1,714 @@
+import { HttpStatusCode } from 'axios'
+import { celebrate, Joi, Segments } from 'celebrate'
+import { randomBytes } from 'crypto'
+import { featureFlags } from 'formsg-shared/constants'
+import {
+  ErrorCode,
+  ErrorDto,
+  FormAuthType,
+  FormFieldDto,
+  FormResponseMode,
+  PrivateFormErrorDto,
+  PublicFormAuthLogoutDto,
+  PublicFormAuthRedirectDto,
+  PublicFormDto,
+  PublicFormViewDto,
+  StrippedFormWorkflowDto,
+} from 'formsg-shared/types'
+import { isLoginIdentityField } from 'formsg-shared/utils/login-identity'
+import { stripWorkflowEmails } from 'formsg-shared/utils/strip-workflow-emails'
+import { StatusCodes } from 'http-status-codes'
+import { err, okAsync } from 'neverthrow'
+
+import { IPopulatedMultirespondentForm } from '../../../../types'
+import { isTest } from '../../../config/config'
+import { createLoggerWithLabel } from '../../../config/logger'
+import { isMongoError } from '../../../utils/handle-mongo-error'
+import { createReqMeta, getRequestIp } from '../../../utils/request'
+import { getFormIfPublic } from '../../auth/auth.service'
+import * as BillingService from '../../billing/billing.service'
+import { ControllerHandler } from '../../core/core.types'
+import { MYINFO_FAPI_SESSION_COOKIE_NAME } from '../../myinfo/fapi/myinfo.fapi.constants'
+import {
+  clearMyInfoFapiSessionCookie,
+  setMyInfoFapiSessionCookie,
+} from '../../myinfo/fapi/myinfo.fapi.controller'
+import {
+  MyInfoFapiIncompleteLoginError,
+  MyInfoFapiSessionFormMismatchError,
+} from '../../myinfo/fapi/myinfo.fapi.errors'
+import * as MyInfoFapiService from '../../myinfo/fapi/myinfo.fapi.service'
+import { MyInfoData } from '../../myinfo/myinfo.adapter'
+import {
+  MYINFO_LOGIN_COOKIE_NAME,
+  MYINFO_LOGIN_COOKIE_OPTIONS,
+} from '../../myinfo/myinfo.constants'
+import { MyInfoService } from '../../myinfo/myinfo.service'
+import {
+  createMyInfoLoginCookie,
+  shouldFetchSponsoredChildren,
+} from '../../myinfo/myinfo.util'
+import { InvalidJwtError, VerifyJwtError } from '../../spcp/spcp.errors'
+import { getOidcService } from '../../spcp/spcp.oidc.service'
+import {
+  getRedirectTargetSpcpOidc,
+  validateSpcpForm,
+} from '../../spcp/spcp.util'
+import { generateHashedSubmitterId } from '../../submission/submission.utils'
+import {
+  AuthTypeMismatchError,
+  FormRespondentNotWhitelistedError,
+  FormRespondentSingleSubmissionValidationError,
+  PrivateFormError,
+} from '../form.errors'
+import * as FormService from '../form.service'
+
+import * as PublicFormService from './public-form.service'
+import {
+  getLoginIdentityValues,
+  mapFormAuthError,
+  mapRouteError,
+  prefillLoginIdentityFields,
+} from './public-form.utils'
+
+const logger = createLoggerWithLabel(module)
+
+/**
+ * Handler for GET /:formId/publicform endpoint
+ * @returns 200 if the form exists
+ * @returns 404 if form with formId does not exist or is private
+ * @returns 410 if form has been archived
+ * @returns 500 if database error occurs or if the type of error is unknown
+ */
+export const handleGetPublicForm: ControllerHandler<
+  { formId: string },
+  PublicFormViewDto | ErrorDto | PrivateFormErrorDto
+> = async (req, res) => {
+  const { formId } = req.params
+  const logMeta = {
+    action: 'handleGetPublicForm',
+    ...createReqMeta(req),
+    formId,
+  }
+
+  const gb = req.growthbook
+  const isMrfResponseLimitEnabled =
+    isTest || (gb?.isOn(featureFlags.mrfResponseLimit) ?? true)
+
+  const formResult = await getFormIfPublic(formId)
+    .andThen((form) =>
+      // TODO(MRF-SUBMISSION-LIMIT): Remove check once mrf submission limit is stable.
+      form.responseMode === FormResponseMode.Encrypt ||
+      isMrfResponseLimitEnabled
+        ? FormService.checkFormSubmissionLimitAndDeactivateForm(form)
+        : okAsync(form),
+    )
+    .andThen((form) => FormService.checkFormSmsLimitAndDeactivateForm(form))
+
+  // Early return if form is not public or any error occurred.
+  if (formResult.isErr()) {
+    const { error } = formResult
+    // NOTE: Only log on possible database errors.
+    // This is because the other kinds of errors are expected errors and are not truly exceptional
+    if (isMongoError(error)) {
+      logger.error({
+        message: 'Error retrieving public form',
+        meta: logMeta,
+        error,
+      })
+    }
+    const { errorMessage, statusCode } = mapRouteError(error)
+
+    // Specialized error response for PrivateFormError.
+    // This is to maintain backwards compatibility with the middleware implementation
+    if (error instanceof PrivateFormError) {
+      return res.status(statusCode).json({
+        message: error.message,
+        // Flag to prevent default 404 subtext ("please check link") from
+        // showing.
+        isPageFound: true,
+        formTitle: error.formTitle,
+      })
+    }
+
+    return res.status(statusCode).json({ message: errorMessage })
+  }
+
+  const form = formResult.value
+  const publicForm = form.getPublicView() as PublicFormDto
+
+  const { authType } = form
+  const isIntranetUser = FormService.checkIsIntranetFormAccess(
+    getRequestIp(req),
+    form,
+  )
+
+  if (authType === FormAuthType.NIL) {
+    return res.json({ form: publicForm, isIntranetUser })
+  }
+
+  let spcpSession
+  let myInfoFields
+
+  // extract spcpSession and myInfoFields based on authType
+  switch (authType) {
+    case FormAuthType.SP: {
+      const oidcService = getOidcService(FormAuthType.SP)
+      const jwtPayloadResult = await oidcService.extractJwtPayloadFromRequest(
+        req.cookies,
+      )
+      if (jwtPayloadResult.isErr()) {
+        const error = jwtPayloadResult.error
+        // Report only relevant errors - verification failed for user here
+        if (
+          error instanceof VerifyJwtError ||
+          error instanceof InvalidJwtError
+        ) {
+          logger.error({
+            message: 'Error getting public form',
+            meta: logMeta,
+            error,
+          })
+        }
+        return res.json({ form: publicForm, isIntranetUser })
+      }
+      spcpSession = jwtPayloadResult.value
+      break
+    }
+    case FormAuthType.CP: {
+      const oidcService = getOidcService(FormAuthType.CP)
+      const jwtPayloadResult = await oidcService.extractJwtPayloadFromRequest(
+        req.cookies,
+      )
+      if (jwtPayloadResult.isErr()) {
+        const error = jwtPayloadResult.error
+        // Report only relevant errors - verification failed for user here
+        if (
+          error instanceof VerifyJwtError ||
+          error instanceof InvalidJwtError
+        ) {
+          logger.error({
+            message: 'Error getting public form',
+            meta: logMeta,
+            error,
+          })
+        }
+        return res.json({ form: publicForm, isIntranetUser })
+      }
+      spcpSession = jwtPayloadResult.value
+      break
+    }
+    case FormAuthType.MyInfo: {
+      // We always want to clear existing login cookies because we no longer
+      // have the prefilled data
+      res.clearCookie(MYINFO_LOGIN_COOKIE_NAME, MYINFO_LOGIN_COOKIE_OPTIONS)
+
+      const fapiSessionId: unknown =
+        req.signedCookies?.[MYINFO_FAPI_SESSION_COOKIE_NAME]
+      if (typeof fapiSessionId === 'string' && fapiSessionId) {
+        const fapiFieldsResult = await MyInfoFapiService.loadPersonForSession({
+          sessionId: fapiSessionId,
+          formId,
+        })
+        if (fapiFieldsResult.isErr()) {
+          const { error: fapiError } = fapiFieldsResult
+
+          // Frontend tab-scoping decides whether to discard a session for
+          // another form.
+          if (!(fapiError instanceof MyInfoFapiSessionFormMismatchError)) {
+            clearMyInfoFapiSessionCookie(res)
+          }
+
+          // Callback not yet reached, or the session belongs to another tab —
+          // treat either as no login attempt.
+          if (
+            fapiError instanceof MyInfoFapiIncompleteLoginError ||
+            fapiError instanceof MyInfoFapiSessionFormMismatchError
+          ) {
+            return res.json({ form: publicForm, isIntranetUser })
+          }
+
+          logger.error({
+            message: 'MyInfo login error',
+            meta: logMeta,
+            error: fapiError,
+          })
+          return res.json({
+            form: publicForm,
+            errorCodes: [ErrorCode.myInfo],
+            isIntranetUser,
+          })
+        }
+
+        clearMyInfoFapiSessionCookie(res)
+        myInfoFields = fapiFieldsResult.value
+      } else {
+        if (req.cookies[MYINFO_FAPI_SESSION_COOKIE_NAME]) {
+          // Present but unreadable (e.g. rotated SESSION_SECRET); drop it
+          // since nothing can consume it.
+          clearMyInfoFapiSessionCookie(res)
+        }
+        // User is accessing the form before logging in.
+        return res.json({
+          form: publicForm,
+          isIntranetUser,
+        })
+      }
+
+      spcpSession = { userName: myInfoFields.getUinFin() }
+      break
+    }
+    default: {
+      // Force TS to emit an error if the cases above are not exhaustive
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      const exhaustiveCheck: never = authType
+    }
+  }
+
+  if (!spcpSession) {
+    logger.error({
+      message: 'spcpSession is undefined',
+      meta: logMeta,
+    })
+    return res.sendStatus(HttpStatusCode.InternalServerError)
+  }
+
+  // for consistency with whitelist lookup which also uppercases all submitterIds when saving
+  const submitterId = spcpSession.userName.toUpperCase()
+
+  // validate if respondent is whitelisted
+  const hasRespondentNotWhitelistedErrorResult =
+    await FormService.checkHasRespondentNotWhitelistedFailure(form, submitterId)
+
+  if (hasRespondentNotWhitelistedErrorResult.isErr()) {
+    const error = hasRespondentNotWhitelistedErrorResult.error
+    logger.error({
+      message: 'Error validating if respondent is whitelisted',
+      meta: logMeta,
+      error,
+    })
+    return res.sendStatus(HttpStatusCode.InternalServerError)
+  }
+
+  const hasRespondentNotWhitelistedError =
+    hasRespondentNotWhitelistedErrorResult.value
+  if (hasRespondentNotWhitelistedError) {
+    // created for Datadog logging of error code
+    new FormRespondentNotWhitelistedError()
+
+    // log user out
+    spcpSession = undefined
+    const authCookieName = PublicFormService.getCookieNameByAuthType(authType)
+    res.clearCookie(authCookieName)
+
+    return res.json({
+      form: publicForm,
+      isIntranetUser,
+      errorCodes: [ErrorCode.respondentNotWhitelisted],
+    })
+  }
+
+  // validate for isSingleSubmission
+  const hasSingleSubmissionValidationFailureResult =
+    await FormService.checkHasSingleSubmissionValidationFailure(
+      publicForm,
+      generateHashedSubmitterId(submitterId, formId),
+    )
+
+  if (hasSingleSubmissionValidationFailureResult.isErr()) {
+    const error = hasSingleSubmissionValidationFailureResult.error
+    logger.error({
+      message: 'Error validating single submission constraint',
+      meta: logMeta,
+      error,
+    })
+    return res.sendStatus(HttpStatusCode.InternalServerError)
+  }
+
+  const hasSingleSubmissionValidationFailure =
+    hasSingleSubmissionValidationFailureResult.value
+
+  if (hasSingleSubmissionValidationFailure) {
+    // Created for Datadog logging of error code
+    new FormRespondentSingleSubmissionValidationError()
+
+    // log user out
+    spcpSession = undefined
+    const authCookieName = PublicFormService.getCookieNameByAuthType(authType)
+    res.clearCookie(authCookieName)
+
+    return res.json({
+      form: publicForm, // do not need to pre-fill even if MyInfo since user is not logged in
+      isIntranetUser,
+      errorCodes: [ErrorCode.respondentSingleSubmissionValidationFailure],
+    })
+  }
+
+  const withLoginIdentities = (formFields: FormFieldDto[]): FormFieldDto[] =>
+    prefillLoginIdentityFields(
+      formFields,
+      getLoginIdentityValues(authType, spcpSession),
+      'workflow' in publicForm ? publicForm.workflow : undefined,
+    )
+
+  // generate form response based on authType
+  switch (authType) {
+    case FormAuthType.SP:
+    case FormAuthType.CP:
+      return res.json({
+        // Forms without login identity fields keep their response as is.
+        form: (publicForm.form_fields ?? []).some(isLoginIdentityField)
+          ? {
+              ...publicForm,
+              form_fields: withLoginIdentities(publicForm.form_fields),
+            }
+          : publicForm,
+        isIntranetUser,
+        spcpSession,
+      })
+    case FormAuthType.MyInfo: {
+      if (!myInfoFields) {
+        logger.error({
+          message: 'Failed to load MyInfo fields',
+          meta: logMeta,
+        })
+        // No need for cookie if data could not be retrieved
+        // NOTE: If the user does not have any cookie, clearing the cookie still has the same result
+        return res.json({
+          form: publicForm,
+          errorCodes: [ErrorCode.myInfo],
+          isIntranetUser,
+        })
+      }
+      await BillingService.recordLoginByForm(form)
+      const prefilledFieldsResult =
+        await MyInfoService.prefillAndSaveMyInfoFields(
+          form._id,
+          myInfoFields,
+          form.toJSON().form_fields,
+        )
+
+      if (prefilledFieldsResult.isErr()) {
+        const error = prefilledFieldsResult.error
+        logger.error({
+          message: 'MyInfo: Failed to prefill and save MyInfo fields',
+          meta: logMeta,
+          error,
+        })
+        return res.json({
+          form: publicForm,
+          errorCodes: [ErrorCode.myInfo],
+          isIntranetUser,
+        })
+      }
+
+      const prefilledFields = prefilledFieldsResult.value
+
+      return res
+        .cookie(
+          MYINFO_LOGIN_COOKIE_NAME,
+          createMyInfoLoginCookie(myInfoFields.getUinFin()),
+          MYINFO_LOGIN_COOKIE_OPTIONS,
+        )
+        .json({
+          spcpSession,
+          form: {
+            ...publicForm,
+            form_fields: withLoginIdentities(prefilledFields as FormFieldDto[]),
+          },
+          isIntranetUser,
+          myInfoChildrenBirthRecords: (
+            myInfoFields as MyInfoData
+          ).getChildrenBirthRecords(form.getUniqueMyInfoAttrs()),
+        })
+    }
+    default: {
+      // Force TS to emit an error if the cases above are not exhaustive
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      const exhaustiveCheck: never = authType
+    }
+  }
+}
+
+export const handleGetPublicFormSampleSubmission: ControllerHandler<
+  { formId: string },
+  | {
+      responses: ReturnType<typeof FormService.createSampleSubmissionResponses>
+      workflowContent?: { workflow: StrippedFormWorkflowDto }
+    }
+  | ErrorDto
+  | PrivateFormErrorDto
+> = async (req, res) => {
+  const { formId } = req.params
+  const logMeta = {
+    action: 'handleGetPublicFormSampleSubmission',
+    ...createReqMeta(req),
+    formId,
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const formResult = await getFormIfPublic(formId)
+  // Early return if form is not public or any error occurred.
+  if (formResult.isErr()) {
+    const { error } = formResult
+    // NOTE: Only log on possible database errors.
+    // This is because the other kinds of errors are expected errors and are not truly exceptional
+    if (isMongoError(error)) {
+      logger.error({
+        message: 'Error retrieving public form',
+        meta: logMeta,
+        error,
+      })
+    }
+    const { errorMessage, statusCode } = mapRouteError(error)
+
+    // Specialized error response for PrivateFormError.
+    // This is to maintain backwards compatibility with the middleware implementation
+    if (error instanceof PrivateFormError) {
+      return res.status(statusCode).json({
+        message: error.message,
+        // Flag to prevent default 404 subtext ("please check link") from
+        // showing.
+        isPageFound: true,
+        formTitle: error.formTitle,
+      })
+    }
+
+    return res.status(statusCode).json({ message: errorMessage })
+  }
+
+  const form = formResult.value
+
+  const publicForm = form.getPublicView() as PublicFormDto
+
+  const formFields = publicForm.form_fields
+  if (!formFields) {
+    logger.error({
+      message: 'Form fields not found from form public view',
+      meta: logMeta,
+    })
+    return res.sendStatus(HttpStatusCode.InternalServerError)
+  }
+
+  let sampleData: ReturnType<typeof FormService.createSampleSubmissionResponses>
+  try {
+    sampleData = FormService.createSampleSubmissionResponses(formFields)
+  } catch (error) {
+    logger.error({
+      message: 'Error faking sample submission data',
+      meta: logMeta,
+      error,
+    })
+    return res.sendStatus(HttpStatusCode.InternalServerError)
+  }
+
+  // Include workflow if form is a multirespondent form
+  if (form.responseMode === FormResponseMode.Multirespondent) {
+    const mrfForm = form as IPopulatedMultirespondentForm
+    res.json({
+      responses: sampleData,
+      workflowContent: {
+        workflow: stripWorkflowEmails(mrfForm.toObject().workflow),
+      },
+    })
+  } else {
+    return res.json({ responses: sampleData })
+  }
+}
+/**
+ * NOTE: This is exported only for testing
+ * Generates redirect URL to Official SingPass/CorpPass log in page
+ * @param isPersistentLogin whether the client wants to have their login information stored
+ * @param encodedQuery base64 encoded queryId for frontend to retrieve stored query params (usually contains prefilled form information)
+ * @returns 200 with the redirect url when the user authenticates successfully
+ * @returns 400 when there is an error on the authType of the form
+ * @returns 400 when the eServiceId of the form does not exist
+ * @returns 404 when form with given ID does not exist
+ * @returns 500 when database error occurs
+ * @returns 500 when the redirect url could not be created
+ * @returns 500 when the redirect feature is not enabled
+ */
+export const _handleFormAuthRedirect: ControllerHandler<
+  { formId: string },
+  PublicFormAuthRedirectDto | ErrorDto,
+  unknown,
+  { isPersistentLogin?: boolean; encodedQuery?: string }
+> = (req, res) => {
+  const { formId } = req.params
+  const { isPersistentLogin, encodedQuery } = req.query
+  const logMeta = {
+    action: 'handleFormAuthRedirect',
+    ...createReqMeta(req),
+    formId,
+  }
+
+  let formAuthType: FormAuthType
+  // NOTE: Using retrieveFullForm instead of retrieveForm to ensure authType always exists
+  return FormService.retrieveFullFormById(formId)
+    .andThen((form) => {
+      formAuthType = form.authType
+      // Add formId to growthbook attributes to allow for targeting in growthbook feature flags.
+      void req.growthbook?.setAttributes({
+        ...req.growthbook.getAttributes(),
+        formId,
+        adminEmail: form.admin.email,
+      })
+      // TODO [CP-PKCE]: Cleanup this flag once the nonce state format is fully
+      // rolled out. Only emit the nonce state format once every instance is
+      // able to parse it, otherwise a callback served by an compute instance running
+      // the older parser rejects the state outright.
+      const useStateNonce =
+        req.growthbook?.isOn(featureFlags.spcpOidcStateNonce) ?? false
+      const nonce = useStateNonce ? randomBytes(16).toString('hex') : undefined
+      // Fail closed: without a growthbook instance, only birth records are fetched.
+      const isMrfChildrenEnabled =
+        req.growthbook?.isOn(featureFlags.mrfChildren) ?? false
+      switch (form.authType) {
+        case FormAuthType.MyInfo:
+          return MyInfoFapiService.startLogin({
+            formId,
+            encodedQuery,
+            requestedAttributes: form.getUniqueMyInfoAttrs(),
+            includeSponsoredChildren: shouldFetchSponsoredChildren(
+              form,
+              isMrfChildrenEnabled,
+            ),
+          }).map(({ sessionId, redirectUrl }) => {
+            setMyInfoFapiSessionCookie(res, sessionId)
+            return redirectUrl
+          })
+        case FormAuthType.SP: {
+          return validateSpcpForm(form).asyncAndThen((form) => {
+            const target = getRedirectTargetSpcpOidc(
+              formId,
+              FormAuthType.SP,
+              isPersistentLogin,
+              encodedQuery,
+              nonce,
+            )
+            const oidcService = getOidcService(FormAuthType.SP)
+            return oidcService
+              .createRedirectUrl(target, form.esrvcId)
+              .map(({ redirectUrl, codeVerifier }) => {
+                res.cookie(
+                  oidcService.getCodeVerifierCookieName(nonce),
+                  codeVerifier,
+                  oidcService.getCodeVerifierCookieOptions(),
+                )
+                return redirectUrl
+              })
+          })
+        }
+        case FormAuthType.CP: {
+          // NOTE: Persistent login is only set (and relevant) when the authType is SP.
+          // If authType is not SP, assume that it was set erroneously and default it to false
+          return validateSpcpForm(form).asyncAndThen((form) => {
+            const target = getRedirectTargetSpcpOidc(
+              formId,
+              FormAuthType.CP,
+              isPersistentLogin,
+              encodedQuery,
+              nonce,
+            )
+            const oidcService = getOidcService(FormAuthType.CP)
+            return oidcService
+              .createRedirectUrl(target, form.esrvcId)
+              .map(({ redirectUrl, codeVerifier }) => {
+                res.cookie(
+                  oidcService.getCodeVerifierCookieName(nonce),
+                  codeVerifier,
+                  oidcService.getCodeVerifierCookieOptions(),
+                )
+                return redirectUrl
+              })
+          })
+        }
+        default:
+          return err<never, AuthTypeMismatchError>(
+            new AuthTypeMismatchError(form.authType),
+          )
+      }
+    })
+    .map((redirectURL) => {
+      logger.info({
+        message: 'Redirecting user to login page',
+        meta: {
+          redirectURL,
+          formAuthType,
+          ...logMeta,
+        },
+      })
+      return res.status(StatusCodes.OK).json({ redirectURL })
+    })
+    .mapErr((error) => {
+      logger.error({
+        message: 'Error while creating redirect URL',
+        meta: {
+          formAuthType,
+          ...logMeta,
+        },
+        error,
+      })
+      const { statusCode, errorMessage } = mapFormAuthError(error)
+      return res.status(statusCode).json({ message: errorMessage })
+    })
+}
+
+/**
+ * Handler for /forms/:formId/auth/redirect
+ */
+export const handleFormAuthRedirect = [
+  celebrate({
+    [Segments.PARAMS]: Joi.object({
+      formId: Joi.string().pattern(/^[a-fA-F0-9]{24}$/),
+    }),
+    [Segments.QUERY]: Joi.object({
+      isPersistentLogin: Joi.boolean().optional(),
+      encodedQuery: Joi.string().allow('').optional(),
+    }),
+  }),
+  _handleFormAuthRedirect,
+] as ControllerHandler[]
+
+/**
+ * NOTE: This is exported only for testing
+ * Logs user out of SP / CP / MyInfo by deleting cookie
+ * @param authType type of authentication
+ *
+ * @returns 200 with success message when user logs out successfully
+ * @returns 400 if authType is invalid
+ */
+export const _handlePublicAuthLogout: ControllerHandler<
+  {
+    authType: FormAuthType.SP | FormAuthType.CP | FormAuthType.MyInfo
+  },
+  PublicFormAuthLogoutDto
+> = (req, res) => {
+  const { authType } = req.params
+
+  const cookieName = PublicFormService.getCookieNameByAuthType(authType)
+
+  res.clearCookie(cookieName)
+
+  // Additional cookies to clear for MyInfo
+  if (authType === FormAuthType.MyInfo) {
+    clearMyInfoFapiSessionCookie(res)
+  }
+
+  return res.status(200).json({ message: 'Successfully logged out.' })
+}
+
+/**
+ * Handler for /forms/auth/:authType/logout
+ * Valid AuthTypes are SP / CP / MyInfo
+ */
+export const handlePublicAuthLogout = [
+  celebrate({
+    [Segments.PARAMS]: Joi.object({
+      authType: Joi.string()
+        .valid(FormAuthType.SP, FormAuthType.CP, FormAuthType.MyInfo)
+        .required(),
+    }),
+  }),
+  _handlePublicAuthLogout,
+] as ControllerHandler[]

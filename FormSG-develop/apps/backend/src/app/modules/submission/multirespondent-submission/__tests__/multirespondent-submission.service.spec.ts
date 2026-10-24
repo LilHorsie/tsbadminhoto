@@ -1,0 +1,5183 @@
+import dbHandler from '__tests__/unit/backend/helpers/jest-db'
+import { ObjectId } from 'bson'
+import { featureFlags } from 'formsg-shared/constants'
+import {
+  BasicField,
+  FieldResponsesV3,
+  FormAuthType,
+  FormFieldDto,
+  FormResponseMode,
+  FormWebhook,
+  FormWorkflowStepDto,
+  MyInfoAttribute,
+  SubmissionType,
+  WorkflowEventType,
+  WorkflowStatus,
+  WorkflowType,
+} from 'formsg-shared/types'
+import mongoose from 'mongoose'
+import { errAsync, okAsync } from 'neverthrow'
+
+import formsgSdk from 'src/app/config/formsg-sdk'
+import { getMultirespondentSubmissionModel } from 'src/app/models/submission.server.model'
+import { WebhookFactory } from 'src/app/modules/webhook/webhook.factory'
+import { webhookStatsdClient } from 'src/app/modules/webhook/webhook.statsd-client'
+import { AutoreplyPdfGenerationError } from 'src/app/services/mail/mail.errors'
+import MailService from 'src/app/services/mail/mail.service'
+import * as MailUtils from 'src/app/services/mail/mail.utils'
+import {
+  IMultirespondentSubmissionSchema,
+  IPopulatedForm,
+  IPopulatedMultirespondentForm,
+  WebhookView,
+} from 'src/types'
+import { MultirespondentSubmissionDto, SnapshottedFormDef } from 'src/types/api'
+
+import { DatabaseConflictError } from '../../../core/core.errors'
+import { FormRespondentSingleSubmissionValidationError } from '../../../form/form.errors'
+import * as FormService from '../../../form/form.service'
+import {
+  MrfReminderInvalidWorkflowStepError,
+  MrfReminderRecipientEmailsEmptyError,
+  MrfWorkflowStoppedError,
+  SubmissionSaveError,
+} from '../../submission.errors'
+import { mapRouteError } from '../../submission.utils'
+import * as MultirespondentSubmissionService from '../multirespondent-submission.service'
+import {
+  createMultiRespondentFormSubmission,
+  getPendingStepRecipientEmailsFromSubmittedStepsMeta,
+  performMultiRespondentPostSubmissionCreateActions,
+  performMultiRespondentPostSubmissionUpdateActions,
+  sendNextStepReminderEmail,
+  updateMultiRespondentFormSubmission,
+} from '../multirespondent-submission.service'
+import * as stepToken from '../step-token'
+import {
+  SnapshotDataIntegrityError,
+  SnapshotWriteError,
+} from '../webhook/submission-snapshot.errors'
+import * as SnapshotStore from '../webhook/submission-snapshot.store'
+
+jest.mock('src/app/modules/datadog/datadog.utils')
+jest.mock('src/app/services/mail/mail.utils')
+
+// Mock only the S3 snapshot I/O so call order/args can be asserted and reads
+// can be steered; keep the real error classes (SnapshotWriteError etc.).
+jest.mock('../webhook/submission-snapshot.store', () => {
+  const actual = jest.requireActual('../webhook/submission-snapshot.store')
+  return {
+    ...actual,
+    writeSnapshot: jest.fn(),
+    readSnapshot: jest.fn(),
+  }
+})
+const MockSnapshotStore = jest.mocked(SnapshotStore)
+
+const mockFormId = new ObjectId().toHexString()
+const mockSubmissionId = new ObjectId().toHexString()
+
+const MockMailUtils = jest.mocked(MailUtils)
+const MOCK_PDF_ATTACHMENT_BUFFER = Buffer.from('mock pdf buffer')
+const EXPECTED_MOCK_PDF_ATTACHMENT = {
+  filename: `RefNo ${mockSubmissionId}.pdf`,
+  content: MOCK_PDF_ATTACHMENT_BUFFER,
+}
+const MOCK_SUBMISSION_ATTACHMENTS = [
+  {
+    filename: 'attachment_1.pdf',
+    content: Buffer.from('mock pdf buffer'),
+    fieldId: new ObjectId().toHexString(),
+  },
+]
+
+describe('multirespondent-submission.service', () => {
+  beforeAll(async () => {
+    await dbHandler.connect()
+  })
+
+  beforeEach(() => {
+    MockMailUtils.generateAutoreplyPdf.mockReturnValue(
+      okAsync(Buffer.from('mock pdf buffer')),
+    )
+  })
+
+  afterEach(async () => {
+    jest.clearAllMocks()
+    await dbHandler.clearDatabase()
+  })
+
+  afterAll(async () => {
+    await dbHandler.closeDatabase()
+  })
+
+  describe('single submission per submitterId', () => {
+    const singleSubmissionFieldId = new ObjectId().toHexString()
+    const singleSubmissionFormId = new ObjectId().toHexString()
+    const mockHashedSubmitterId = 'mock-hashed-submitter-id'
+
+    const buildMinimalMrfForm = (
+      overrides: Partial<IPopulatedMultirespondentForm> = {},
+    ): IPopulatedMultirespondentForm =>
+      ({
+        _id: singleSubmissionFormId,
+        authType: FormAuthType.NIL,
+        responseMode: FormResponseMode.Multirespondent,
+        title: 'Test form',
+        form_fields: [
+          {
+            _id: singleSubmissionFieldId,
+            fieldType: BasicField.ShortText,
+            title: 'Q1',
+          },
+        ],
+        form_logics: [],
+        workflow: [
+          {
+            _id: new ObjectId().toHexString(),
+            workflow_type: WorkflowType.Static,
+            emails: [],
+            edit: [singleSubmissionFieldId],
+          },
+        ],
+        isSingleSubmission: false,
+        getUniqueMyInfoAttrs: jest.fn().mockReturnValue([]),
+        ...overrides,
+      }) as unknown as IPopulatedMultirespondentForm
+
+    const buildMinimalEncryptedPayload = (
+      overrides: Partial<MultirespondentSubmissionDto> = {},
+    ): MultirespondentSubmissionDto => ({
+      submissionPublicKey: 'submission-public-key',
+      encryptedSubmissionSecretKey: 'encrypted-submission-secret-key',
+      encryptedContent: 'encrypted-content',
+      submissionSecretKey: 'submission-secret-key',
+      version: 2,
+      workflowStep: 0,
+      responses: {
+        [singleSubmissionFieldId]: {
+          fieldType: BasicField.ShortText,
+          answer: 'answer',
+        },
+      },
+      mrfVersion: 1,
+      ...overrides,
+    })
+
+    it('should check for submissions with duplicate hashedSubmitterId if isSingleSubmission is enabled and save successfully if no duplicates are found', async () => {
+      const MultirespondentSubmission =
+        getMultirespondentSubmissionModel(mongoose)
+      const mockSavedDoc = {
+        _id: new ObjectId(),
+      } as IMultirespondentSubmissionSchema & { _id: mongoose.Types.ObjectId }
+
+      const saveIfSpy = jest
+        .spyOn(MultirespondentSubmission, 'saveIfSubmitterIdIsUnique')
+        .mockResolvedValue(mockSavedDoc)
+      const saveProtoSpy = jest
+        .spyOn(MultirespondentSubmission.prototype, 'save')
+        .mockImplementation(function (this: IMultirespondentSubmissionSchema) {
+          return Promise.resolve(this)
+        })
+
+      const form = buildMinimalMrfForm({
+        isSingleSubmission: true,
+        authType: FormAuthType.MyInfo,
+      })
+      const encryptedPayload = buildMinimalEncryptedPayload({
+        hashedSubmitterId: mockHashedSubmitterId,
+      })
+
+      const result = await createMultiRespondentFormSubmission({
+        form,
+        encryptedPayload,
+        logMeta: { action: 'createMultiRespondentFormSubmission' },
+      })
+
+      expect(saveIfSpy).toHaveBeenCalledWith(
+        singleSubmissionFormId,
+        mockHashedSubmitterId,
+        0,
+        expect.objectContaining({
+          form: singleSubmissionFormId,
+          workflowStep: 0,
+          mrfVersion: 1,
+          submittedSteps: expect.arrayContaining([
+            expect.objectContaining({
+              submitterId: mockHashedSubmitterId,
+            }),
+          ]),
+        }),
+      )
+      expect(saveProtoSpy).not.toHaveBeenCalled()
+      expect(result.isOk()).toBe(true)
+      expect(result._unsafeUnwrap().submission).toEqual(mockSavedDoc)
+
+      saveIfSpy.mockRestore()
+      saveProtoSpy.mockRestore()
+    })
+
+    it('should save successfully without checking for duplicate hashedSubmitterId if isSingleSubmission is disabled', async () => {
+      const MultirespondentSubmission =
+        getMultirespondentSubmissionModel(mongoose)
+      const saveIfSpy = jest.spyOn(
+        MultirespondentSubmission,
+        'saveIfSubmitterIdIsUnique',
+      )
+      const expectedSavedSubmissionId = new ObjectId().toHexString()
+      const mockSavedSubmission = {
+        _id: expectedSavedSubmissionId,
+        form: singleSubmissionFormId,
+        workflowStep: 0,
+        mrfVersion: 1,
+      } as IMultirespondentSubmissionSchema & { _id: mongoose.Types.ObjectId }
+      const saveProtoSpy = jest
+        .spyOn(MultirespondentSubmission.prototype, 'save')
+        .mockResolvedValue(mockSavedSubmission)
+
+      const form = buildMinimalMrfForm({ isSingleSubmission: false })
+      const encryptedPayload = buildMinimalEncryptedPayload({
+        hashedSubmitterId: mockHashedSubmitterId,
+      })
+
+      const result = await createMultiRespondentFormSubmission({
+        form,
+        encryptedPayload,
+        logMeta: { action: 'createMultiRespondentFormSubmission' },
+      })
+
+      expect(saveIfSpy).not.toHaveBeenCalled()
+      expect(saveProtoSpy).toHaveBeenCalled()
+      expect(result.isOk()).toBe(true)
+      const savedSubmission = result._unsafeUnwrap().submission
+      expect(savedSubmission).toEqual(mockSavedSubmission)
+
+      saveIfSpy.mockRestore()
+      saveProtoSpy.mockRestore()
+    })
+
+    it('should throw error if submission with duplicate hashedSubmitterId is found and isSingleSubmission is enabled', async () => {
+      const MultirespondentSubmission =
+        getMultirespondentSubmissionModel(mongoose)
+      const saveIfSpy = jest
+        .spyOn(MultirespondentSubmission, 'saveIfSubmitterIdIsUnique')
+        .mockResolvedValue(null)
+
+      const form = buildMinimalMrfForm({
+        isSingleSubmission: true,
+        authType: FormAuthType.MyInfo,
+      })
+      const encryptedPayload = buildMinimalEncryptedPayload({
+        hashedSubmitterId: mockHashedSubmitterId,
+      })
+
+      const result = await createMultiRespondentFormSubmission({
+        form,
+        encryptedPayload,
+        logMeta: { action: 'createMultiRespondentFormSubmission' },
+      })
+
+      expect(saveIfSpy).toHaveBeenCalled()
+      expect(result.isErr()).toBe(true)
+      expect(result._unsafeUnwrapErr()).toBeInstanceOf(
+        FormRespondentSingleSubmissionValidationError,
+      )
+
+      saveIfSpy.mockRestore()
+    })
+
+    it('should throw error if hashedSubmitterId is not set and isSingleSubmission is enabled', async () => {
+      const MultirespondentSubmission =
+        getMultirespondentSubmissionModel(mongoose)
+      const saveIfSpy = jest.spyOn(
+        MultirespondentSubmission,
+        'saveIfSubmitterIdIsUnique',
+      )
+
+      const form = buildMinimalMrfForm({
+        isSingleSubmission: true,
+        authType: FormAuthType.MyInfo,
+      })
+      const encryptedPayload = buildMinimalEncryptedPayload()
+
+      const result = await createMultiRespondentFormSubmission({
+        form,
+        encryptedPayload,
+        logMeta: { action: 'createMultiRespondentFormSubmission' },
+      })
+
+      expect(saveIfSpy).not.toHaveBeenCalled()
+      expect(result.isErr()).toBe(true)
+      expect(result._unsafeUnwrapErr()).toBeInstanceOf(SubmissionSaveError)
+
+      saveIfSpy.mockRestore()
+    })
+
+    it('should not throw error if hashedSubmitterId is not set and isSingleSubmission is disabled', async () => {
+      const MultirespondentSubmission =
+        getMultirespondentSubmissionModel(mongoose)
+      const saveIfSpy = jest.spyOn(
+        MultirespondentSubmission,
+        'saveIfSubmitterIdIsUnique',
+      )
+      const saveProtoSpy = jest
+        .spyOn(MultirespondentSubmission.prototype, 'save')
+        .mockImplementation(function (this: IMultirespondentSubmissionSchema) {
+          return Promise.resolve(this)
+        })
+
+      const form = buildMinimalMrfForm({ isSingleSubmission: false })
+      const encryptedPayload = buildMinimalEncryptedPayload()
+
+      const result = await createMultiRespondentFormSubmission({
+        form,
+        encryptedPayload,
+        logMeta: { action: 'createMultiRespondentFormSubmission' },
+      })
+
+      expect(saveIfSpy).not.toHaveBeenCalled()
+      expect(saveProtoSpy).toHaveBeenCalled()
+      expect(result.isOk()).toBe(true)
+
+      saveIfSpy.mockRestore()
+      saveProtoSpy.mockRestore()
+    })
+  })
+
+  describe('pdf attachment', () => {
+    describe('pdf attachment is not generated when not needed', () => {
+      describe('first step', () => {
+        it('should not generate pdf when there is no active form summary included email field and workflow is incomplete', async () => {
+          // Arrange
+          const emailFieldWithoutFormSummaryStep1 = {
+            _id: new ObjectId().toHexString(),
+            fieldType: BasicField.Email,
+            title: 'Step 1 Email Field',
+            autoReplyOptions: {
+              hasAutoReply: true,
+              includeFormSummary: false,
+              autoReplySubject: 'Test Subject',
+              autoReplyMessage: 'Test Message',
+              autoReplySender: 'Test Sender',
+            },
+          }
+          const emailFieldWithFormSummaryStep2 = {
+            _id: new ObjectId().toHexString(),
+            fieldType: BasicField.Email,
+            title: 'Step 2 Email Field',
+            autoReplyOptions: {
+              hasAutoReply: true,
+              includeFormSummary: true,
+              autoReplySubject: 'Test Subject',
+              autoReplyMessage: 'Test Message',
+              autoReplySender: 'Test Sender',
+            },
+          }
+
+          const workflow = [
+            {
+              _id: new ObjectId().toHexString(),
+              workflow_type: WorkflowType.Static,
+              emails: [],
+              edit: [emailFieldWithoutFormSummaryStep1._id],
+            },
+            {
+              _id: new ObjectId().toHexString(),
+              workflow_type: WorkflowType.Static,
+              emails: ['step2_respondent_email@example.com'],
+              edit: [emailFieldWithFormSummaryStep2._id],
+            },
+          ]
+
+          // Act
+          await performMultiRespondentPostSubmissionCreateActions({
+            submission: {
+              id: mockSubmissionId,
+            } as unknown as IMultirespondentSubmissionSchema,
+            submissionId: mockSubmissionId,
+            form: {
+              _id: mockFormId,
+              title: 'Test Form',
+              form_fields: [
+                emailFieldWithoutFormSummaryStep1,
+                emailFieldWithFormSummaryStep2,
+              ],
+              stepsToNotify: [workflow[0]._id, workflow[1]._id],
+              workflow,
+              admin: {
+                agency: {
+                  fullName: 'Government Technology Agency',
+                },
+              },
+            } as unknown as IPopulatedMultirespondentForm,
+            encryptedPayload: {
+              encryptedContent: 'encryptedContent',
+              version: 1,
+              submissionPublicKey: 'submissionPublicKey',
+              encryptedSubmissionSecretKey: 'encryptedSubmissionSecretKey',
+              responses: {
+                [emailFieldWithoutFormSummaryStep1._id]: {
+                  fieldType: BasicField.Email,
+                  answer: {
+                    value: 'expected1@example.com',
+                  },
+                },
+              },
+            } as MultirespondentSubmissionDto,
+            logMeta: {} as any,
+            attachments: MOCK_SUBMISSION_ATTACHMENTS,
+          })
+
+          // Assert
+          expect(MockMailUtils.generateAutoreplyPdf).not.toHaveBeenCalled()
+        })
+        it('should not generate pdf when there is no active form summary included email field and workflow is complete but has no emails to notify for outcome', async () => {
+          // Arrange
+          const emailFieldWithoutFormSummaryStep1 = {
+            _id: new ObjectId().toHexString(),
+            fieldType: BasicField.Email,
+            title: 'Step 1 Email Field',
+            autoReplyOptions: {
+              hasAutoReply: true,
+              includeFormSummary: false,
+              autoReplySubject: 'Test Subject',
+              autoReplyMessage: 'Test Message',
+              autoReplySender: 'Test Sender',
+            },
+          }
+
+          const workflow = [
+            {
+              _id: new ObjectId().toHexString(),
+              workflow_type: WorkflowType.Static,
+              emails: [], // step 1 has no emails to notify for outcome
+              edit: [emailFieldWithoutFormSummaryStep1._id],
+            },
+          ]
+
+          const step1Id = new ObjectId().toHexString()
+
+          // Act
+          await performMultiRespondentPostSubmissionCreateActions({
+            submission: {
+              id: mockSubmissionId,
+            } as unknown as IMultirespondentSubmissionSchema,
+            submissionId: mockSubmissionId,
+            form: {
+              _id: mockFormId,
+              title: 'Test Form',
+              form_fields: [emailFieldWithoutFormSummaryStep1],
+              stepsToNotify: [step1Id],
+              workflow,
+              admin: {
+                agency: {
+                  fullName: 'Government Technology Agency',
+                },
+              },
+            } as unknown as IPopulatedMultirespondentForm,
+            encryptedPayload: {
+              encryptedContent: 'encryptedContent',
+              version: 1,
+              submissionPublicKey: 'submissionPublicKey',
+              encryptedSubmissionSecretKey: 'encryptedSubmissionSecretKey',
+              responses: {
+                [emailFieldWithoutFormSummaryStep1._id]: {
+                  fieldType: BasicField.Email,
+                  answer: {
+                    value: 'expected1@example.com',
+                  },
+                },
+              },
+            } as MultirespondentSubmissionDto,
+            logMeta: {} as any,
+            attachments: MOCK_SUBMISSION_ATTACHMENTS,
+          })
+
+          // Assert
+          expect(MockMailUtils.generateAutoreplyPdf).not.toHaveBeenCalled()
+        })
+      })
+
+      describe('subsequent steps', () => {
+        it('should not generate pdf when there is no active form summary included email field and workflow is incomplete', async () => {
+          // Arrange
+          const emailFieldWithFormSummaryStep1 = {
+            _id: new ObjectId().toHexString(),
+            fieldType: BasicField.Email,
+            title: 'Step 1 Email Field',
+            autoReplyOptions: {
+              hasAutoReply: true,
+              includeFormSummary: true,
+              autoReplySubject: 'Test Subject',
+              autoReplyMessage: 'Test Message',
+              autoReplySender: 'Test Sender',
+            },
+          }
+          const emailFieldWithoutFormSummaryStep2 = {
+            _id: new ObjectId().toHexString(),
+            fieldType: BasicField.Email,
+            title: 'Step 2 Email Field',
+            autoReplyOptions: {
+              hasAutoReply: true,
+              includeFormSummary: false,
+              autoReplySubject: 'Test Subject',
+              autoReplyMessage: 'Test Message',
+              autoReplySender: 'Test Sender',
+            },
+          }
+
+          const workflow = [
+            {
+              _id: new ObjectId().toHexString(),
+              workflow_type: WorkflowType.Static,
+              emails: [],
+              edit: [emailFieldWithFormSummaryStep1._id],
+            },
+            {
+              _id: new ObjectId().toHexString(),
+              workflow_type: WorkflowType.Static,
+              emails: ['step2_respondent_email@example.com'],
+              edit: [emailFieldWithoutFormSummaryStep2._id],
+            },
+            {
+              _id: new ObjectId().toHexString(),
+              workflow_type: WorkflowType.Static,
+              emails: ['step3_respondent_email@example.com'],
+              edit: [emailFieldWithFormSummaryStep1._id],
+            },
+          ]
+
+          // Act
+          await performMultiRespondentPostSubmissionUpdateActions({
+            submission: {
+              id: mockSubmissionId,
+            } as unknown as IMultirespondentSubmissionSchema,
+            submissionId: mockSubmissionId,
+            snapshottedFormDef: {
+              _id: mockFormId,
+              title: 'Test Form',
+              form_fields: [
+                emailFieldWithFormSummaryStep1,
+                emailFieldWithoutFormSummaryStep2,
+              ],
+              stepsToNotify: [workflow[1]._id],
+              workflow,
+              admin: {
+                agency: {
+                  fullName: 'Government Technology Agency',
+                },
+              },
+            } as unknown as SnapshottedFormDef,
+            currentStepNumber: 1, // submitted step 2
+            encryptedPayload: {
+              encryptedContent: 'encryptedContent',
+              version: 1,
+              submissionPublicKey: 'submissionPublicKey',
+              encryptedSubmissionSecretKey: 'encryptedSubmissionSecretKey',
+              responses: {
+                [emailFieldWithFormSummaryStep1._id]: {
+                  fieldType: BasicField.Email,
+                  answer: {
+                    value: 'expected1@example.com',
+                  },
+                },
+                [emailFieldWithoutFormSummaryStep2._id]: {
+                  fieldType: BasicField.Email,
+                  answer: {
+                    value: 'expected2@example.com',
+                  },
+                },
+              },
+            } as MultirespondentSubmissionDto,
+            logMeta: {} as any,
+            attachments: MOCK_SUBMISSION_ATTACHMENTS,
+          })
+
+          // Assert
+          expect(MockMailUtils.generateAutoreplyPdf).not.toHaveBeenCalled()
+        })
+
+        it('should not generate pdf when there is no active form summary included email field and workflow is complete but has no emails to notify for outcome', async () => {
+          // Arrange
+          const emailFieldWithFormSummaryStep1 = {
+            _id: new ObjectId().toHexString(),
+            fieldType: BasicField.Email,
+            title: 'Step 1 Email Field',
+            autoReplyOptions: {
+              hasAutoReply: true,
+              includeFormSummary: true,
+              autoReplySubject: 'Test Subject',
+              autoReplyMessage: 'Test Message',
+              autoReplySender: 'Test Sender',
+            },
+          }
+          const emailFieldWithoutFormSummaryStep2 = {
+            _id: new ObjectId().toHexString(),
+            fieldType: BasicField.Email,
+            title: 'Step 2 Email Field',
+            autoReplyOptions: {
+              hasAutoReply: true,
+              includeFormSummary: false,
+              autoReplySubject: 'Test Subject',
+              autoReplyMessage: 'Test Message',
+              autoReplySender: 'Test Sender',
+            },
+          }
+
+          const workflow = [
+            {
+              _id: new ObjectId().toHexString(),
+              workflow_type: WorkflowType.Static,
+              emails: [],
+              edit: [emailFieldWithFormSummaryStep1._id],
+            },
+            {
+              _id: new ObjectId().toHexString(),
+              workflow_type: WorkflowType.Static,
+              emails: ['step2_respondent_email@example.com'],
+              edit: [emailFieldWithoutFormSummaryStep2._id],
+            },
+          ]
+
+          // Act
+          await performMultiRespondentPostSubmissionUpdateActions({
+            submission: {
+              id: mockSubmissionId,
+            } as unknown as IMultirespondentSubmissionSchema,
+            submissionId: mockSubmissionId,
+            snapshottedFormDef: {
+              _id: mockFormId,
+              title: 'Test Form',
+              form_fields: [
+                emailFieldWithFormSummaryStep1,
+                emailFieldWithoutFormSummaryStep2,
+              ],
+              stepsToNotify: [],
+              emails: [],
+              workflow,
+              admin: {
+                agency: {
+                  fullName: 'Government Technology Agency',
+                },
+              },
+            } as unknown as SnapshottedFormDef,
+            currentStepNumber: 1, // submitted step 2
+            encryptedPayload: {
+              encryptedContent: 'encryptedContent',
+              version: 1,
+              submissionPublicKey: 'submissionPublicKey',
+              encryptedSubmissionSecretKey: 'encryptedSubmissionSecretKey',
+              responses: {
+                [emailFieldWithFormSummaryStep1._id]: {
+                  fieldType: BasicField.Email,
+                  answer: {
+                    value: 'expected1@example.com',
+                  },
+                },
+                [emailFieldWithoutFormSummaryStep2._id]: {
+                  fieldType: BasicField.Email,
+                  answer: {
+                    value: 'expected2@example.com',
+                  },
+                },
+              },
+            } as MultirespondentSubmissionDto,
+            logMeta: {} as any,
+            attachments: MOCK_SUBMISSION_ATTACHMENTS,
+          })
+
+          // Assert
+          expect(MockMailUtils.generateAutoreplyPdf).not.toHaveBeenCalled()
+        })
+      })
+    })
+  })
+
+  describe('respondent copy emails are sent', () => {
+    describe('first step', () => {
+      it('sends respondent copy without pdf when email field auto reply enabled but form summary is not included', async () => {
+        // Arrange
+        const sendMrfRespondentCopyEmailSpy = jest.spyOn(
+          MailService,
+          'sendRespondentCopyEmail',
+        )
+
+        const emailFieldWithoutFormSummaryStep1 = {
+          _id: new ObjectId().toHexString(),
+          fieldType: BasicField.Email,
+          title: 'Step 1 Email Field',
+          autoReplyOptions: {
+            hasAutoReply: true,
+            includeFormSummary: false,
+            autoReplySubject: 'Test Subject',
+            autoReplyMessage: 'Test Message',
+            autoReplySender: 'Test Sender',
+          },
+        }
+        const emailFieldWithFormSummaryStep2 = {
+          _id: new ObjectId().toHexString(),
+          fieldType: BasicField.Email,
+          title: 'Step 2 Email Field',
+          autoReplyOptions: {
+            hasAutoReply: true,
+            includeFormSummary: true,
+            autoReplySubject: 'Test Subject',
+            autoReplyMessage: 'Test Message',
+            autoReplySender: 'Test Sender',
+          },
+        }
+
+        const workflow = [
+          {
+            _id: new ObjectId().toHexString(),
+            workflow_type: WorkflowType.Static,
+            emails: [],
+            edit: [emailFieldWithoutFormSummaryStep1._id],
+          },
+          {
+            _id: new ObjectId().toHexString(),
+            workflow_type: WorkflowType.Static,
+            emails: ['step2_respondent_email@example.com'],
+            edit: [emailFieldWithFormSummaryStep2._id],
+          },
+        ]
+
+        // Act
+        await performMultiRespondentPostSubmissionCreateActions({
+          submission: {
+            id: mockSubmissionId,
+          } as unknown as IMultirespondentSubmissionSchema,
+          submissionId: mockSubmissionId,
+          form: {
+            _id: mockFormId,
+            title: 'Test Form',
+            form_fields: [
+              emailFieldWithoutFormSummaryStep1,
+              emailFieldWithFormSummaryStep2,
+            ],
+            stepsToNotify: [workflow[0]._id, workflow[1]._id],
+            workflow,
+            admin: {
+              agency: {
+                fullName: 'Government Technology Agency',
+              },
+            },
+          } as unknown as IPopulatedMultirespondentForm,
+          encryptedPayload: {
+            encryptedContent: 'encryptedContent',
+            version: 1,
+            submissionPublicKey: 'submissionPublicKey',
+            encryptedSubmissionSecretKey: 'encryptedSubmissionSecretKey',
+            responses: {
+              [emailFieldWithoutFormSummaryStep1._id]: {
+                fieldType: BasicField.Email,
+                answer: {
+                  value: 'expected1@example.com',
+                },
+              },
+            },
+          } as MultirespondentSubmissionDto,
+          logMeta: {} as any,
+          attachments: MOCK_SUBMISSION_ATTACHMENTS,
+        })
+
+        // Assert
+        // that sent to correct destination emails
+        expect(sendMrfRespondentCopyEmailSpy).toHaveBeenCalledTimes(1)
+        expect(
+          sendMrfRespondentCopyEmailSpy.mock.calls[0][0].autoReplyMailData
+            .email,
+        ).toEqual('expected1@example.com')
+        // does not attach pdf and submission attachments since form summary is not included for active respondent copy email field
+        expect(
+          sendMrfRespondentCopyEmailSpy.mock.calls[0][0].attachments,
+        ).toEqual([])
+      })
+      it('sends respondent copy emails with pdf when email field auto reply enabled and form summary is included', async () => {
+        // Arrange
+        const sendMrfRespondentCopyEmailSpy = jest.spyOn(
+          MailService,
+          'sendRespondentCopyEmail',
+        )
+
+        const emailFieldWithFormSummaryStep1 = {
+          _id: new ObjectId().toHexString(),
+          fieldType: BasicField.Email,
+          title: 'Step 1 Email Field',
+          autoReplyOptions: {
+            hasAutoReply: true,
+            includeFormSummary: true,
+            autoReplySubject: 'Test Subject',
+            autoReplyMessage: 'Test Message',
+            autoReplySender: 'Test Sender',
+          },
+        }
+        const emailFieldWithFormSummaryStep2 = {
+          _id: new ObjectId().toHexString(),
+          fieldType: BasicField.Email,
+          title: 'Step 2 Email Field',
+          autoReplyOptions: {
+            hasAutoReply: true,
+            includeFormSummary: true,
+            autoReplySubject: 'Test Subject',
+            autoReplyMessage: 'Test Message',
+            autoReplySender: 'Test Sender',
+          },
+        }
+
+        const workflow = [
+          {
+            _id: new ObjectId().toHexString(),
+            workflow_type: WorkflowType.Static,
+            emails: [],
+            edit: [emailFieldWithFormSummaryStep1._id],
+          },
+          {
+            _id: new ObjectId().toHexString(),
+            workflow_type: WorkflowType.Static,
+            emails: ['step2_respondent_email@example.com'],
+            edit: [emailFieldWithFormSummaryStep2._id],
+          },
+        ]
+
+        // Act
+        await performMultiRespondentPostSubmissionCreateActions({
+          submission: {
+            id: mockSubmissionId,
+          } as unknown as IMultirespondentSubmissionSchema,
+          submissionId: mockSubmissionId,
+          form: {
+            _id: mockFormId,
+            title: 'Test Form',
+            form_fields: [
+              emailFieldWithFormSummaryStep1,
+              emailFieldWithFormSummaryStep2,
+            ],
+            stepsToNotify: [workflow[0]._id, workflow[1]._id],
+            workflow,
+            admin: {
+              agency: {
+                fullName: 'Government Technology Agency',
+              },
+            },
+          } as unknown as IPopulatedMultirespondentForm,
+          encryptedPayload: {
+            encryptedContent: 'encryptedContent',
+            version: 1,
+            submissionPublicKey: 'submissionPublicKey',
+            encryptedSubmissionSecretKey: 'encryptedSubmissionSecretKey',
+            responses: {
+              [emailFieldWithFormSummaryStep1._id]: {
+                fieldType: BasicField.Email,
+                answer: {
+                  value: 'expected1@example.com',
+                },
+              },
+            },
+          } as MultirespondentSubmissionDto,
+          logMeta: {} as any,
+          attachments: MOCK_SUBMISSION_ATTACHMENTS,
+        })
+
+        // Assert
+        // that sent to correct destination emails
+        expect(sendMrfRespondentCopyEmailSpy).toHaveBeenCalledTimes(1)
+        expect(
+          sendMrfRespondentCopyEmailSpy.mock.calls[0][0].autoReplyMailData
+            .email,
+        ).toEqual('expected1@example.com')
+        // attaches pdf and submission attachments
+        expect(
+          sendMrfRespondentCopyEmailSpy.mock.calls[0][0].attachments,
+        ).toEqual([
+          ...MOCK_SUBMISSION_ATTACHMENTS,
+          EXPECTED_MOCK_PDF_ATTACHMENT,
+        ])
+      })
+      it('does not send respondent copy emails when email field auto reply is not enabled', async () => {
+        // Arrange
+        const sendMrfRespondentCopyEmailSpy = jest.spyOn(
+          MailService,
+          'sendRespondentCopyEmail',
+        )
+
+        const emailFieldWithoutAutoReplyStep1 = {
+          _id: new ObjectId().toHexString(),
+          fieldType: BasicField.Email,
+          title: 'Step 1 Email Field',
+          autoReplyOptions: {
+            hasAutoReply: false,
+            includeFormSummary: false,
+            autoReplySubject: 'Test Subject',
+            autoReplyMessage: 'Test Message',
+            autoReplySender: 'Test Sender',
+          },
+        }
+        const emailFieldWithFormSummaryStep2 = {
+          _id: new ObjectId().toHexString(),
+          fieldType: BasicField.Email,
+          title: 'Step 2 Email Field',
+          autoReplyOptions: {
+            hasAutoReply: true,
+            includeFormSummary: true,
+            autoReplySubject: 'Test Subject',
+            autoReplyMessage: 'Test Message',
+            autoReplySender: 'Test Sender',
+          },
+        }
+
+        const workflow = [
+          {
+            _id: new ObjectId().toHexString(),
+            workflow_type: WorkflowType.Static,
+            emails: [],
+            edit: [emailFieldWithoutAutoReplyStep1._id],
+          },
+          {
+            _id: new ObjectId().toHexString(),
+            workflow_type: WorkflowType.Static,
+            emails: ['step2_respondent_email@example.com'],
+            edit: [emailFieldWithFormSummaryStep2._id],
+          },
+        ]
+
+        // Act
+        await performMultiRespondentPostSubmissionCreateActions({
+          submission: {
+            id: mockSubmissionId,
+          } as unknown as IMultirespondentSubmissionSchema,
+          submissionId: mockSubmissionId,
+          form: {
+            _id: mockFormId,
+            title: 'Test Form',
+            form_fields: [
+              emailFieldWithoutAutoReplyStep1,
+              emailFieldWithFormSummaryStep2,
+            ],
+            stepsToNotify: [workflow[0]._id, workflow[1]._id],
+            workflow,
+            admin: {
+              agency: {
+                fullName: 'Government Technology Agency',
+              },
+            },
+          } as unknown as IPopulatedMultirespondentForm,
+          encryptedPayload: {
+            encryptedContent: 'encryptedContent',
+            version: 1,
+            submissionPublicKey: 'submissionPublicKey',
+            encryptedSubmissionSecretKey: 'encryptedSubmissionSecretKey',
+            responses: {
+              [emailFieldWithoutAutoReplyStep1._id]: {
+                fieldType: BasicField.Email,
+                answer: {
+                  value: 'expected1@example.com',
+                },
+              },
+            },
+          } as MultirespondentSubmissionDto,
+          logMeta: {} as any,
+          attachments: MOCK_SUBMISSION_ATTACHMENTS,
+        })
+
+        // Assert
+        expect(sendMrfRespondentCopyEmailSpy).not.toHaveBeenCalled()
+      })
+
+      it('sends respondent copy despite pdf generation error', async () => {
+        // Arrange
+        MockMailUtils.generateAutoreplyPdf.mockReturnValue(
+          errAsync(new AutoreplyPdfGenerationError()),
+        )
+        const sendMrfRespondentCopyEmailSpy = jest.spyOn(
+          MailService,
+          'sendRespondentCopyEmail',
+        )
+        const emailFieldWithFormSummaryStep1 = {
+          _id: new ObjectId().toHexString(),
+          fieldType: BasicField.Email,
+          title: 'Step 1 Email Field',
+          autoReplyOptions: {
+            hasAutoReply: true,
+            includeFormSummary: true,
+            autoReplySubject: 'Test Subject',
+            autoReplyMessage: 'Test Message',
+            autoReplySender: 'Test Sender',
+          },
+        }
+
+        const workflow = [
+          {
+            _id: new ObjectId().toHexString(),
+            workflow_type: WorkflowType.Static,
+            emails: [],
+            edit: [emailFieldWithFormSummaryStep1._id],
+          },
+        ]
+
+        // Act
+        await performMultiRespondentPostSubmissionCreateActions({
+          submission: {
+            id: mockSubmissionId,
+          } as unknown as IMultirespondentSubmissionSchema,
+          submissionId: mockSubmissionId,
+          form: {
+            _id: mockFormId,
+            title: 'Test Form',
+            form_fields: [emailFieldWithFormSummaryStep1],
+            stepsToNotify: [workflow[0]._id],
+            workflow,
+            admin: {
+              agency: {
+                fullName: 'Government Technology Agency',
+              },
+            },
+          } as unknown as IPopulatedMultirespondentForm,
+          encryptedPayload: {
+            encryptedContent: 'encryptedContent',
+            version: 1,
+            submissionPublicKey: 'submissionPublicKey',
+            encryptedSubmissionSecretKey: 'encryptedSubmissionSecretKey',
+            responses: {
+              [emailFieldWithFormSummaryStep1._id]: {
+                fieldType: BasicField.Email,
+                answer: {
+                  value: 'expected1@example.com',
+                },
+              },
+            },
+          } as MultirespondentSubmissionDto,
+          logMeta: {} as any,
+          attachments: MOCK_SUBMISSION_ATTACHMENTS,
+        })
+
+        // Assert
+        // that sent to correct destination emails
+        expect(sendMrfRespondentCopyEmailSpy).toHaveBeenCalledTimes(1)
+        expect(
+          sendMrfRespondentCopyEmailSpy.mock.calls[0][0].autoReplyMailData
+            .email,
+        ).toEqual('expected1@example.com')
+        // still sends without pdf attachment
+        expect(
+          sendMrfRespondentCopyEmailSpy.mock.calls[0][0].attachments,
+        ).toEqual([...MOCK_SUBMISSION_ATTACHMENTS])
+      })
+
+      it('sends respondent copy + workflow completion email when workflow has 0 steps', async () => {
+        // Arrange
+        const sendMrfRespondentCopyEmailSpy = jest.spyOn(
+          MailService,
+          'sendRespondentCopyEmail',
+        )
+        const sendMrfWorkflowCompletionEmailSpy = jest.spyOn(
+          MailService,
+          'sendMrfWorkflowCompletionEmail',
+        )
+
+        const emailFieldWithFormSummaryStep1 = {
+          _id: new ObjectId().toHexString(),
+          fieldType: BasicField.Email,
+          title: 'Step 1 Email Field',
+          autoReplyOptions: {
+            hasAutoReply: true,
+            includeFormSummary: true,
+            autoReplySubject: 'Test Subject',
+            autoReplyMessage: 'Test Message',
+            autoReplySender: 'Test Sender',
+          },
+        }
+
+        const workflow: FormWorkflowStepDto[] = []
+
+        // Act
+        await performMultiRespondentPostSubmissionCreateActions({
+          submission: {
+            id: mockSubmissionId,
+          } as unknown as IMultirespondentSubmissionSchema,
+          submissionId: mockSubmissionId,
+          form: {
+            _id: mockFormId,
+            title: 'Test Form',
+            form_fields: [emailFieldWithFormSummaryStep1],
+            stepsToNotify: [],
+            workflow,
+            emails: ['expected2@example.com'],
+            stepOneEmailNotificationFieldId: emailFieldWithFormSummaryStep1._id,
+            admin: {
+              agency: {
+                fullName: 'Government Technology Agency',
+              },
+            },
+          } as unknown as IPopulatedMultirespondentForm,
+          encryptedPayload: {
+            encryptedContent: 'encryptedContent',
+            version: 1,
+            submissionPublicKey: 'submissionPublicKey',
+            encryptedSubmissionSecretKey: 'encryptedSubmissionSecretKey',
+            responses: {
+              [emailFieldWithFormSummaryStep1._id]: {
+                fieldType: BasicField.Email,
+                answer: {
+                  value: 'expected1@example.com',
+                },
+              },
+            },
+          } as MultirespondentSubmissionDto,
+          logMeta: {} as any,
+          attachments: MOCK_SUBMISSION_ATTACHMENTS,
+        })
+
+        // Assert
+        // that respondent copy is sent to correct destination emails
+        expect(sendMrfRespondentCopyEmailSpy).toHaveBeenCalledTimes(1)
+        expect(
+          sendMrfRespondentCopyEmailSpy.mock.calls[0][0].autoReplyMailData
+            .email,
+        ).toEqual('expected1@example.com')
+        // that workflow completion email is also sent to correct destination emails
+        expect(
+          sendMrfWorkflowCompletionEmailSpy.mock.calls[0][0].emails,
+        ).toContainValues(['expected1@example.com', 'expected2@example.com'])
+        expect(
+          sendMrfWorkflowCompletionEmailSpy.mock.calls[0][0].emails.length,
+        ).toBe(2)
+      })
+    })
+
+    describe('subsequent steps', () => {
+      it('sends respondent copy without pdf when email field auto reply enabled but form summary is not included', async () => {
+        // Arrange
+        const sendMrfRespondentCopyEmailSpy = jest.spyOn(
+          MailService,
+          'sendRespondentCopyEmail',
+        )
+
+        const emailFieldWithFormSummaryStep1 = {
+          _id: new ObjectId().toHexString(),
+          fieldType: BasicField.Email,
+          title: 'Step 1 Email Field',
+          autoReplyOptions: {
+            hasAutoReply: true,
+            includeFormSummary: true,
+            autoReplySubject: 'Test Subject',
+            autoReplyMessage: 'Test Message',
+            autoReplySender: 'Test Sender',
+          },
+        }
+        const emailFieldWithoutFormSummaryStep2 = {
+          _id: new ObjectId().toHexString(),
+          fieldType: BasicField.Email,
+          title: 'Step 2 Email Field',
+          autoReplyOptions: {
+            hasAutoReply: true,
+            includeFormSummary: false,
+            autoReplySubject: 'Test Subject',
+            autoReplyMessage: 'Test Message',
+            autoReplySender: 'Test Sender',
+          },
+        }
+
+        const workflow = [
+          {
+            _id: new ObjectId().toHexString(),
+            workflow_type: WorkflowType.Static,
+            emails: [],
+            edit: [emailFieldWithFormSummaryStep1._id],
+          },
+          {
+            _id: new ObjectId().toHexString(),
+            workflow_type: WorkflowType.Static,
+            emails: ['step2_respondent_email@example.com'],
+            edit: [emailFieldWithoutFormSummaryStep2._id],
+          },
+        ]
+
+        // Act
+        await performMultiRespondentPostSubmissionUpdateActions({
+          submission: {
+            id: mockSubmissionId,
+          } as unknown as IMultirespondentSubmissionSchema,
+          submissionId: mockSubmissionId,
+          snapshottedFormDef: {
+            _id: mockFormId,
+            title: 'Test Form',
+            form_fields: [
+              emailFieldWithFormSummaryStep1,
+              emailFieldWithoutFormSummaryStep2,
+            ],
+            stepsToNotify: [workflow[0]._id, workflow[1]._id],
+            workflow,
+            admin: {
+              agency: {
+                fullName: 'Government Technology Agency',
+              },
+            },
+          } as unknown as SnapshottedFormDef,
+          currentStepNumber: 1, // step 2
+          encryptedPayload: {
+            encryptedContent: 'encryptedContent',
+            version: 1,
+            submissionPublicKey: 'submissionPublicKey',
+            encryptedSubmissionSecretKey: 'encryptedSubmissionSecretKey',
+            responses: {
+              [emailFieldWithFormSummaryStep1._id]: {
+                fieldType: BasicField.Email,
+                answer: {
+                  value: 'expected1@example.com',
+                },
+              },
+              [emailFieldWithoutFormSummaryStep2._id]: {
+                fieldType: BasicField.Email,
+                answer: {
+                  value: 'expected2@example.com',
+                },
+              },
+            },
+          } as MultirespondentSubmissionDto,
+          logMeta: {} as any,
+          attachments: MOCK_SUBMISSION_ATTACHMENTS,
+        })
+
+        // Assert
+        // that sent to correct destination emails
+        expect(sendMrfRespondentCopyEmailSpy).toHaveBeenCalledTimes(1)
+        expect(
+          sendMrfRespondentCopyEmailSpy.mock.calls[0][0].autoReplyMailData
+            .email,
+        ).toEqual('expected2@example.com')
+        // does not attach pdf and submission attachments since form summary is not included for active respondent copy email field
+        expect(
+          sendMrfRespondentCopyEmailSpy.mock.calls[0][0].attachments,
+        ).toEqual([])
+      })
+      it('sends respondent copy emails with pdf when email field auto reply enabled and form summary is included', async () => {
+        // Arrange
+        const sendMrfRespondentCopyEmailSpy = jest.spyOn(
+          MailService,
+          'sendRespondentCopyEmail',
+        )
+
+        const emailFieldWithFormSummaryStep1 = {
+          _id: new ObjectId().toHexString(),
+          fieldType: BasicField.Email,
+          title: 'Step 1 Email Field',
+          autoReplyOptions: {
+            hasAutoReply: true,
+            includeFormSummary: true,
+            autoReplySubject: 'Test Subject',
+            autoReplyMessage: 'Test Message',
+            autoReplySender: 'Test Sender',
+          },
+        }
+        const emailFieldWithFormSummaryStep2 = {
+          _id: new ObjectId().toHexString(),
+          fieldType: BasicField.Email,
+          title: 'Step 2 Email Field',
+          autoReplyOptions: {
+            hasAutoReply: true,
+            includeFormSummary: true,
+            autoReplySubject: 'Test Subject',
+            autoReplyMessage: 'Test Message',
+            autoReplySender: 'Test Sender',
+          },
+        }
+
+        const emailField2WithFormSummaryStep2 = {
+          _id: new ObjectId().toHexString(),
+          fieldType: BasicField.Email,
+          title: 'Step 2 Email Field',
+          autoReplyOptions: {
+            hasAutoReply: true,
+            includeFormSummary: true,
+            autoReplySubject: 'Test Subject',
+            autoReplyMessage: 'Test Message',
+            autoReplySender: 'Test Sender',
+          },
+        }
+
+        const workflow = [
+          {
+            _id: new ObjectId().toHexString(),
+            workflow_type: WorkflowType.Static,
+            emails: [],
+            edit: [emailFieldWithFormSummaryStep1._id],
+          },
+          {
+            _id: new ObjectId().toHexString(),
+            workflow_type: WorkflowType.Static,
+            emails: ['step2_respondent_email@example.com'],
+            edit: [
+              emailField2WithFormSummaryStep2._id,
+              emailFieldWithFormSummaryStep2._id,
+            ],
+          },
+        ]
+
+        // Act
+        await performMultiRespondentPostSubmissionUpdateActions({
+          submission: {
+            id: mockSubmissionId,
+          } as unknown as IMultirespondentSubmissionSchema,
+          submissionId: mockSubmissionId,
+          snapshottedFormDef: {
+            _id: mockFormId,
+            title: 'Test Form',
+            form_fields: [
+              emailFieldWithFormSummaryStep1,
+              emailField2WithFormSummaryStep2,
+              emailFieldWithFormSummaryStep2,
+            ],
+            stepsToNotify: [workflow[0]._id, workflow[1]._id],
+            workflow,
+            admin: {
+              agency: {
+                fullName: 'Government Technology Agency',
+              },
+            },
+          } as unknown as SnapshottedFormDef,
+          currentStepNumber: 1, // step 2
+          encryptedPayload: {
+            encryptedContent: 'encryptedContent',
+            version: 1,
+            submissionPublicKey: 'submissionPublicKey',
+            encryptedSubmissionSecretKey: 'encryptedSubmissionSecretKey',
+            responses: {
+              [emailFieldWithFormSummaryStep1._id]: {
+                fieldType: BasicField.Email,
+                answer: {
+                  value: 'expected1@example.com',
+                },
+              },
+              [emailField2WithFormSummaryStep2._id]: {
+                fieldType: BasicField.Email,
+                answer: {
+                  value: 'expected2@example.com',
+                },
+              },
+              [emailFieldWithFormSummaryStep2._id]: {
+                fieldType: BasicField.Email,
+                answer: {
+                  value: 'expected3@example.com',
+                },
+              },
+            },
+          } as MultirespondentSubmissionDto,
+          logMeta: {} as any,
+          attachments: MOCK_SUBMISSION_ATTACHMENTS,
+        })
+
+        // Assert
+        // that sent to correct destination emails
+        expect(sendMrfRespondentCopyEmailSpy).toHaveBeenCalledTimes(2)
+        expect(
+          sendMrfRespondentCopyEmailSpy.mock.calls.map(
+            (call) => call[0].autoReplyMailData.email,
+          ),
+        ).toContainValues(['expected2@example.com', 'expected3@example.com'])
+        // attaches pdf and submission attachments
+        expect(
+          sendMrfRespondentCopyEmailSpy.mock.calls[0][0].attachments,
+        ).toEqual([
+          ...MOCK_SUBMISSION_ATTACHMENTS,
+          EXPECTED_MOCK_PDF_ATTACHMENT,
+        ])
+        expect(
+          sendMrfRespondentCopyEmailSpy.mock.calls[1][0].attachments,
+        ).toEqual([
+          ...MOCK_SUBMISSION_ATTACHMENTS,
+          EXPECTED_MOCK_PDF_ATTACHMENT,
+        ])
+      })
+      it('does not send respondent copy emails when email field auto reply is not enabled', async () => {
+        // Arrange
+        const sendMrfRespondentCopyEmailSpy = jest.spyOn(
+          MailService,
+          'sendRespondentCopyEmail',
+        )
+
+        const emailFieldWithFormSummaryStep1 = {
+          _id: new ObjectId().toHexString(),
+          fieldType: BasicField.Email,
+          title: 'Step 1 Email Field',
+          autoReplyOptions: {
+            hasAutoReply: true,
+            includeFormSummary: true,
+            autoReplySubject: 'Test Subject',
+            autoReplyMessage: 'Test Message',
+            autoReplySender: 'Test Sender',
+          },
+        }
+        const emailFieldNoAutoReplyStep2 = {
+          _id: new ObjectId().toHexString(),
+          fieldType: BasicField.Email,
+          title: 'Step 2 Email Field',
+        }
+
+        const emailFieldWithFormSummaryStep2 = {
+          _id: new ObjectId().toHexString(),
+          fieldType: BasicField.Email,
+          title: 'Step 2 Email Field',
+          autoReplyOptions: {
+            hasAutoReply: true,
+            includeFormSummary: true,
+            autoReplySubject: 'Test Subject',
+            autoReplyMessage: 'Test Message',
+            autoReplySender: 'Test Sender',
+          },
+          required: false,
+        }
+
+        const workflow = [
+          {
+            _id: new ObjectId().toHexString(),
+            workflow_type: WorkflowType.Static,
+            emails: [],
+            edit: [emailFieldWithFormSummaryStep1._id],
+          },
+          {
+            _id: new ObjectId().toHexString(),
+            workflow_type: WorkflowType.Static,
+            emails: ['step2_respondent_email@example.com'],
+            edit: [
+              emailFieldWithFormSummaryStep2._id,
+              emailFieldNoAutoReplyStep2._id,
+            ],
+          },
+        ]
+
+        // Act
+        await performMultiRespondentPostSubmissionUpdateActions({
+          submission: {
+            id: mockSubmissionId,
+          } as unknown as IMultirespondentSubmissionSchema,
+          submissionId: mockSubmissionId,
+          snapshottedFormDef: {
+            _id: mockFormId,
+            title: 'Test Form',
+            form_fields: [
+              emailFieldWithFormSummaryStep1,
+              emailFieldNoAutoReplyStep2,
+              emailFieldWithFormSummaryStep2,
+            ],
+            stepsToNotify: [workflow[0]._id, workflow[1]._id],
+            workflow,
+            admin: {
+              agency: {
+                fullName: 'Government Technology Agency',
+              },
+            },
+          } as unknown as SnapshottedFormDef,
+          currentStepNumber: 1, // step 2
+          encryptedPayload: {
+            encryptedContent: 'encryptedContent',
+            version: 1,
+            submissionPublicKey: 'submissionPublicKey',
+            encryptedSubmissionSecretKey: 'encryptedSubmissionSecretKey',
+            responses: {
+              [emailFieldWithFormSummaryStep1._id]: {
+                fieldType: BasicField.Email,
+                answer: {
+                  value: 'expected1@example.com',
+                },
+              },
+              [emailFieldNoAutoReplyStep2._id]: {
+                fieldType: BasicField.Email,
+                answer: {
+                  value: 'expected2@example.com',
+                },
+              },
+            },
+          } as MultirespondentSubmissionDto,
+          logMeta: {} as any,
+          attachments: MOCK_SUBMISSION_ATTACHMENTS,
+        })
+
+        // Assert
+        expect(sendMrfRespondentCopyEmailSpy).not.toHaveBeenCalled()
+      })
+    })
+  })
+
+  describe('mrf approval email notification when approval step exists', () => {
+    it('workflow continues and does not send approved outcome email when mrf is approved for mid step of multiple step MRF', async () => {
+      // Arrange
+      const sendMrfWorkflowCompletionEmailSpy = jest.spyOn(
+        MailService,
+        'sendMrfWorkflowCompletionEmail',
+      )
+      const sendMrfApprovalEmailSpy = jest.spyOn(
+        MailService,
+        'sendMrfApprovalEmail',
+      )
+      const sendMRFWorkflowStepEmailSpy = jest.spyOn(
+        MailService,
+        'sendMRFWorkflowStepEmail',
+      )
+
+      const expectedEmails = ['expected1@example.com']
+
+      const stepOneId = new ObjectId().toHexString()
+      const stepTwoId = new ObjectId().toHexString()
+      const stepThreeId = new ObjectId().toHexString()
+
+      const emailFieldId1 = new ObjectId().toHexString()
+      const emailFieldId2 = new ObjectId().toHexString()
+
+      const yesNoFieldId1 = new ObjectId().toHexString()
+      const yesNoFieldId2 = new ObjectId().toHexString()
+
+      const submissionResponses = {
+        [emailFieldId1]: {
+          fieldType: BasicField.Email,
+          answer: {
+            value: 'not_expected_1@example.com',
+          },
+        },
+        [emailFieldId2]: {
+          fieldType: BasicField.Email,
+          answer: {
+            value: expectedEmails[0],
+          },
+        },
+        [yesNoFieldId1]: {
+          fieldType: BasicField.YesNo,
+          answer: { value: 'Yes' },
+        },
+        [yesNoFieldId2]: {
+          fieldType: BasicField.YesNo,
+          answer: { value: 'No' },
+        },
+      } as FieldResponsesV3
+
+      const threeStepApprovalWorkflow: FormWorkflowStepDto[] = [
+        {
+          _id: stepOneId,
+          workflow_type: WorkflowType.Static,
+          emails: [],
+          edit: [],
+        },
+        {
+          _id: stepTwoId,
+          workflow_type: WorkflowType.Static,
+          emails: ['not_expected_2@example.com'],
+          edit: [yesNoFieldId1],
+          approval_field: yesNoFieldId1,
+        },
+        {
+          _id: stepThreeId,
+          workflow_type: WorkflowType.Dynamic,
+          field: emailFieldId2,
+          edit: [yesNoFieldId2],
+          // no approval field for last step
+        },
+      ]
+
+      const currentStepNumber = 1 // 2nd step of 3 steps workflow
+
+      // Act
+      await performMultiRespondentPostSubmissionUpdateActions({
+        submission: {
+          id: mockSubmissionId,
+        } as unknown as IMultirespondentSubmissionSchema,
+        submissionId: mockSubmissionId,
+        snapshottedFormDef: {
+          _id: mockFormId,
+          workflow: threeStepApprovalWorkflow,
+          emails: [expectedEmails[0]],
+          stepOneEmailNotificationFieldId: emailFieldId1,
+          admin: {
+            agency: {
+              fullName: 'Government Technology Agency',
+            },
+          },
+          form_fields: [
+            {
+              _id: emailFieldId1,
+              fieldType: BasicField.Email,
+              title: 'Email Field 1',
+            },
+            {
+              _id: emailFieldId2,
+              fieldType: BasicField.Email,
+              title: 'Email Field 2',
+            },
+            {
+              _id: yesNoFieldId1,
+              fieldType: BasicField.YesNo,
+              title: 'Yes/No Field 1',
+            },
+            {
+              _id: yesNoFieldId2,
+              fieldType: BasicField.YesNo,
+              title: 'Yes/No Field 2',
+            },
+          ] as FormFieldDto[],
+        } as SnapshottedFormDef,
+        currentStepNumber: currentStepNumber,
+        encryptedPayload: {
+          encryptedContent: 'encryptedContent',
+          version: 1,
+          submissionPublicKey: 'submissionPublicKey',
+          encryptedSubmissionSecretKey: 'encryptedSubmissionSecretKey',
+          responses: submissionResponses,
+          workflowStep: currentStepNumber,
+        } as MultirespondentSubmissionDto,
+        logMeta: {} as any,
+      })
+      // Assert
+      // next workflow step email is sent only
+      expect(sendMrfApprovalEmailSpy).not.toHaveBeenCalled()
+      expect(sendMrfWorkflowCompletionEmailSpy).not.toHaveBeenCalled()
+      expect(sendMRFWorkflowStepEmailSpy).toHaveBeenCalledTimes(1)
+      // destination emails are correct
+      expect(
+        sendMRFWorkflowStepEmailSpy.mock.calls[0][0].emails,
+      ).toContainValues(expectedEmails)
+      expect(sendMRFWorkflowStepEmailSpy.mock.calls[0][0].emails.length).toBe(
+        expectedEmails.length,
+      )
+    })
+
+    it('sends approved outcome email when mrf has approval step earlier but last step is not approval step', async () => {
+      // Arrange
+      const sendMrfWorkflowCompletionEmailSpy = jest.spyOn(
+        MailService,
+        'sendMrfWorkflowCompletionEmail',
+      )
+      const sendMrfApprovalEmailSpy = jest.spyOn(
+        MailService,
+        'sendMrfApprovalEmail',
+      )
+      const sendMRFWorkflowStepEmailSpy = jest.spyOn(
+        MailService,
+        'sendMRFWorkflowStepEmail',
+      )
+
+      const expectedEmails = ['expected1@example.com', 'expected2@example.com']
+
+      const stepOneId = new ObjectId().toHexString()
+      const stepTwoId = new ObjectId().toHexString()
+      const stepThreeId = new ObjectId().toHexString()
+
+      const emailFieldId1 = new ObjectId().toHexString()
+      const emailFieldId2 = new ObjectId().toHexString()
+
+      const yesNoFieldId1 = new ObjectId().toHexString()
+      const yesNoFieldId2 = new ObjectId().toHexString()
+
+      const submissionResponses = {
+        [emailFieldId1]: {
+          fieldType: BasicField.Email,
+          answer: {
+            value: expectedEmails[0],
+          },
+        },
+        [emailFieldId2]: {
+          fieldType: BasicField.Email,
+          answer: {
+            value: 'not_expected_1@example.com',
+          },
+        },
+        [yesNoFieldId1]: {
+          fieldType: BasicField.YesNo,
+          answer: { value: 'Yes' },
+        },
+        [yesNoFieldId2]: {
+          fieldType: BasicField.YesNo,
+          answer: { value: 'No' },
+        },
+      } as FieldResponsesV3
+
+      const threeStepApprovalWorkflow: FormWorkflowStepDto[] = [
+        {
+          _id: stepOneId,
+          workflow_type: WorkflowType.Static,
+          emails: [],
+          edit: [],
+        },
+        {
+          _id: stepTwoId,
+          workflow_type: WorkflowType.Static,
+          emails: ['not_expected_2@example.com'],
+          edit: [yesNoFieldId1],
+          approval_field: yesNoFieldId1,
+        },
+        {
+          _id: stepThreeId,
+          workflow_type: WorkflowType.Dynamic,
+          field: emailFieldId2,
+          edit: [yesNoFieldId2],
+          // no approval field for last step
+        },
+      ]
+
+      const currentWorkflowStep = 2 // last step of 3 step workflow
+
+      // Act
+      await performMultiRespondentPostSubmissionUpdateActions({
+        submission: {
+          id: mockSubmissionId,
+        } as unknown as IMultirespondentSubmissionSchema,
+        submissionId: mockSubmissionId,
+        snapshottedFormDef: {
+          _id: mockFormId,
+          workflow: threeStepApprovalWorkflow,
+          emails: [expectedEmails[1]],
+          stepOneEmailNotificationFieldId: emailFieldId1,
+          admin: {
+            agency: {
+              fullName: 'Government Technology Agency',
+            },
+          },
+          form_fields: [
+            {
+              _id: emailFieldId1,
+              fieldType: BasicField.Email,
+              title: 'Email Field 1',
+            },
+            {
+              _id: emailFieldId2,
+              fieldType: BasicField.Email,
+              title: 'Email Field 2',
+            },
+            {
+              _id: yesNoFieldId1,
+              fieldType: BasicField.YesNo,
+              title: 'Yes/No Field 1',
+            },
+            {
+              _id: yesNoFieldId2,
+              fieldType: BasicField.YesNo,
+              title: 'Yes/No Field 2',
+            },
+          ] as FormFieldDto[],
+        } as SnapshottedFormDef,
+        currentStepNumber: currentWorkflowStep,
+        attachments: MOCK_SUBMISSION_ATTACHMENTS,
+        encryptedPayload: {
+          encryptedContent: 'encryptedContent',
+          version: 1,
+          submissionPublicKey: 'submissionPublicKey',
+          encryptedSubmissionSecretKey: 'encryptedSubmissionSecretKey',
+          responses: submissionResponses,
+          workflowStep: currentWorkflowStep,
+        } as MultirespondentSubmissionDto,
+        logMeta: {} as any,
+      })
+      // Assert
+      // approval email is sent instead of completion email
+      expect(sendMrfApprovalEmailSpy).toHaveBeenCalledTimes(1)
+      expect(sendMrfWorkflowCompletionEmailSpy).not.toHaveBeenCalled()
+      expect(sendMRFWorkflowStepEmailSpy).not.toHaveBeenCalled()
+      // pdf generation is invoked
+      expect(MockMailUtils.generateAutoreplyPdf).toHaveBeenCalledTimes(1)
+      // pdf attachment is included and submission attachments are correct
+      expect(sendMrfApprovalEmailSpy.mock.calls[0][0].attachments).toEqual([
+        ...MOCK_SUBMISSION_ATTACHMENTS,
+        EXPECTED_MOCK_PDF_ATTACHMENT,
+      ])
+      // is approve email and destination emails are correct
+      expect(sendMrfApprovalEmailSpy.mock.calls[0][0].isRejected).toBeFalse()
+      expect(sendMrfApprovalEmailSpy.mock.calls[0][0].emails).toContainValues(
+        expectedEmails,
+      )
+      expect(sendMrfApprovalEmailSpy.mock.calls[0][0].emails.length).toBe(
+        expectedEmails.length,
+      )
+    })
+
+    it('sends approved outcome email to all specified steps including last step of workflow for approval', async () => {
+      // Arrange
+      const sendMrfWorkflowCompletionEmailSpy = jest.spyOn(
+        MailService,
+        'sendMrfWorkflowCompletionEmail',
+      )
+      const sendMrfApprovalEmailSpy = jest.spyOn(
+        MailService,
+        'sendMrfApprovalEmail',
+      )
+      const sendMRFWorkflowStepEmailSpy = jest.spyOn(
+        MailService,
+        'sendMRFWorkflowStepEmail',
+      )
+
+      const expectedEmails = [
+        'expected1@example.com',
+        'expected2@example.com',
+        'expected3@example.com',
+        'expected4@example.com',
+      ]
+
+      const stepOneId = new ObjectId().toHexString()
+      const stepTwoId = new ObjectId().toHexString()
+      const stepThreeId = new ObjectId().toHexString()
+
+      const emailFieldId1 = new ObjectId().toHexString()
+      const emailFieldId2 = new ObjectId().toHexString()
+
+      const yesNoFieldId1 = new ObjectId().toHexString()
+      const yesNoFieldId2 = new ObjectId().toHexString()
+
+      const submissionResponses = {
+        [emailFieldId1]: {
+          fieldType: BasicField.Email,
+          answer: {
+            value: expectedEmails[0],
+          },
+        },
+        [emailFieldId2]: {
+          fieldType: BasicField.Email,
+          answer: {
+            value: expectedEmails[2],
+          },
+        },
+        [yesNoFieldId1]: {
+          fieldType: BasicField.YesNo,
+          answer: { value: 'Yes' },
+        },
+        [yesNoFieldId2]: {
+          fieldType: BasicField.YesNo,
+          answer: { value: 'No' },
+        },
+      } as FieldResponsesV3
+
+      const threeStepApprovalWorkflow: FormWorkflowStepDto[] = [
+        {
+          _id: stepOneId,
+          workflow_type: WorkflowType.Static,
+          emails: [],
+          edit: [],
+        },
+        {
+          _id: stepTwoId,
+          workflow_type: WorkflowType.Static,
+          emails: [expectedEmails[1]],
+          edit: [yesNoFieldId1],
+          approval_field: yesNoFieldId1,
+        },
+        {
+          _id: stepThreeId,
+          workflow_type: WorkflowType.Dynamic,
+          field: emailFieldId2,
+          edit: [yesNoFieldId2],
+          // no approval field for last step
+        },
+      ]
+
+      const currentWorkflowStep = 2 // last step of 3 step workflow
+
+      // Act
+      await performMultiRespondentPostSubmissionUpdateActions({
+        submission: {
+          id: mockSubmissionId,
+        } as unknown as IMultirespondentSubmissionSchema,
+        submissionId: mockSubmissionId,
+        snapshottedFormDef: {
+          _id: mockFormId,
+          workflow: threeStepApprovalWorkflow,
+          emails: [expectedEmails[3]],
+          stepsToNotify: [stepTwoId, stepThreeId],
+          stepOneEmailNotificationFieldId: emailFieldId1,
+          admin: {
+            agency: {
+              fullName: 'Government Technology Agency',
+            },
+          },
+          form_fields: [
+            {
+              _id: emailFieldId1,
+              fieldType: BasicField.Email,
+              title: 'Email Field 1',
+            },
+            {
+              _id: emailFieldId2,
+              fieldType: BasicField.Email,
+              title: 'Email Field 2',
+            },
+            {
+              _id: yesNoFieldId1,
+              fieldType: BasicField.YesNo,
+              title: 'Yes/No Field 1',
+            },
+            {
+              _id: yesNoFieldId2,
+              fieldType: BasicField.YesNo,
+              title: 'Yes/No Field 2',
+            },
+          ] as FormFieldDto[],
+        } as SnapshottedFormDef,
+        currentStepNumber: currentWorkflowStep,
+        encryptedPayload: {
+          encryptedContent: 'encryptedContent',
+          version: 1,
+          submissionPublicKey: 'submissionPublicKey',
+          encryptedSubmissionSecretKey: 'encryptedSubmissionSecretKey',
+          responses: submissionResponses,
+          workflowStep: currentWorkflowStep,
+        } as MultirespondentSubmissionDto,
+        logMeta: {} as any,
+      })
+      // Assert
+      // approval email is sent instead of completion email
+      expect(sendMrfApprovalEmailSpy).toHaveBeenCalledTimes(1)
+      expect(sendMrfWorkflowCompletionEmailSpy).not.toHaveBeenCalled()
+      expect(sendMRFWorkflowStepEmailSpy).not.toHaveBeenCalled()
+      // pdf generation is invoked
+      expect(MockMailUtils.generateAutoreplyPdf).toHaveBeenCalledTimes(1)
+      // pdf attachment is included and submission attachments are correct
+      expect(sendMrfApprovalEmailSpy.mock.calls[0][0].attachments).toEqual([
+        EXPECTED_MOCK_PDF_ATTACHMENT,
+      ])
+      // is approve email and destination emails are correct
+      expect(sendMrfApprovalEmailSpy.mock.calls[0][0].isRejected).toBeFalse()
+      expect(sendMrfApprovalEmailSpy.mock.calls[0][0].emails).toContainValues(
+        expectedEmails,
+      )
+      expect(sendMrfApprovalEmailSpy.mock.calls[0][0].emails.length).toBe(
+        expectedEmails.length,
+      )
+    })
+
+    it('sends approved outcome email when mrf is approved for last step of multiple step MRF', async () => {
+      // Arrange
+      const sendMrfWorkflowCompletionEmailSpy = jest.spyOn(
+        MailService,
+        'sendMrfWorkflowCompletionEmail',
+      )
+      const sendMrfApprovalEmailSpy = jest.spyOn(
+        MailService,
+        'sendMrfApprovalEmail',
+      )
+      const sendMRFWorkflowStepEmailSpy = jest.spyOn(
+        MailService,
+        'sendMRFWorkflowStepEmail',
+      )
+
+      const expectedEmails = ['expected1@example.com', 'expected2@example.com']
+
+      const stepOneId = new ObjectId().toHexString()
+      const stepTwoId = new ObjectId().toHexString()
+      const stepThreeId = new ObjectId().toHexString()
+
+      const emailFieldId1 = new ObjectId().toHexString()
+      const emailFieldId2 = new ObjectId().toHexString()
+
+      const yesNoFieldId1 = new ObjectId().toHexString()
+      const yesNoFieldId2 = new ObjectId().toHexString()
+
+      const submissionResponses = {
+        [emailFieldId1]: {
+          fieldType: BasicField.Email,
+          answer: {
+            value: expectedEmails[0],
+          },
+        },
+        [emailFieldId2]: {
+          fieldType: BasicField.Email,
+          answer: {
+            value: 'not_expected_1@example.com',
+          },
+        },
+        [yesNoFieldId1]: {
+          fieldType: BasicField.YesNo,
+          answer: { value: 'Yes' },
+        },
+        [yesNoFieldId2]: {
+          fieldType: BasicField.YesNo,
+          answer: { value: 'Yes' },
+        },
+      }
+
+      const threeStepApprovalWorkflow: FormWorkflowStepDto[] = [
+        {
+          _id: stepOneId,
+          workflow_type: WorkflowType.Static,
+          emails: [],
+          edit: [],
+        },
+        {
+          _id: stepTwoId,
+          workflow_type: WorkflowType.Static,
+          emails: ['not_expected_2@example.com'],
+          edit: [yesNoFieldId1],
+          approval_field: yesNoFieldId1,
+        },
+        {
+          _id: stepThreeId,
+          workflow_type: WorkflowType.Dynamic,
+          field: emailFieldId2,
+          edit: [yesNoFieldId2],
+          approval_field: yesNoFieldId2,
+        },
+      ]
+
+      const currentWorkflowStep = 2 // last step of 3 step workflow
+
+      // Act
+      await performMultiRespondentPostSubmissionUpdateActions({
+        submission: {
+          id: mockSubmissionId,
+        } as unknown as IMultirespondentSubmissionSchema,
+        submissionId: mockSubmissionId,
+        snapshottedFormDef: {
+          _id: mockFormId,
+          workflow: threeStepApprovalWorkflow,
+          emails: [expectedEmails[1]],
+          stepOneEmailNotificationFieldId: emailFieldId1,
+          admin: {
+            agency: {
+              fullName: 'Government Technology Agency',
+            },
+          },
+          form_fields: [
+            {
+              _id: emailFieldId1,
+              fieldType: BasicField.Email,
+              title: 'Email Field 1',
+            },
+            {
+              _id: emailFieldId2,
+              fieldType: BasicField.Email,
+              title: 'Email Field 2',
+            },
+            {
+              _id: yesNoFieldId1,
+              fieldType: BasicField.YesNo,
+              title: 'Yes/No Field 1',
+            },
+            {
+              _id: yesNoFieldId2,
+              fieldType: BasicField.YesNo,
+              title: 'Yes/No Field 2',
+            },
+          ] as FormFieldDto[],
+        } as SnapshottedFormDef,
+        currentStepNumber: currentWorkflowStep,
+        encryptedPayload: {
+          encryptedContent: 'encryptedContent',
+          version: 1,
+          submissionPublicKey: 'submissionPublicKey',
+          encryptedSubmissionSecretKey: 'encryptedSubmissionSecretKey',
+          responses: submissionResponses,
+          workflowStep: threeStepApprovalWorkflow.length - 1, // last step
+        } as MultirespondentSubmissionDto,
+        logMeta: {} as any,
+      })
+      // Assert
+      // approval email is sent instead of completion email
+      expect(sendMrfApprovalEmailSpy).toHaveBeenCalledTimes(1)
+      expect(sendMrfWorkflowCompletionEmailSpy).not.toHaveBeenCalled()
+      expect(sendMRFWorkflowStepEmailSpy).not.toHaveBeenCalled()
+      // pdf generation is invoked
+      expect(MockMailUtils.generateAutoreplyPdf).toHaveBeenCalledTimes(1)
+      // pdf attachment is included and submission attachments are correct
+      expect(sendMrfApprovalEmailSpy.mock.calls[0][0].attachments).toEqual([
+        EXPECTED_MOCK_PDF_ATTACHMENT,
+      ])
+      // is approve email and destination emails are correct
+      expect(sendMrfApprovalEmailSpy.mock.calls[0][0].isRejected).toBeFalse()
+      expect(sendMrfApprovalEmailSpy.mock.calls[0][0].emails).toContainValues(
+        expectedEmails,
+      )
+      expect(sendMrfApprovalEmailSpy.mock.calls[0][0].emails.length).toBe(
+        expectedEmails.length,
+      )
+    })
+
+    it('workflow terminates and sends not approved outcome email when mrf is rejected for mid step of multiple step MRF', async () => {
+      // Arrange
+      const sendMrfWorkflowCompletionEmailSpy = jest.spyOn(
+        MailService,
+        'sendMrfWorkflowCompletionEmail',
+      )
+      const sendMrfApprovalEmailSpy = jest.spyOn(
+        MailService,
+        'sendMrfApprovalEmail',
+      )
+      const sendMRFWorkflowStepEmailSpy = jest.spyOn(
+        MailService,
+        'sendMRFWorkflowStepEmail',
+      )
+
+      const expectedEmails = ['expected1@example.com', 'expected2@example.com']
+
+      const stepOneId = new ObjectId().toHexString()
+      const stepTwoId = new ObjectId().toHexString()
+      const stepThreeId = new ObjectId().toHexString()
+
+      const emailFieldId1 = new ObjectId().toHexString()
+      const emailFieldId2 = new ObjectId().toHexString()
+
+      const yesNoFieldId1 = new ObjectId().toHexString()
+      const yesNoFieldId2 = new ObjectId().toHexString()
+
+      const submissionResponses = {
+        [emailFieldId1]: {
+          fieldType: BasicField.Email,
+          answer: {
+            value: expectedEmails[0],
+          },
+        },
+        [emailFieldId2]: {
+          fieldType: BasicField.Email,
+          answer: {
+            value: 'not_expected_1@example.com',
+          },
+        },
+        [yesNoFieldId1]: {
+          fieldType: BasicField.YesNo,
+          answer: { value: 'No' },
+        },
+      } as FieldResponsesV3
+
+      const threeStepApprovalWorkflow: FormWorkflowStepDto[] = [
+        {
+          _id: stepOneId,
+          workflow_type: WorkflowType.Static,
+          emails: [],
+          edit: [],
+        },
+        {
+          _id: stepTwoId,
+          workflow_type: WorkflowType.Static,
+          emails: ['not_expected_2@example.com'],
+          edit: [yesNoFieldId1],
+          approval_field: yesNoFieldId1,
+        },
+        {
+          _id: stepThreeId,
+          workflow_type: WorkflowType.Dynamic,
+          field: emailFieldId2,
+          edit: [yesNoFieldId2],
+          approval_field: yesNoFieldId2,
+        },
+      ]
+
+      const currentStepNumber = 1 // 2nd step of 3 steps workflow
+
+      // Act
+      await performMultiRespondentPostSubmissionUpdateActions({
+        submission: {
+          id: mockSubmissionId,
+        } as unknown as IMultirespondentSubmissionSchema,
+        submissionId: mockSubmissionId,
+        snapshottedFormDef: {
+          _id: mockFormId,
+          workflow: threeStepApprovalWorkflow,
+          emails: [expectedEmails[1]],
+          stepOneEmailNotificationFieldId: emailFieldId1,
+          admin: {
+            agency: {
+              fullName: 'Government Technology Agency',
+            },
+          },
+          form_fields: [
+            {
+              _id: emailFieldId1,
+              fieldType: BasicField.Email,
+              title: 'Email Field 1',
+            },
+            {
+              _id: emailFieldId2,
+              fieldType: BasicField.Email,
+              title: 'Email Field 2',
+            },
+            {
+              _id: yesNoFieldId1,
+              fieldType: BasicField.YesNo,
+              title: 'Yes/No Field 1',
+            },
+            {
+              _id: yesNoFieldId2,
+              fieldType: BasicField.YesNo,
+              title: 'Yes/No Field 2',
+            },
+          ] as FormFieldDto[],
+        } as SnapshottedFormDef,
+        currentStepNumber: currentStepNumber,
+        attachments: MOCK_SUBMISSION_ATTACHMENTS,
+        encryptedPayload: {
+          encryptedContent: 'encryptedContent',
+          version: 1,
+          submissionPublicKey: 'submissionPublicKey',
+          encryptedSubmissionSecretKey: 'encryptedSubmissionSecretKey',
+          responses: submissionResponses,
+          workflowStep: currentStepNumber,
+        } as MultirespondentSubmissionDto,
+        logMeta: {} as any,
+      })
+      // Assert
+      // approval email is sent instead of completion email
+      expect(sendMrfApprovalEmailSpy).toHaveBeenCalledTimes(1)
+      expect(sendMrfWorkflowCompletionEmailSpy).not.toHaveBeenCalled()
+      expect(sendMRFWorkflowStepEmailSpy).not.toHaveBeenCalled()
+      // pdf generation is invoked
+      expect(MockMailUtils.generateAutoreplyPdf).toHaveBeenCalledTimes(1)
+      // pdf attachment is included and submission attachments are correct
+      expect(sendMrfApprovalEmailSpy.mock.calls[0][0].attachments).toEqual([
+        ...MOCK_SUBMISSION_ATTACHMENTS,
+        EXPECTED_MOCK_PDF_ATTACHMENT,
+      ])
+      // is rejected email and destination emails are correct
+      expect(sendMrfApprovalEmailSpy.mock.calls[0][0].isRejected).toBeTrue()
+      expect(sendMrfApprovalEmailSpy.mock.calls[0][0].emails).toContainValues(
+        expectedEmails,
+      )
+      expect(sendMrfApprovalEmailSpy.mock.calls[0][0].emails.length).toBe(
+        expectedEmails.length,
+      )
+    })
+
+    it('workflow terminates and sends not approved outcome email only to steps before and including current step when mrf is rejected for mid step of multiple step MRF', async () => {
+      // Arrange
+      const sendMrfWorkflowCompletionEmailSpy = jest.spyOn(
+        MailService,
+        'sendMrfWorkflowCompletionEmail',
+      )
+      const sendMrfApprovalEmailSpy = jest.spyOn(
+        MailService,
+        'sendMrfApprovalEmail',
+      )
+      const sendMRFWorkflowStepEmailSpy = jest.spyOn(
+        MailService,
+        'sendMRFWorkflowStepEmail',
+      )
+
+      const expectedEmails = [
+        'expected1@example.com',
+        'expected2@example.com',
+        'expected3@example.com',
+      ]
+
+      const stepOneId = new ObjectId().toHexString()
+      const stepTwoId = new ObjectId().toHexString()
+      const stepThreeId = new ObjectId().toHexString()
+      const stepFourId = new ObjectId().toHexString()
+      const stepFiveId = new ObjectId().toHexString()
+
+      const emailFieldId1 = new ObjectId().toHexString()
+      const emailFieldId2 = new ObjectId().toHexString()
+
+      const yesNoFieldId1 = new ObjectId().toHexString()
+      const yesNoFieldId2 = new ObjectId().toHexString()
+
+      const submissionResponses = {
+        [emailFieldId1]: {
+          fieldType: BasicField.Email,
+          answer: {
+            value: expectedEmails[0],
+          },
+        },
+        [emailFieldId2]: {
+          fieldType: BasicField.Email,
+          answer: {
+            value: 'not_expected_1@example.com',
+          },
+        },
+        [yesNoFieldId1]: {
+          fieldType: BasicField.YesNo,
+          answer: { value: 'No' },
+        },
+      } as FieldResponsesV3
+
+      const fiveStepApprovalWorkflow: FormWorkflowStepDto[] = [
+        {
+          _id: stepOneId,
+          workflow_type: WorkflowType.Static,
+          emails: [],
+          edit: [],
+        },
+        {
+          _id: stepTwoId,
+          workflow_type: WorkflowType.Static,
+          emails: ['not_expected_2@example.com'],
+          edit: [yesNoFieldId1],
+          approval_field: yesNoFieldId1,
+        },
+        {
+          _id: stepThreeId,
+          workflow_type: WorkflowType.Dynamic,
+          field: emailFieldId2,
+          edit: [yesNoFieldId2],
+          approval_field: yesNoFieldId2,
+        },
+        {
+          _id: stepFourId,
+          workflow_type: WorkflowType.Static,
+          emails: [expectedEmails[2]],
+          edit: [],
+        },
+        {
+          _id: stepFiveId,
+          workflow_type: WorkflowType.Static,
+          emails: ['not_expected_3@example.com'],
+          edit: [],
+        },
+      ]
+
+      const currentStepNumber = 1 // 2nd step of 5 steps workflow
+
+      // Act
+      await performMultiRespondentPostSubmissionUpdateActions({
+        submission: {
+          id: mockSubmissionId,
+        } as unknown as IMultirespondentSubmissionSchema,
+        submissionId: mockSubmissionId,
+        snapshottedFormDef: {
+          _id: mockFormId,
+          workflow: fiveStepApprovalWorkflow,
+          emails: [expectedEmails[1], expectedEmails[2]],
+          stepsToNotify: [stepThreeId, stepFourId, stepFiveId],
+          stepOneEmailNotificationFieldId: emailFieldId1,
+          admin: {
+            agency: {
+              fullName: 'Government Technology Agency',
+            },
+          },
+          form_fields: [
+            {
+              _id: emailFieldId1,
+              fieldType: BasicField.Email,
+              title: 'Email Field 1',
+            },
+            {
+              _id: emailFieldId2,
+              fieldType: BasicField.Email,
+              title: 'Email Field 2',
+            },
+            {
+              _id: yesNoFieldId1,
+              fieldType: BasicField.YesNo,
+              title: 'Yes/No Field 1',
+            },
+            {
+              _id: yesNoFieldId2,
+              fieldType: BasicField.YesNo,
+              title: 'Yes/No Field 2',
+            },
+          ] as FormFieldDto[],
+        } as SnapshottedFormDef,
+        currentStepNumber: currentStepNumber,
+        encryptedPayload: {
+          encryptedContent: 'encryptedContent',
+          version: 1,
+          submissionPublicKey: 'submissionPublicKey',
+          encryptedSubmissionSecretKey: 'encryptedSubmissionSecretKey',
+          responses: submissionResponses,
+          workflowStep: currentStepNumber,
+        } as MultirespondentSubmissionDto,
+        logMeta: {} as any,
+      })
+      // Assert
+      // approval email is sent instead of completion email
+      expect(sendMrfApprovalEmailSpy).toHaveBeenCalledTimes(1)
+      expect(sendMrfWorkflowCompletionEmailSpy).not.toHaveBeenCalled()
+      expect(sendMRFWorkflowStepEmailSpy).not.toHaveBeenCalled()
+      // pdf generation is invoked
+      expect(MockMailUtils.generateAutoreplyPdf).toHaveBeenCalledTimes(1)
+      // pdf attachment is included and submission attachments are correct
+      expect(sendMrfApprovalEmailSpy.mock.calls[0][0].attachments).toEqual([
+        EXPECTED_MOCK_PDF_ATTACHMENT,
+      ])
+      // is rejected email and destination emails are correct
+      expect(sendMrfApprovalEmailSpy.mock.calls[0][0].isRejected).toBeTrue()
+      expect(sendMrfApprovalEmailSpy.mock.calls[0][0].emails).toContainValues(
+        expectedEmails,
+      )
+      expect(sendMrfApprovalEmailSpy.mock.calls[0][0].emails.length).toBe(
+        expectedEmails.length,
+      )
+    })
+
+    it('workflow terminates and sends not approved outcome email when mrf is rejected for last step of multiple step MRF', async () => {
+      // Arrange
+      const sendMrfWorkflowCompletionEmailSpy = jest.spyOn(
+        MailService,
+        'sendMrfWorkflowCompletionEmail',
+      )
+      const sendMrfApprovalEmailSpy = jest.spyOn(
+        MailService,
+        'sendMrfApprovalEmail',
+      )
+      const sendMRFWorkflowStepEmailSpy = jest.spyOn(
+        MailService,
+        'sendMRFWorkflowStepEmail',
+      )
+
+      const expectedEmails = ['expected1@example.com', 'expected2@example.com']
+
+      const stepOneId = new ObjectId().toHexString()
+      const stepTwoId = new ObjectId().toHexString()
+      const stepThreeId = new ObjectId().toHexString()
+
+      const emailFieldId1 = new ObjectId().toHexString()
+      const emailFieldId2 = new ObjectId().toHexString()
+
+      const yesNoFieldId1 = new ObjectId().toHexString()
+      const yesNoFieldId2 = new ObjectId().toHexString()
+
+      const submissionResponses = {
+        [emailFieldId1]: {
+          fieldType: BasicField.Email,
+          answer: {
+            value: expectedEmails[0],
+          },
+        },
+        [emailFieldId2]: {
+          fieldType: BasicField.Email,
+          answer: {
+            value: 'not_expected_1@example.com',
+          },
+        },
+        [yesNoFieldId1]: {
+          fieldType: BasicField.YesNo,
+          answer: { value: 'Yes' },
+        },
+        [yesNoFieldId2]: {
+          fieldType: BasicField.YesNo,
+          answer: { value: 'No' },
+        },
+      }
+
+      const threeStepApprovalWorkflow: FormWorkflowStepDto[] = [
+        {
+          _id: stepOneId,
+          workflow_type: WorkflowType.Static,
+          emails: [],
+          edit: [],
+        },
+        {
+          _id: stepTwoId,
+          workflow_type: WorkflowType.Static,
+          emails: ['not_expected_2@example.com'],
+          edit: [yesNoFieldId1],
+          approval_field: yesNoFieldId1,
+        },
+        {
+          _id: stepThreeId,
+          workflow_type: WorkflowType.Dynamic,
+          field: emailFieldId2,
+          edit: [yesNoFieldId2],
+          approval_field: yesNoFieldId2,
+        },
+      ]
+
+      const currentStepNumber = 2 // last step of 3 step workflow
+
+      // Act
+      await performMultiRespondentPostSubmissionUpdateActions({
+        submission: {
+          id: mockSubmissionId,
+        } as unknown as IMultirespondentSubmissionSchema,
+        submissionId: mockSubmissionId,
+        snapshottedFormDef: {
+          _id: mockFormId,
+          workflow: threeStepApprovalWorkflow,
+          emails: [expectedEmails[1]],
+          stepOneEmailNotificationFieldId: emailFieldId1,
+          admin: {
+            agency: {
+              fullName: 'Government Technology Agency',
+            },
+          },
+          form_fields: [
+            {
+              _id: emailFieldId1,
+              fieldType: BasicField.Email,
+              title: 'Email Field 1',
+            },
+            {
+              _id: emailFieldId2,
+              fieldType: BasicField.Email,
+              title: 'Email Field 2',
+            },
+            {
+              _id: yesNoFieldId1,
+              fieldType: BasicField.YesNo,
+              title: 'Yes/No Field 1',
+            },
+            {
+              _id: yesNoFieldId2,
+              fieldType: BasicField.YesNo,
+              title: 'Yes/No Field 2',
+            },
+          ] as FormFieldDto[],
+        } as SnapshottedFormDef,
+        currentStepNumber,
+        encryptedPayload: {
+          encryptedContent: 'encryptedContent',
+          version: 1,
+          submissionPublicKey: 'submissionPublicKey',
+          encryptedSubmissionSecretKey: 'encryptedSubmissionSecretKey',
+          responses: submissionResponses,
+          workflowStep: threeStepApprovalWorkflow.length - 1, // last step
+        } as MultirespondentSubmissionDto,
+        logMeta: {} as any,
+      })
+      // Assert
+      // approval email is sent instead of completion email
+      expect(sendMrfApprovalEmailSpy).toHaveBeenCalledTimes(1)
+      expect(sendMrfWorkflowCompletionEmailSpy).not.toHaveBeenCalled()
+      expect(sendMRFWorkflowStepEmailSpy).not.toHaveBeenCalled()
+      // pdf generation is invoked
+      expect(MockMailUtils.generateAutoreplyPdf).toHaveBeenCalledTimes(1)
+      // pdf attachment is included and submission attachments are correct
+      expect(sendMrfApprovalEmailSpy.mock.calls[0][0].attachments).toEqual([
+        EXPECTED_MOCK_PDF_ATTACHMENT,
+      ])
+      // is rejected email and destination emails are correct
+      expect(sendMrfApprovalEmailSpy.mock.calls[0][0].isRejected).toBeTrue()
+      expect(sendMrfApprovalEmailSpy.mock.calls[0][0].emails).toContainValues(
+        expectedEmails,
+      )
+      expect(sendMrfApprovalEmailSpy.mock.calls[0][0].emails.length).toBe(
+        expectedEmails.length,
+      )
+    })
+  })
+
+  describe('mrf completion email notification when no approval step exists', () => {
+    it('sends completion email without pdf attachment when pdf generation fails', async () => {
+      // Arrange
+      MockMailUtils.generateAutoreplyPdf.mockReturnValue(
+        errAsync(new AutoreplyPdfGenerationError()),
+      )
+      const sendMrfWorkflowCompletionEmailSpy = jest.spyOn(
+        MailService,
+        'sendMrfWorkflowCompletionEmail',
+      )
+      const singleStepWorkflow: FormWorkflowStepDto[] = [
+        {
+          _id: new ObjectId().toHexString(),
+          workflow_type: WorkflowType.Static,
+          emails: [],
+          edit: [],
+        },
+      ]
+
+      // Act
+      await performMultiRespondentPostSubmissionCreateActions({
+        submission: {
+          id: mockSubmissionId,
+        } as unknown as IMultirespondentSubmissionSchema,
+        submissionId: mockSubmissionId,
+        form: {
+          _id: mockFormId,
+          workflow: singleStepWorkflow,
+          emails: ['email1@example.com'],
+        } as IPopulatedMultirespondentForm,
+        encryptedPayload: {
+          encryptedContent: 'encryptedContent',
+          version: 1,
+          submissionPublicKey: 'submissionPublicKey',
+          encryptedSubmissionSecretKey: 'encryptedSubmissionSecretKey',
+        } as MultirespondentSubmissionDto,
+        attachments: MOCK_SUBMISSION_ATTACHMENTS,
+        logMeta: {} as any,
+      })
+
+      // Assert
+      expect(sendMrfWorkflowCompletionEmailSpy).toHaveBeenCalledTimes(1)
+      // pdf generation is invoked
+      expect(MockMailUtils.generateAutoreplyPdf).toHaveBeenCalledTimes(1)
+      // submission attachments is sent without pdf attachment
+      expect(
+        sendMrfWorkflowCompletionEmailSpy.mock.calls[0][0].attachments,
+      ).toEqual([...MOCK_SUBMISSION_ATTACHMENTS])
+      // the correct destination emails are included
+      expect(
+        sendMrfWorkflowCompletionEmailSpy.mock.calls[0][0].emails,
+      ).toContainValues(['email1@example.com'])
+      expect(
+        sendMrfWorkflowCompletionEmailSpy.mock.calls[0][0].emails.length,
+      ).toBe(1)
+    })
+
+    it('sends completion email with pdf attachment when single step mrf is completed', async () => {
+      // Arrange
+      const sendMrfWorkflowCompletionEmailSpy = jest.spyOn(
+        MailService,
+        'sendMrfWorkflowCompletionEmail',
+      )
+
+      const singleStepWorkflow: FormWorkflowStepDto[] = [
+        {
+          _id: new ObjectId().toHexString(),
+          workflow_type: WorkflowType.Static,
+          emails: [],
+          edit: [],
+        },
+      ]
+
+      // Act
+      await performMultiRespondentPostSubmissionCreateActions({
+        submission: {
+          id: mockSubmissionId,
+        } as unknown as IMultirespondentSubmissionSchema,
+        submissionId: mockSubmissionId,
+        form: {
+          _id: mockFormId,
+          workflow: singleStepWorkflow,
+          emails: ['email1@example.com'],
+        } as IPopulatedMultirespondentForm,
+        encryptedPayload: {
+          encryptedContent: 'encryptedContent',
+          version: 1,
+          submissionPublicKey: 'submissionPublicKey',
+          encryptedSubmissionSecretKey: 'encryptedSubmissionSecretKey',
+        } as MultirespondentSubmissionDto,
+        attachments: MOCK_SUBMISSION_ATTACHMENTS,
+        logMeta: {} as any,
+      })
+
+      // Assert
+      expect(sendMrfWorkflowCompletionEmailSpy).toHaveBeenCalledTimes(1)
+      // pdf generation is invoked
+      expect(MockMailUtils.generateAutoreplyPdf).toHaveBeenCalledTimes(1)
+      // pdf attachment is included and submission attachments are correct
+      expect(
+        sendMrfWorkflowCompletionEmailSpy.mock.calls[0][0].attachments,
+      ).toEqual([...MOCK_SUBMISSION_ATTACHMENTS, EXPECTED_MOCK_PDF_ATTACHMENT])
+      // the correct destination emails are included
+      expect(
+        sendMrfWorkflowCompletionEmailSpy.mock.calls[0][0].emails,
+      ).toContainValues(['email1@example.com'])
+      expect(
+        sendMrfWorkflowCompletionEmailSpy.mock.calls[0][0].emails.length,
+      ).toBe(1)
+    })
+
+    it('sends completion email when multi-step mrf is completed and only to specified steps only and also static emails', async () => {
+      // Arrange
+      const sendMrfWorkflowCompletionEmailSpy = jest.spyOn(
+        MailService,
+        'sendMrfWorkflowCompletionEmail',
+      )
+
+      const expectedEmails = [
+        'expected1@example.com',
+        'expected2@example.com',
+        'expected3@example.com',
+        'expected4@example.com',
+      ]
+
+      const stepOneId = new ObjectId().toHexString()
+      const stepTwoId = new ObjectId().toHexString()
+      const stepThreeId = new ObjectId().toHexString()
+      const stepFourId = new ObjectId().toHexString()
+
+      const emailFieldId1 = new ObjectId().toHexString()
+      const emailFieldId2 = new ObjectId().toHexString()
+
+      const submissionResponses = {
+        [emailFieldId1]: {
+          fieldType: 'email',
+          answer: {
+            value: expectedEmails[0],
+          },
+        },
+        [emailFieldId2]: {
+          fieldType: 'email',
+          answer: {
+            value: 'not_expected_1@example.com',
+          },
+        },
+      } as FieldResponsesV3
+
+      const fourStepWorkflow: FormWorkflowStepDto[] = [
+        {
+          _id: stepOneId,
+          workflow_type: WorkflowType.Static,
+          emails: [],
+          edit: [],
+        },
+        {
+          _id: stepTwoId,
+          workflow_type: WorkflowType.Static,
+          emails: ['not_expected_2@example.com'],
+          edit: [],
+        },
+        {
+          _id: stepThreeId,
+          workflow_type: WorkflowType.Dynamic,
+          field: emailFieldId2,
+          edit: [],
+        },
+        {
+          _id: stepFourId,
+          workflow_type: WorkflowType.Static,
+          emails: [expectedEmails[1], expectedEmails[2]],
+          edit: [],
+        },
+      ]
+
+      const currentStepNumber = fourStepWorkflow.length - 1 // last step of 4 steps workflow
+
+      // Act
+      await performMultiRespondentPostSubmissionUpdateActions({
+        submission: {
+          id: mockSubmissionId,
+        } as unknown as IMultirespondentSubmissionSchema,
+        submissionId: mockSubmissionId,
+        snapshottedFormDef: {
+          _id: mockFormId,
+          workflow: fourStepWorkflow,
+          emails: [expectedEmails[3]],
+          stepsToNotify: [stepFourId],
+          stepOneEmailNotificationFieldId: emailFieldId1,
+        } as SnapshottedFormDef,
+        currentStepNumber,
+        encryptedPayload: {
+          encryptedContent: 'encryptedContent',
+          version: 1,
+          submissionPublicKey: 'submissionPublicKey',
+          encryptedSubmissionSecretKey: 'encryptedSubmissionSecretKey',
+          responses: submissionResponses,
+          workflowStep: currentStepNumber,
+        } as MultirespondentSubmissionDto,
+        logMeta: {} as any,
+      })
+
+      // Assert
+      expect(sendMrfWorkflowCompletionEmailSpy).toHaveBeenCalledTimes(1)
+      // pdf generation is invoked
+      expect(MockMailUtils.generateAutoreplyPdf).toHaveBeenCalledTimes(1)
+      // pdf attachment is included and submission attachments are correct
+      expect(
+        sendMrfWorkflowCompletionEmailSpy.mock.calls[0][0].attachments,
+      ).toEqual([EXPECTED_MOCK_PDF_ATTACHMENT])
+      // The emails sent to should only be the expected emails exactly
+      expect(
+        sendMrfWorkflowCompletionEmailSpy.mock.calls[0][0].emails,
+      ).toContainValues(expectedEmails)
+      expect(
+        sendMrfWorkflowCompletionEmailSpy.mock.calls[0][0].emails.length,
+      ).toBe(expectedEmails.length)
+    })
+
+    it('does not send completion email when step number >0 and mrf not completed', async () => {
+      // Arrange
+      const sendMrfWorkflowCompletionEmailSpy = jest.spyOn(
+        MailService,
+        'sendMrfWorkflowCompletionEmail',
+      )
+
+      const selectedEmails = [
+        'seelcted1@example.com',
+        'seelcted2@example.com',
+        'seelcted3@example.com',
+        'seelcted4@example.com',
+      ]
+
+      const stepOneId = new ObjectId().toHexString()
+      const stepTwoId = new ObjectId().toHexString()
+      const stepThreeId = new ObjectId().toHexString()
+      const stepFourId = new ObjectId().toHexString()
+
+      const emailFieldId1 = new ObjectId().toHexString()
+      const emailFieldId2 = new ObjectId().toHexString()
+
+      const submissionResponses = {
+        [emailFieldId1]: {
+          fieldType: 'email',
+          answer: {
+            value: selectedEmails[0],
+          },
+        },
+        [emailFieldId2]: {
+          fieldType: 'email',
+          answer: {
+            value: 'not_selected_1@example.com',
+          },
+        },
+      }
+
+      const fourStepWorkflow: FormWorkflowStepDto[] = [
+        {
+          _id: stepOneId,
+          workflow_type: WorkflowType.Static,
+          emails: [],
+          edit: [],
+        },
+        {
+          _id: stepTwoId,
+          workflow_type: WorkflowType.Static,
+          emails: ['not_selected_2@example.com'],
+          edit: [],
+        },
+        {
+          _id: stepThreeId,
+          workflow_type: WorkflowType.Dynamic,
+          field: emailFieldId2,
+          edit: [],
+        },
+        {
+          _id: stepFourId,
+          workflow_type: WorkflowType.Static,
+          emails: [selectedEmails[1], selectedEmails[2]],
+          edit: [],
+        },
+      ]
+
+      const currentStepNumber = fourStepWorkflow.length - 2 // not last step of 4 steps workflow
+
+      // Act
+      await performMultiRespondentPostSubmissionUpdateActions({
+        submission: {
+          id: mockSubmissionId,
+        } as unknown as IMultirespondentSubmissionSchema,
+        submissionId: mockSubmissionId,
+        snapshottedFormDef: {
+          _id: mockFormId,
+          workflow: fourStepWorkflow,
+          emails: [selectedEmails[3]],
+          stepsToNotify: [stepFourId],
+          stepOneEmailNotificationFieldId: emailFieldId1,
+        } as SnapshottedFormDef,
+        currentStepNumber,
+        encryptedPayload: {
+          encryptedContent: 'encryptedContent',
+          version: 1,
+          submissionPublicKey: 'submissionPublicKey',
+          encryptedSubmissionSecretKey: 'encryptedSubmissionSecretKey',
+          responses: submissionResponses,
+          workflowStep: currentStepNumber,
+        } as MultirespondentSubmissionDto,
+        logMeta: {} as any,
+      })
+
+      // Assert
+      expect(sendMrfWorkflowCompletionEmailSpy).not.toHaveBeenCalled()
+    })
+
+    describe('people added to a step through Reassign', () => {
+      const buildWorkflow = (stepCount: number): FormWorkflowStepDto[] =>
+        Array.from({ length: stepCount }, (_, index) => ({
+          _id: new ObjectId().toHexString(),
+          workflow_type: WorkflowType.Static,
+          emails: index === 0 ? [] : [`step${index + 1}@example.com`],
+          edit: [],
+        }))
+
+      const completeWorkflow = async ({
+        workflow,
+        stepNumbersToNotify,
+      }: {
+        workflow: FormWorkflowStepDto[]
+        stepNumbersToNotify: number[]
+      }) => {
+        const sendMrfWorkflowCompletionEmailSpy = jest.spyOn(
+          MailService,
+          'sendMrfWorkflowCompletionEmail',
+        )
+        const lastStepIndex = workflow.length - 1
+
+        await performMultiRespondentPostSubmissionUpdateActions({
+          submission: {
+            id: mockSubmissionId,
+            workflowEvents: workflow.slice(1).map((_, index) => ({
+              type: WorkflowEventType.AssigneesAdded,
+              actorEmail: 'admin@example.com',
+              stepNumber: index + 2,
+              emails: [`added${index + 2}@example.com`],
+              created: new Date(),
+            })),
+          } as unknown as IMultirespondentSubmissionSchema,
+          submissionId: mockSubmissionId,
+          snapshottedFormDef: {
+            _id: mockFormId,
+            workflow,
+            emails: [],
+            stepsToNotify: stepNumbersToNotify.map(
+              (stepNumber) => workflow[stepNumber - 1]._id,
+            ),
+          } as unknown as SnapshottedFormDef,
+          currentStepNumber: lastStepIndex,
+          encryptedPayload: {
+            encryptedContent: 'encryptedContent',
+            version: 1,
+            submissionPublicKey: 'submissionPublicKey',
+            encryptedSubmissionSecretKey: 'encryptedSubmissionSecretKey',
+            responses: {},
+            workflowStep: lastStepIndex,
+          } as MultirespondentSubmissionDto,
+          logMeta: {} as any,
+        })
+
+        expect(sendMrfWorkflowCompletionEmailSpy).toHaveBeenCalledTimes(1)
+        return sendMrfWorkflowCompletionEmailSpy.mock.calls[0][0].emails
+      }
+
+      it.each([
+        { stepCount: 2, stepNumbersToNotify: [2] },
+        { stepCount: 3, stepNumbersToNotify: [2, 3] },
+        { stepCount: 3, stepNumbersToNotify: [3] },
+        { stepCount: 4, stepNumbersToNotify: [2, 3, 4] },
+        { stepCount: 4, stepNumbersToNotify: [2, 4] },
+        { stepCount: 4, stepNumbersToNotify: [3] },
+      ])(
+        'sends the completion email to them on a $stepCount-step workflow notifying steps $stepNumbersToNotify',
+        async ({ stepCount, stepNumbersToNotify }) => {
+          const emails = await completeWorkflow({
+            workflow: buildWorkflow(stepCount),
+            stepNumbersToNotify,
+          })
+
+          expect(emails).toEqual([
+            ...stepNumbersToNotify.map((n) => `step${n}@example.com`),
+            ...stepNumbersToNotify.map((n) => `added${n}@example.com`),
+          ])
+        },
+      )
+
+      it('sends the completion email once to someone added who was already in the step', async () => {
+        const workflow = buildWorkflow(3)
+        const sendMrfWorkflowCompletionEmailSpy = jest.spyOn(
+          MailService,
+          'sendMrfWorkflowCompletionEmail',
+        )
+
+        await performMultiRespondentPostSubmissionUpdateActions({
+          submission: {
+            id: mockSubmissionId,
+            workflowEvents: [
+              {
+                type: WorkflowEventType.AssigneesAdded,
+                actorEmail: 'admin@example.com',
+                stepNumber: 3,
+                emails: ['Step3@example.com', 'added3@example.com'],
+                created: new Date(),
+              },
+            ],
+          } as unknown as IMultirespondentSubmissionSchema,
+          submissionId: mockSubmissionId,
+          snapshottedFormDef: {
+            _id: mockFormId,
+            workflow,
+            emails: [],
+            stepsToNotify: [workflow[2]._id],
+          } as unknown as SnapshottedFormDef,
+          currentStepNumber: 2,
+          encryptedPayload: {
+            encryptedContent: 'encryptedContent',
+            version: 1,
+            submissionPublicKey: 'submissionPublicKey',
+            encryptedSubmissionSecretKey: 'encryptedSubmissionSecretKey',
+            responses: {},
+            workflowStep: 2,
+          } as MultirespondentSubmissionDto,
+          logMeta: {} as any,
+        })
+
+        expect(
+          sendMrfWorkflowCompletionEmailSpy.mock.calls[0][0].emails,
+        ).toEqual(['step3@example.com', 'added3@example.com'])
+      })
+    })
+  })
+
+  describe('step one email notification field id', () => {
+    const mockFormId = new ObjectId().toHexString()
+
+    it('sends completion email to step one email notification field id, stepsToNotify and static emails when step one email notification field id is set', async () => {
+      // Arrange
+      const sendMrfWorkflowCompletionEmailSpy = jest.spyOn(
+        MailService,
+        'sendMrfWorkflowCompletionEmail',
+      )
+      const stepOneEmailNotificationFieldId = new ObjectId().toHexString()
+      const stepOneEditEmailFieldId = new ObjectId().toHexString()
+
+      const expectedStepOneEmail = 'expected_step_one_email@example.com'
+      const notExpectedStepOneEmail = 'not_expected_step_one_email@example.com'
+      const expectedStaticEmail = 'expected_static_email@example.com'
+      const expectedStepTwoEmail = 'expected_step_two_static_email@example.com'
+
+      const expectedEmails = [
+        expectedStepOneEmail,
+        expectedStaticEmail,
+        expectedStepTwoEmail,
+      ]
+
+      const stepOneId = new ObjectId().toHexString()
+      const stepTwoId = new ObjectId().toHexString()
+
+      const workflow: FormWorkflowStepDto[] = [
+        {
+          _id: stepOneId,
+          workflow_type: WorkflowType.Dynamic,
+          field: stepOneEditEmailFieldId,
+          edit: [stepOneEditEmailFieldId],
+        },
+        {
+          _id: stepTwoId,
+          workflow_type: WorkflowType.Static,
+          emails: [expectedStepTwoEmail],
+          edit: [],
+        },
+      ]
+
+      const snapshottedFormDef = {
+        _id: mockFormId,
+        workflow,
+        emails: [expectedStaticEmail],
+        stepsToNotify: [stepOneId, stepTwoId], // Including step one in stepsToNotify
+        stepOneEmailNotificationFieldId,
+      } as SnapshottedFormDef
+
+      const submissionResponses: FieldResponsesV3 = {
+        [stepOneEmailNotificationFieldId]: {
+          fieldType: BasicField.Email,
+          answer: {
+            value: expectedStepOneEmail,
+          },
+        },
+        [stepOneEditEmailFieldId]: {
+          fieldType: BasicField.Email,
+          answer: {
+            value: notExpectedStepOneEmail,
+          },
+        },
+      }
+
+      // Act
+      await performMultiRespondentPostSubmissionUpdateActions({
+        submission: {
+          id: mockSubmissionId,
+        } as unknown as IMultirespondentSubmissionSchema,
+        submissionId: mockSubmissionId,
+        snapshottedFormDef,
+        currentStepNumber: workflow.length - 1,
+        encryptedPayload: {
+          encryptedContent: 'encryptedContent',
+          version: 1,
+          submissionPublicKey: 'submissionPublicKey',
+          encryptedSubmissionSecretKey: 'encryptedSubmissionSecretKey',
+          responses: submissionResponses,
+          workflowStep: workflow.length - 1,
+        } as MultirespondentSubmissionDto,
+        logMeta: {} as any,
+      })
+
+      // Assert
+      expect(sendMrfWorkflowCompletionEmailSpy).toHaveBeenCalledTimes(1)
+      // pdf generation is invoked
+      expect(MockMailUtils.generateAutoreplyPdf).toHaveBeenCalledTimes(1)
+      // pdf attachment is included and submission attachments are correct
+      expect(
+        sendMrfWorkflowCompletionEmailSpy.mock.calls[0][0].attachments,
+      ).toEqual([EXPECTED_MOCK_PDF_ATTACHMENT])
+      expect(
+        sendMrfWorkflowCompletionEmailSpy.mock.calls[0][0].emails,
+      ).toContainValues(expectedEmails)
+      expect(
+        sendMrfWorkflowCompletionEmailSpy.mock.calls[0][0].emails.length,
+      ).toBe(expectedEmails.length)
+      expect(
+        sendMrfWorkflowCompletionEmailSpy.mock.calls[0][0].emails.includes(
+          notExpectedStepOneEmail,
+        ),
+      ).toBe(false)
+    })
+
+    it('does not send completion to step one email notification field id but still sends to stepsToNotify and static emails when step one email notification field id is not set', async () => {
+      // Arrange
+      const sendMrfWorkflowCompletionEmailSpy = jest.spyOn(
+        MailService,
+        'sendMrfWorkflowCompletionEmail',
+      )
+      const staticEmail = 'expected_static_email@example.com'
+      const stepTwoEmail = 'expected_step_two_static_email@example.com'
+      const expectedEmails = [staticEmail, stepTwoEmail]
+
+      const stepOneId = new ObjectId().toHexString()
+      const stepTwoId = new ObjectId().toHexString()
+
+      const workflow: FormWorkflowStepDto[] = [
+        {
+          _id: stepOneId,
+          workflow_type: WorkflowType.Static,
+          emails: [],
+          edit: [],
+        },
+        {
+          _id: stepTwoId,
+          workflow_type: WorkflowType.Static,
+          emails: [stepTwoEmail],
+          edit: [],
+        },
+      ]
+
+      const snapshottedFormDef = {
+        _id: mockFormId,
+        workflow,
+        emails: [staticEmail],
+        stepsToNotify: [stepTwoId],
+      } as SnapshottedFormDef
+
+      // Act
+      await performMultiRespondentPostSubmissionUpdateActions({
+        submission: {
+          id: mockSubmissionId,
+        } as unknown as IMultirespondentSubmissionSchema,
+        submissionId: mockSubmissionId,
+        snapshottedFormDef,
+        currentStepNumber: workflow.length - 1,
+        encryptedPayload: {
+          encryptedContent: 'encryptedContent',
+          version: 1,
+          submissionPublicKey: 'submissionPublicKey',
+          encryptedSubmissionSecretKey: 'encryptedSubmissionSecretKey',
+          workflowStep: workflow.length - 1,
+        } as MultirespondentSubmissionDto,
+        logMeta: {} as any,
+        attachments: MOCK_SUBMISSION_ATTACHMENTS,
+      })
+
+      // Assert
+      expect(sendMrfWorkflowCompletionEmailSpy).toHaveBeenCalledTimes(1)
+      // pdf generation is invoked
+      expect(MockMailUtils.generateAutoreplyPdf).toHaveBeenCalledTimes(1)
+      // pdf attachment is included and submission attachments are correct
+      expect(
+        sendMrfWorkflowCompletionEmailSpy.mock.calls[0][0].attachments,
+      ).toEqual([...MOCK_SUBMISSION_ATTACHMENTS, EXPECTED_MOCK_PDF_ATTACHMENT])
+      expect(
+        sendMrfWorkflowCompletionEmailSpy.mock.calls[0][0].emails,
+      ).toContainValues(expectedEmails)
+      expect(
+        sendMrfWorkflowCompletionEmailSpy.mock.calls[0][0].emails.length,
+      ).toBe(expectedEmails.length)
+    })
+
+    it('does not send completion email to step one email notification field id but still sends to stepsToNotify and static emails when it is deleted', async () => {
+      // Arrange
+      const sendMrfWorkflowCompletionEmailSpy = jest.spyOn(
+        MailService,
+        'sendMrfWorkflowCompletionEmail',
+      )
+      const stepOneEmailNotificationFieldId = new ObjectId().toHexString()
+      const staticEmail = 'expected_static_email@example.com'
+      const stepTwoEmail = 'expected_step_two_static_email@example.com'
+
+      const stepOneId = new ObjectId().toHexString()
+      const stepTwoId = new ObjectId().toHexString()
+      const expectedEmails = [staticEmail, stepTwoEmail]
+
+      const workflow: FormWorkflowStepDto[] = [
+        {
+          _id: stepOneId,
+          workflow_type: WorkflowType.Static,
+          emails: [],
+          edit: [],
+        },
+        {
+          _id: stepTwoId,
+          workflow_type: WorkflowType.Static,
+          emails: [stepTwoEmail],
+          edit: [],
+        },
+      ]
+
+      const snapshottedFormDef = {
+        _id: mockFormId,
+        workflow,
+        emails: [staticEmail],
+        stepsToNotify: [stepTwoId],
+        stepOneEmailNotificationFieldId,
+      } as SnapshottedFormDef
+
+      const submissionResponses: FieldResponsesV3 = {
+        // stepOneEmailNotificationFieldId is not present in responses
+      }
+
+      // Act
+      await performMultiRespondentPostSubmissionUpdateActions({
+        submission: {
+          id: mockSubmissionId,
+        } as unknown as IMultirespondentSubmissionSchema,
+        submissionId: mockSubmissionId,
+        snapshottedFormDef,
+        currentStepNumber: workflow.length - 1,
+        encryptedPayload: {
+          encryptedContent: 'encryptedContent',
+          version: 1,
+          submissionPublicKey: 'submissionPublicKey',
+          encryptedSubmissionSecretKey: 'encryptedSubmissionSecretKey',
+          responses: submissionResponses,
+          workflowStep: workflow.length - 1,
+        } as MultirespondentSubmissionDto,
+        logMeta: {} as any,
+      })
+
+      // Assert
+      expect(sendMrfWorkflowCompletionEmailSpy).toHaveBeenCalledTimes(1)
+      // pdf generation is invoked
+      expect(MockMailUtils.generateAutoreplyPdf).toHaveBeenCalledTimes(1)
+      // pdf attachment is included and submission attachments are correct
+      expect(
+        sendMrfWorkflowCompletionEmailSpy.mock.calls[0][0].attachments,
+      ).toEqual([EXPECTED_MOCK_PDF_ATTACHMENT])
+      expect(
+        sendMrfWorkflowCompletionEmailSpy.mock.calls[0][0].emails,
+      ).toContainValues(expectedEmails)
+      expect(
+        sendMrfWorkflowCompletionEmailSpy.mock.calls[0][0].emails.length,
+      ).toBe(expectedEmails.length)
+    })
+
+    it('does not send duplicate completion email to step one in stepsToNotify', async () => {
+      // Arrange
+      const sendMrfWorkflowCompletionEmailSpy = jest.spyOn(
+        MailService,
+        'sendMrfWorkflowCompletionEmail',
+      )
+      const stepOneEmailNotificationFieldId = new ObjectId().toHexString()
+      const emailFieldId2 = new ObjectId().toHexString()
+
+      const expectedStepOneEmail = 'expected_step_one_email@example.com'
+      const notExpectedStepOneEmail = 'not_expected_step_one_email@example.com'
+      const expectedStaticEmail = 'expected_static_email@example.com'
+      const expectedStepTwoEmail = 'expected_step_two_static_email@example.com'
+
+      const expectedEmails = [
+        expectedStepOneEmail,
+        expectedStaticEmail,
+        expectedStepTwoEmail,
+      ]
+
+      const stepOneId = new ObjectId().toHexString()
+      const stepTwoId = new ObjectId().toHexString()
+
+      const workflow: FormWorkflowStepDto[] = [
+        {
+          _id: stepOneId,
+          workflow_type: WorkflowType.Dynamic,
+          field: emailFieldId2,
+          edit: [emailFieldId2],
+        },
+        {
+          _id: stepTwoId,
+          workflow_type: WorkflowType.Static,
+          emails: [expectedStepTwoEmail],
+          edit: [],
+        },
+      ]
+
+      const snapshottedFormDef = {
+        _id: mockFormId,
+        workflow,
+        emails: [expectedStaticEmail],
+        stepsToNotify: [stepOneId, stepTwoId], // Including step one in stepsToNotify
+        stepOneEmailNotificationFieldId,
+      } as SnapshottedFormDef
+
+      const submissionResponses: FieldResponsesV3 = {
+        [stepOneEmailNotificationFieldId]: {
+          fieldType: BasicField.Email,
+          answer: {
+            value: expectedStepOneEmail,
+          },
+        },
+        [emailFieldId2]: {
+          fieldType: BasicField.Email,
+          answer: {
+            value: notExpectedStepOneEmail,
+          },
+        },
+      }
+
+      // Act
+      await performMultiRespondentPostSubmissionUpdateActions({
+        submission: {
+          id: mockSubmissionId,
+        } as unknown as IMultirespondentSubmissionSchema,
+        submissionId: mockSubmissionId,
+        snapshottedFormDef,
+        currentStepNumber: workflow.length - 1,
+        encryptedPayload: {
+          encryptedContent: 'encryptedContent',
+          version: 1,
+          submissionPublicKey: 'submissionPublicKey',
+          encryptedSubmissionSecretKey: 'encryptedSubmissionSecretKey',
+          responses: submissionResponses,
+          workflowStep: workflow.length - 1,
+        } as MultirespondentSubmissionDto,
+        logMeta: {} as any,
+      })
+
+      // Assert
+      expect(sendMrfWorkflowCompletionEmailSpy).toHaveBeenCalledTimes(1)
+      // pdf generation is invoked
+      expect(MockMailUtils.generateAutoreplyPdf).toHaveBeenCalledTimes(1)
+      // pdf attachment is included and submission attachments are correct
+      expect(
+        sendMrfWorkflowCompletionEmailSpy.mock.calls[0][0].attachments,
+      ).toEqual([EXPECTED_MOCK_PDF_ATTACHMENT])
+      // the correct destination emails are included
+      expect(
+        sendMrfWorkflowCompletionEmailSpy.mock.calls[0][0].emails,
+      ).toContainValues(expectedEmails)
+      expect(
+        sendMrfWorkflowCompletionEmailSpy.mock.calls[0][0].emails.length,
+      ).toBe(expectedEmails.length)
+      expect(
+        sendMrfWorkflowCompletionEmailSpy.mock.calls[0][0].emails.includes(
+          notExpectedStepOneEmail,
+        ),
+      ).toBe(false)
+    })
+  })
+
+  describe('sendNextStepReminderEmail', () => {
+    it('invokes the sendMRFWorkflowStepEmail function with isReminder set to true and correct recipient emails', async () => {
+      // Arrange
+      const mockEmails = ['test@example.com', 'test2@example.com']
+      const sendMRFWorkflowStepEmailSpy = jest
+        .spyOn(MailService, 'sendMRFWorkflowStepEmail')
+        .mockReturnValue(okAsync(true))
+
+      // Act
+      await sendNextStepReminderEmail({
+        submissionId: 'submissionId',
+        emails: mockEmails,
+        formTitle: 'Test Form',
+        responseUrl: 'http://test.com',
+        formId: 'formId',
+        reminderStepNumber: 1,
+        senderEmail: 'senderEmail@example.com',
+      })
+
+      // Assert
+      expect(sendMRFWorkflowStepEmailSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          emails: mockEmails,
+          isReminder: true,
+        }),
+      )
+    })
+  })
+
+  describe('getPendingStepRecipientEmailsFromSubmittedStepsMeta', () => {
+    it('gets correct recipient emails for 2nd step of 5-step mrf submission', async () => {
+      // Arrange
+      const mockEmails = ['test@example.com']
+      const mockSubmission = {
+        workflow: [{}, {}, {}, {}, {}],
+        submittedSteps: [
+          {
+            nextStepRecipientEmails: mockEmails,
+          },
+        ],
+      } as unknown as IMultirespondentSubmissionSchema
+
+      jest
+        .spyOn(MultirespondentSubmissionService, 'getMultirespondentSubmission')
+        .mockReturnValue(okAsync(mockSubmission))
+
+      // Act
+      const result = await getPendingStepRecipientEmailsFromSubmittedStepsMeta({
+        submissionId: 'submissionId',
+      })
+
+      // Assert
+      expect(result.isOk()).toBe(true)
+      expect(result._unsafeUnwrap().recipientEmails).toEqual(mockEmails)
+      expect(result._unsafeUnwrap().reminderStepNumber).toBe(2)
+    })
+
+    it('gets correct recipient email for 3rd step of 4-step mrf submission', async () => {
+      // Arrange
+      const mockEmails = ['test@example.com', 'test2@example.com']
+      const mockSubmission = {
+        workflow: [{}, {}, {}, {}],
+        submittedSteps: [
+          { nextStepRecipientEmails: ['old@example.com'] },
+          {
+            nextStepRecipientEmails: mockEmails,
+            isApproval: true,
+            status: WorkflowStatus.APPROVED,
+          },
+        ],
+      } as unknown as IMultirespondentSubmissionSchema
+
+      jest
+        .spyOn(MultirespondentSubmissionService, 'getMultirespondentSubmission')
+        .mockReturnValue(okAsync(mockSubmission))
+
+      // Act
+      const result = await getPendingStepRecipientEmailsFromSubmittedStepsMeta({
+        submissionId: 'submissionId',
+      })
+
+      // Assert
+      expect(result.isOk()).toBe(true)
+      expect(result._unsafeUnwrap().recipientEmails).toEqual(mockEmails)
+      expect(result._unsafeUnwrap().reminderStepNumber).toBe(3)
+    })
+
+    it('gets correct recipient email for last step of 2-step mrf submission', async () => {
+      // Arrange
+      const mockEmails = ['test@example.com']
+      const mockSubmission = {
+        workflow: [{}, {}],
+        submittedSteps: [
+          {
+            nextStepRecipientEmails: mockEmails,
+          },
+        ],
+      } as unknown as IMultirespondentSubmissionSchema
+
+      jest
+        .spyOn(MultirespondentSubmissionService, 'getMultirespondentSubmission')
+        .mockReturnValue(okAsync(mockSubmission))
+
+      // Act
+      const result = await getPendingStepRecipientEmailsFromSubmittedStepsMeta({
+        submissionId: 'submissionId',
+      })
+
+      // Assert
+      expect(result.isOk()).toBe(true)
+      expect(result._unsafeUnwrap().recipientEmails).toEqual(mockEmails)
+      expect(result._unsafeUnwrap().reminderStepNumber).toBe(2)
+    })
+
+    it('gets correct recipient email for last step of 4-step mrf submission', async () => {
+      // Arrange
+      const mockEmails = ['test@example.com']
+      const mockSubmission = {
+        workflow: [{}, {}, {}, {}],
+        submittedSteps: [
+          { nextStepRecipientEmails: ['old1@example.com'] },
+          { nextStepRecipientEmails: ['old2@example.com'] },
+          { nextStepRecipientEmails: mockEmails },
+        ],
+      } as unknown as IMultirespondentSubmissionSchema
+
+      jest
+        .spyOn(MultirespondentSubmissionService, 'getMultirespondentSubmission')
+        .mockReturnValue(okAsync(mockSubmission))
+
+      // Act
+      const result = await getPendingStepRecipientEmailsFromSubmittedStepsMeta({
+        submissionId: 'submissionId',
+      })
+
+      // Assert
+      expect(result.isOk()).toBe(true)
+      expect(result._unsafeUnwrap().recipientEmails).toEqual(mockEmails)
+      expect(result._unsafeUnwrap().reminderStepNumber).toBe(4)
+    })
+
+    it('throws pending step not found error for 2nd step where it is rejected ie, completed workflow', async () => {
+      // Arrange
+      const mockSubmission = {
+        workflow: [{}, {}, {}],
+        submittedSteps: [
+          { nextStepRecipientEmails: ['old1@example.com'] },
+          {
+            status: WorkflowStatus.REJECTED,
+            isApproval: true,
+          },
+        ],
+      } as unknown as IMultirespondentSubmissionSchema
+
+      jest
+        .spyOn(MultirespondentSubmissionService, 'getMultirespondentSubmission')
+        .mockReturnValue(okAsync(mockSubmission))
+
+      // Act
+      const result = await getPendingStepRecipientEmailsFromSubmittedStepsMeta({
+        submissionId: 'submissionId',
+      })
+
+      // Assert
+      expect(result.isErr()).toBe(true)
+      expect(result._unsafeUnwrapErr()).toBeInstanceOf(
+        MrfReminderInvalidWorkflowStepError,
+      )
+    })
+
+    it('throws pending step not found for all steps submitted ie, commpleted workflow', async () => {
+      // Arrange
+      const mockSubmission = {
+        workflow: [{}, {}],
+        submittedSteps: [
+          { nextStepRecipientEmails: ['old1@example.com'] },
+          { nextStepRecipientEmails: ['old2@example.com'] },
+        ],
+      } as unknown as IMultirespondentSubmissionSchema
+
+      jest
+        .spyOn(MultirespondentSubmissionService, 'getMultirespondentSubmission')
+        .mockReturnValue(okAsync(mockSubmission))
+
+      // Act
+      const result = await getPendingStepRecipientEmailsFromSubmittedStepsMeta({
+        submissionId: 'submissionId',
+      })
+
+      // Assert
+      expect(result.isErr()).toBe(true)
+      expect(result._unsafeUnwrapErr()).toBeInstanceOf(
+        MrfReminderInvalidWorkflowStepError,
+      )
+    })
+
+    it('throws recipient email not found for valid pending step ie 3rd step of 4-step mrf submission but recipient emails is not found in pending step metadata', async () => {
+      // Arrange
+      const mockSubmission = {
+        workflow: [{}, {}, {}, {}],
+        submittedSteps: [{ nextStepRecipientEmails: ['old@example.com'] }, {}],
+      } as unknown as IMultirespondentSubmissionSchema
+
+      jest
+        .spyOn(MultirespondentSubmissionService, 'getMultirespondentSubmission')
+        .mockReturnValue(okAsync(mockSubmission))
+
+      // Act
+      const result = await getPendingStepRecipientEmailsFromSubmittedStepsMeta({
+        submissionId: 'submissionId',
+      })
+
+      // Assert
+      expect(result.isErr()).toBe(true)
+      expect(result._unsafeUnwrapErr()).toBeInstanceOf(
+        MrfReminderRecipientEmailsEmptyError,
+      )
+    })
+  })
+
+  describe('step-token lifecycle', () => {
+    const fieldId = new ObjectId().toHexString()
+    const stepId0 = new ObjectId().toHexString()
+    const stepId1 = new ObjectId().toHexString()
+
+    const twoStepWorkflow: FormWorkflowStepDto[] = [
+      {
+        _id: stepId0,
+        workflow_type: WorkflowType.Static,
+        emails: [],
+        edit: [fieldId],
+      },
+      {
+        _id: stepId1,
+        workflow_type: WorkflowType.Static,
+        emails: ['next@example.com'],
+        edit: [fieldId],
+      },
+    ]
+
+    const buildForm = (): IPopulatedMultirespondentForm =>
+      ({
+        _id: mockFormId,
+        authType: FormAuthType.NIL,
+        responseMode: FormResponseMode.Multirespondent,
+        title: 'Test form',
+        form_fields: [
+          { _id: fieldId, fieldType: BasicField.ShortText, title: 'Q1' },
+        ],
+        form_logics: [],
+        workflow: twoStepWorkflow,
+        isSingleSubmission: false,
+        getUniqueMyInfoAttrs: jest.fn().mockReturnValue([]),
+      }) as unknown as IPopulatedMultirespondentForm
+
+    const buildSnapshottedFormDef = (): SnapshottedFormDef =>
+      ({
+        _id: mockFormId,
+        title: 'Test form',
+        form_fields: [
+          { _id: fieldId, fieldType: BasicField.ShortText, title: 'Q1' },
+        ],
+        form_logics: [],
+        workflow: twoStepWorkflow,
+      }) as unknown as SnapshottedFormDef
+
+    const buildPayload = (
+      overrides: Partial<MultirespondentSubmissionDto> = {},
+    ): MultirespondentSubmissionDto => ({
+      submissionPublicKey: 'submission-public-key',
+      encryptedSubmissionSecretKey: 'encrypted-submission-secret-key',
+      encryptedContent: 'encrypted-content',
+      submissionSecretKey: 'submission-secret-key',
+      version: 2,
+      workflowStep: 0,
+      responses: {
+        [fieldId]: { fieldType: BasicField.ShortText, answer: 'answer' },
+      },
+      mrfVersion: 1,
+      ...overrides,
+    })
+
+    it('persists stepTokenHash and encryptedStepToken on create', async () => {
+      const raw = stepToken.generate()
+      const result = await createMultiRespondentFormSubmission({
+        form: buildForm(),
+        encryptedPayload: buildPayload({
+          stepToken: raw,
+          stepTokenHash: stepToken.hash(raw),
+          encryptedStepToken: 'wrapped-token-A',
+        }),
+        logMeta: { action: 'test' },
+      })
+
+      expect(result.isOk()).toBe(true)
+      const saved = await getMultirespondentSubmissionModel(mongoose).findById(
+        result._unsafeUnwrap().submission._id,
+      )
+      expect(saved?.stepTokenHash).toBe(stepToken.hash(raw))
+      expect(saved?.encryptedStepToken).toBe('wrapped-token-A')
+    })
+
+    it('clears token fields on update when the next step does not generate one', async () => {
+      const Model = getMultirespondentSubmissionModel(mongoose)
+      // Row already carries the previous step's token (minted under flag ON).
+      const prevRaw = stepToken.generate()
+      const row = await Model.create({
+        form: mockFormId,
+        submissionType: SubmissionType.Multirespondent,
+        form_fields: [],
+        form_logics: [],
+        workflow: twoStepWorkflow,
+        submissionPublicKey: 'pk',
+        encryptedSubmissionSecretKey: 'esk',
+        encryptedContent: 'ec',
+        version: 2,
+        workflowStep: 0,
+        submittedSteps: [
+          { isApproval: false, submittedAt: new Date().toISOString() },
+        ],
+        stepTokenHash: stepToken.hash(prevRaw),
+        encryptedStepToken: 'wrapped-token-prev',
+      })
+      expect(row.stepTokenHash).toBe(stepToken.hash(prevRaw))
+      expect(row.encryptedStepToken).toBe('wrapped-token-prev')
+
+      // Flag OFF advance: middleware omits both token fields from the payload.
+      const result = await updateMultiRespondentFormSubmission({
+        submissionId: row._id.toString(),
+        snapshottedFormDef: buildSnapshottedFormDef(),
+        encryptedPayload: buildPayload({ workflowStep: 1 }),
+        logMeta: { action: 'test' },
+      })
+
+      expect(result.isOk()).toBe(true)
+      const saved = await Model.findById(row._id).lean()
+      expect(saved?.stepTokenHash).toBeUndefined()
+      expect(saved?.encryptedStepToken).toBeUndefined()
+      expect('stepTokenHash' in (saved as object)).toBe(false)
+      expect('encryptedStepToken' in (saved as object)).toBe(false)
+    })
+
+    it('rejects a step on a stopped workflow without appending it', async () => {
+      const Model = getMultirespondentSubmissionModel(mongoose)
+      const row = await Model.create({
+        form: mockFormId,
+        submissionType: SubmissionType.Multirespondent,
+        form_fields: [],
+        form_logics: [],
+        workflow: twoStepWorkflow,
+        submissionPublicKey: 'pk',
+        encryptedSubmissionSecretKey: 'esk',
+        encryptedContent: 'ec',
+        version: 2,
+        workflowStep: 0,
+        submittedSteps: [
+          { isApproval: false, submittedAt: new Date().toISOString() },
+        ],
+        stoppedAt: new Date(),
+      })
+
+      const result = await updateMultiRespondentFormSubmission({
+        submissionId: row._id.toString(),
+        snapshottedFormDef: buildSnapshottedFormDef(),
+        encryptedPayload: buildPayload({ workflowStep: 1 }),
+        logMeta: { action: 'test' },
+      })
+
+      expect(result._unsafeUnwrapErr()).toBeInstanceOf(MrfWorkflowStoppedError)
+      const saved = await Model.findById(row._id).lean()
+      expect(saved?.submittedSteps).toHaveLength(1)
+    })
+
+    it('rotates the token on advance, upgrading a legacy row that carried no hash (migration)', async () => {
+      const Model = getMultirespondentSubmissionModel(mongoose)
+      // Legacy in-flight row: no stepTokenHash / encryptedStepToken.
+      const legacy = await Model.create({
+        form: mockFormId,
+        submissionType: SubmissionType.Multirespondent,
+        form_fields: [],
+        form_logics: [],
+        workflow: twoStepWorkflow,
+        submissionPublicKey: 'pk',
+        encryptedSubmissionSecretKey: 'esk',
+        encryptedContent: 'ec',
+        version: 2,
+        workflowStep: 0,
+        submittedSteps: [
+          { isApproval: false, submittedAt: new Date().toISOString() },
+        ],
+      })
+      expect(legacy.stepTokenHash).toBeUndefined()
+
+      const nextRaw = stepToken.generate()
+      const result = await updateMultiRespondentFormSubmission({
+        submissionId: legacy._id.toString(),
+        snapshottedFormDef: buildSnapshottedFormDef(),
+        encryptedPayload: buildPayload({
+          workflowStep: 1,
+          stepToken: nextRaw,
+          stepTokenHash: stepToken.hash(nextRaw),
+          encryptedStepToken: 'wrapped-token-B',
+        }),
+        logMeta: { action: 'test' },
+      })
+
+      expect(result.isOk()).toBe(true)
+      const saved = await Model.findById(legacy._id)
+      expect(saved?.stepTokenHash).toBe(stepToken.hash(nextRaw))
+      expect(saved?.encryptedStepToken).toBe('wrapped-token-B')
+      // The freshly minted token verifies against the rotated hash (loop-back:
+      // a stale/previous token would not).
+      expect(stepToken.verify(nextRaw, saved?.stepTokenHash as string)).toBe(
+        true,
+      )
+      expect(
+        stepToken.verify(stepToken.generate(), saved?.stepTokenHash as string),
+      ).toBe(false)
+    })
+
+    it('rotates both token fields on a flag-on advance from a row that already carried a token (D1)', async () => {
+      const Model = getMultirespondentSubmissionModel(mongoose)
+      const prevRaw = stepToken.generate()
+      const row = await Model.create({
+        form: mockFormId,
+        submissionType: SubmissionType.Multirespondent,
+        form_fields: [],
+        form_logics: [],
+        workflow: twoStepWorkflow,
+        submissionPublicKey: 'pk',
+        encryptedSubmissionSecretKey: 'esk',
+        encryptedContent: 'ec',
+        version: 2,
+        workflowStep: 0,
+        submittedSteps: [
+          { isApproval: false, submittedAt: new Date().toISOString() },
+        ],
+        stepTokenHash: stepToken.hash(prevRaw),
+        encryptedStepToken: 'wrapped-token-prev',
+      })
+
+      const nextRaw = stepToken.generate()
+      const result = await updateMultiRespondentFormSubmission({
+        submissionId: row._id.toString(),
+        snapshottedFormDef: buildSnapshottedFormDef(),
+        encryptedPayload: buildPayload({
+          workflowStep: 1,
+          stepToken: nextRaw,
+          stepTokenHash: stepToken.hash(nextRaw),
+          encryptedStepToken: 'wrapped-token-next',
+        }),
+        logMeta: { action: 'test' },
+      })
+
+      expect(result.isOk()).toBe(true)
+      const saved = await Model.findById(row._id)
+      expect(saved?.stepTokenHash).toBe(stepToken.hash(nextRaw))
+      expect(saved?.encryptedStepToken).toBe('wrapped-token-next')
+      // New token verifies; the previous step's token must not.
+      expect(stepToken.verify(nextRaw, saved?.stepTokenHash as string)).toBe(
+        true,
+      )
+      expect(stepToken.verify(prevRaw, saved?.stepTokenHash as string)).toBe(
+        false,
+      )
+    })
+
+    it('leaves a legacy no-hash row absent after a flag-off advance (no stale key introduced) (D1)', async () => {
+      const Model = getMultirespondentSubmissionModel(mongoose)
+      // Legacy in-flight row: no token fields at all.
+      const legacy = await Model.create({
+        form: mockFormId,
+        submissionType: SubmissionType.Multirespondent,
+        form_fields: [],
+        form_logics: [],
+        workflow: twoStepWorkflow,
+        submissionPublicKey: 'pk',
+        encryptedSubmissionSecretKey: 'esk',
+        encryptedContent: 'ec',
+        version: 2,
+        workflowStep: 0,
+        submittedSteps: [
+          { isApproval: false, submittedAt: new Date().toISOString() },
+        ],
+      })
+
+      const result = await updateMultiRespondentFormSubmission({
+        submissionId: legacy._id.toString(),
+        snapshottedFormDef: buildSnapshottedFormDef(),
+        encryptedPayload: buildPayload({ workflowStep: 1 }),
+        logMeta: { action: 'test' },
+      })
+
+      expect(result.isOk()).toBe(true)
+      const saved = await Model.findById(legacy._id).lean()
+      expect(saved?.stepTokenHash).toBeUndefined()
+      expect(saved?.encryptedStepToken).toBeUndefined()
+      expect('stepTokenHash' in (saved as object)).toBe(false)
+      expect('encryptedStepToken' in (saved as object)).toBe(false)
+    })
+
+    it('surfaces a lost concurrent-write race as a 409 conflict, not a 500', async () => {
+      const Model = getMultirespondentSubmissionModel(mongoose)
+      const doc = await Model.create({
+        form: mockFormId,
+        submissionType: SubmissionType.Multirespondent,
+        form_fields: [],
+        form_logics: [],
+        workflow: twoStepWorkflow,
+        submissionPublicKey: 'pk',
+        encryptedSubmissionSecretKey: 'esk',
+        encryptedContent: 'ec',
+        version: 2,
+        workflowStep: 0,
+        submittedSteps: [
+          { isApproval: false, submittedAt: new Date().toISOString() },
+        ],
+      })
+
+      // Simulate the optimistic-concurrency loser: the save rejects with a
+      // Mongoose VersionError (__v mismatch on the submittedSteps array).
+      const versionError = new mongoose.Error.VersionError(
+        doc as any,
+        (doc as any).__v,
+        ['submittedSteps'],
+      )
+      const saveSpy = jest
+        .spyOn(Model.prototype, 'save')
+        .mockRejectedValueOnce(versionError)
+
+      const result = await updateMultiRespondentFormSubmission({
+        submissionId: doc._id.toString(),
+        snapshottedFormDef: buildSnapshottedFormDef(),
+        encryptedPayload: buildPayload({ workflowStep: 1 }),
+        logMeta: { action: 'test' },
+      })
+
+      expect(result.isErr()).toBe(true)
+      const error = result._unsafeUnwrapErr()
+      expect(error).toBeInstanceOf(DatabaseConflictError)
+      // Non-retryable 409, not a 5xx default.
+      expect(mapRouteError(error).statusCode).toBe(409)
+
+      saveSpy.mockRestore()
+    })
+
+    it('threads the raw step token into the next respondent magic link on create', async () => {
+      const raw = stepToken.generate()
+      const sendSpy = jest
+        .spyOn(MailService, 'sendMRFWorkflowStepEmail')
+        .mockReturnValue(okAsync(true))
+
+      await performMultiRespondentPostSubmissionCreateActions({
+        submission: {
+          id: mockSubmissionId,
+          submittedSteps: [
+            { isApproval: false, submittedAt: new Date().toISOString() },
+          ],
+        } as unknown as IMultirespondentSubmissionSchema,
+        submissionId: mockSubmissionId,
+        form: buildForm(),
+        encryptedPayload: buildPayload({ stepToken: raw }),
+        logMeta: { action: 'test' } as any,
+      })
+
+      expect(sendSpy).toHaveBeenCalled()
+      expect(sendSpy.mock.calls[0][0].responseUrl).toContain(
+        `&token=${encodeURIComponent(raw)}`,
+      )
+    })
+  })
+
+  describe('S4 MRF v4 webhook snapshot integration', () => {
+    const { publicKey: formPublicKey } = formsgSdk.crypto.generate()
+    const PLUMBER_URL = 'https://plumber.gov.sg/webhooks/x'
+    const GENERIC_URL = 'https://example.com/hook'
+    const ZAPIER_URL = 'https://hooks.zapier.com/hooks/catch/1/x'
+    const fieldId = new ObjectId().toHexString()
+    const stepId0 = new ObjectId().toHexString()
+    const stepId1 = new ObjectId().toHexString()
+
+    const twoStepWorkflow: FormWorkflowStepDto[] = [
+      {
+        _id: stepId0,
+        workflow_type: WorkflowType.Static,
+        emails: [],
+        edit: [fieldId],
+      },
+      {
+        _id: stepId1,
+        workflow_type: WorkflowType.Static,
+        emails: ['next@example.com'],
+
+        edit: [fieldId],
+      },
+    ]
+
+    const oneStepWorkflow: FormWorkflowStepDto[] = [twoStepWorkflow[0]]
+
+    const genericV4Webhook = (url: string = GENERIC_URL) => {
+      return { url, isRetryEnabled: true, webhookFormat: 'v4' } as any
+    }
+
+    const genericWebhook = ({
+      url = GENERIC_URL,
+      webhookFormat,
+    }: {
+      url?: string
+      webhookFormat?: FormWebhook['webhookFormat']
+    }) => {
+      return { url, isRetryEnabled: true, webhookFormat } as any
+    }
+
+    const flushPromises = () => new Promise((resolve) => setImmediate(resolve))
+
+    const growthbookWithFlags = ({
+      enableMrfWebhooks = false,
+    }: {
+      enableMrfWebhooks?: boolean
+    }) =>
+      ({
+        isOn: jest.fn(
+          (flag: string) =>
+            flag === featureFlags.enableMrfWebhooks && enableMrfWebhooks,
+        ),
+        getFeatureValue: jest.fn((_flag: string, def: unknown) => def),
+      }) as any
+
+    const buildV4Form = (
+      overrides: Partial<IPopulatedMultirespondentForm> = {},
+    ): IPopulatedMultirespondentForm =>
+      ({
+        _id: mockFormId,
+        authType: FormAuthType.NIL,
+        responseMode: FormResponseMode.Multirespondent,
+        title: 'Test form',
+        publicKey: formPublicKey,
+        form_fields: [
+          { _id: fieldId, fieldType: BasicField.ShortText, title: 'Q1' },
+        ],
+        form_logics: [],
+        workflow: twoStepWorkflow,
+        isSingleSubmission: false,
+        webhook: { url: PLUMBER_URL, isRetryEnabled: true },
+        getUniqueMyInfoAttrs: jest.fn().mockReturnValue([]),
+        ...overrides,
+      }) as unknown as IPopulatedMultirespondentForm
+
+    const buildSnapshottedFormDef = (
+      overrides: Partial<SnapshottedFormDef> = {},
+    ): SnapshottedFormDef =>
+      ({
+        _id: mockFormId,
+        title: 'Test form',
+        form_fields: [
+          { _id: fieldId, fieldType: BasicField.ShortText, title: 'Q1' },
+        ],
+        form_logics: [],
+        workflow: twoStepWorkflow,
+        webhook: { url: PLUMBER_URL, isRetryEnabled: true },
+        ...overrides,
+      }) as unknown as SnapshottedFormDef
+
+    const buildV4Payload = (
+      overrides: Partial<MultirespondentSubmissionDto> = {},
+    ): MultirespondentSubmissionDto => ({
+      submissionPublicKey: 'submission-public-key',
+      encryptedSubmissionSecretKey: 'wrapped-read-key-v4',
+      encryptedContent: 'v4-encrypted-content',
+      verifiedContent: 'v4-verified-content',
+      submissionSecretKey: 'submission-secret-key',
+      version: 2,
+      workflowStep: 0,
+      responses: {
+        [fieldId]: {
+          fieldType: BasicField.ShortText,
+          answer: { value: 'answer' },
+          question: 'Q1',
+          provenance: {},
+        },
+      },
+      mrfVersion: 2,
+      ...overrides,
+    })
+
+    const buildSnapshot = (overrides: Record<string, unknown> = {}) =>
+      ({
+        _v: 1,
+        contentFormat: 'v4',
+        formId: mockFormId,
+        submissionId: 'snap-submission-id',
+        submissionIndex: 0,
+        workflowStep: 0,
+        encryptedContent: 'frozen-content',
+        encryptedSubmissionSecretKey: 'frozen-read-key',
+        verifiedContent: 'frozen-verified',
+        createdAt: new Date().toISOString(),
+        ...overrides,
+      }) as any
+
+    const buildLiveWebhookView = (): WebhookView =>
+      ({
+        data: {
+          formId: mockFormId,
+          submissionId: 'live-submission-id',
+          encryptedContent: 'live-content',
+          encryptedSubmissionSecretKey: 'live-read-key',
+          verifiedContent: 'live-verified',
+          version: 2,
+          created: new Date(),
+          attachmentDownloadUrls: {},
+          paymentContent: {},
+          workflowContent: {
+            workflow: twoStepWorkflow,
+            workflowStep: 0,
+            submittedSteps: [
+              { isApproval: false, submittedAt: new Date().toISOString() },
+            ],
+          },
+        },
+      }) as unknown as WebhookView
+
+    const buildSubmissionWithToken = (
+      token: string | undefined,
+      view: WebhookView = buildLiveWebhookView(),
+      mrfVersion = 2,
+      workflow: FormWorkflowStepDto[] = twoStepWorkflow,
+    ): IMultirespondentSubmissionSchema =>
+      ({
+        _id: new ObjectId(),
+        mrfVersion,
+        workflow,
+        submittedSteps: [
+          {
+            isApproval: false,
+            submittedAt: new Date().toISOString(),
+            snapshotTokens: token ? { v4: token } : undefined,
+          },
+        ],
+        getWebhookView: jest.fn().mockResolvedValue(view),
+      }) as unknown as IMultirespondentSubmissionSchema
+
+    beforeEach(() => {
+      MockSnapshotStore.writeSnapshot.mockReturnValue(
+        okAsync({ token: 'default-token', key: 'default-key' }),
+      )
+      MockSnapshotStore.readSnapshot.mockReturnValue(okAsync(buildSnapshot()))
+      jest
+        .spyOn(webhookStatsdClient, 'increment')
+        .mockImplementation(() => undefined as any)
+      jest
+        .spyOn(WebhookFactory, 'sendInitialWebhook')
+        .mockReturnValue(okAsync(true))
+    })
+
+    // ---- Committed-step-has-a-readable-snapshot (write side) ----
+
+    it.each([
+      { scenario: 'editable MyInfo', readOnly: false, expectedQuestion: 'Q1' },
+      {
+        scenario: 'verified read-only MyInfo',
+        readOnly: true,
+        expectedQuestion: 'Q1',
+      },
+    ])(
+      'creates a first-step snapshot with $scenario labels and saves its retry token',
+      async ({ readOnly, expectedQuestion }) => {
+        // Prepare: verification for the first step is supplied by the validated submission payload.
+        MockSnapshotStore.writeSnapshot.mockReturnValue(
+          okAsync({ token: 'tok-create', key: 'key-create' }),
+        )
+
+        const form = buildV4Form()
+        Object.assign(form.form_fields[0], {
+          myInfo: { attr: MyInfoAttribute.Name },
+        })
+        // Act
+        const result = await createMultiRespondentFormSubmission({
+          form,
+          encryptedPayload: buildV4Payload({
+            myInfoReadOnlyFields: readOnly ? [fieldId] : [],
+          }),
+          logMeta: { action: 'test' },
+        })
+
+        // Assert: the frozen payload and persisted token describe the same committed step.
+        expect(result.isOk()).toBe(true)
+        expect(MockSnapshotStore.writeSnapshot).toHaveBeenCalledTimes(1)
+        const snapshot = MockSnapshotStore.writeSnapshot.mock.calls[0][0]
+        expect(snapshot.submissionIndex).toBe(0)
+        expect(snapshot.workflowStep).toBe(0)
+        expect(snapshot.encryptedContent).toBe('v4-encrypted-content')
+        expect(snapshot.encryptedSubmissionSecretKey).toBe(
+          'wrapped-read-key-v4',
+        )
+        expect(snapshot.formFields).toEqual({
+          [fieldId]: { question: expectedQuestion },
+        })
+
+        const saved = await getMultirespondentSubmissionModel(
+          mongoose,
+        ).findById(result._unsafeUnwrap().submission._id)
+        expect(saved?.submittedSteps?.[0]?.snapshotTokens?.v4).toBe(
+          'tok-create',
+        )
+      },
+    )
+
+    it.each([
+      { scenario: 'editable MyInfo', readOnly: false, expectedQuestion: 'Q1' },
+      {
+        scenario: 'verified read-only MyInfo',
+        readOnly: true,
+        expectedQuestion: 'Q1',
+      },
+    ])(
+      'snapshots the next step with saved $scenario labels and records its retry token',
+      async ({ readOnly, expectedQuestion }) => {
+        // Prepare: later steps must preserve the verification status saved on the original row.
+        const Model = getMultirespondentSubmissionModel(mongoose)
+        const row = await Model.create({
+          form: mockFormId,
+          submissionType: SubmissionType.Multirespondent,
+          form_fields: [],
+          form_logics: [],
+          workflow: twoStepWorkflow,
+          submissionPublicKey: 'pk',
+          encryptedSubmissionSecretKey: 'esk',
+          encryptedContent: 'ec',
+          version: 2,
+          workflowStep: 0,
+          myInfoReadOnlyFields: readOnly ? [fieldId] : [],
+          submittedSteps: [
+            { isApproval: false, submittedAt: new Date().toISOString() },
+          ],
+        })
+        MockSnapshotStore.writeSnapshot.mockReturnValue(
+          okAsync({ token: 'tok-update', key: 'key-update' }),
+        )
+
+        const snapshottedFormDef = buildSnapshottedFormDef()
+        Object.assign(snapshottedFormDef.form_fields[0], {
+          myInfo: { attr: MyInfoAttribute.Name },
+        })
+        // Act
+        const result = await updateMultiRespondentFormSubmission({
+          submissionId: row._id.toString(),
+          snapshottedFormDef,
+          encryptedPayload: buildV4Payload({ workflowStep: 1 }),
+          logMeta: { action: 'test' },
+        })
+
+        // Assert: the frozen payload and persisted token describe the same committed step.
+        expect(result.isOk()).toBe(true)
+        expect(MockSnapshotStore.writeSnapshot).toHaveBeenCalledTimes(1)
+        const snapshot = MockSnapshotStore.writeSnapshot.mock.calls[0][0]
+        expect(snapshot.submissionIndex).toBe(1)
+        expect(snapshot.workflowStep).toBe(1)
+        expect(snapshot.encryptedContent).toBe('v4-encrypted-content')
+        expect(snapshot.formFields).toEqual({
+          [fieldId]: { question: expectedQuestion },
+        })
+
+        const saved = await Model.findById(row._id)
+        expect(saved?.submittedSteps?.[1]?.snapshotTokens?.v4).toBe(
+          'tok-update',
+        )
+      },
+    )
+
+    it('does not write a snapshot when the write-condition is false (mrfVersion 1)', async () => {
+      const result = await createMultiRespondentFormSubmission({
+        form: buildV4Form(),
+        encryptedPayload: buildV4Payload({ mrfVersion: 1 }),
+        logMeta: { action: 'test' },
+      })
+
+      expect(result.isOk()).toBe(true)
+      expect(MockSnapshotStore.writeSnapshot).not.toHaveBeenCalled()
+    })
+
+    it.each`
+      label                                     | webhookFormat | workflow           | enableMrfWebhooks | expectWritten
+      ${'v4, flag off'}                         | ${'v4'}       | ${twoStepWorkflow} | ${false}          | ${false}
+      ${'v4, enable-mrf-webhooks on'}           | ${'v4'}       | ${twoStepWorkflow} | ${true}           | ${true}
+      ${'v1 by default, 2 steps (not sent)'}    | ${undefined}  | ${twoStepWorkflow} | ${true}           | ${false}
+      ${'v1 by default, 1 step (sent as V1)'}   | ${undefined}  | ${oneStepWorkflow} | ${true}           | ${true}
+      ${'v1 explicit, 1 step (sent as V1)'}     | ${'v1'}       | ${oneStepWorkflow} | ${true}           | ${true}
+      ${'v1 by default, no steps (sent as V1)'} | ${undefined}  | ${[]}              | ${true}           | ${true}
+      ${'v4, 1 step'}                           | ${'v4'}       | ${oneStepWorkflow} | ${true}           | ${true}
+    `(
+      'generic create snapshot write ($label) -> written=$expectWritten',
+      async ({ webhookFormat, workflow, enableMrfWebhooks, expectWritten }) => {
+        const result = await createMultiRespondentFormSubmission({
+          form: buildV4Form({
+            workflow,
+            webhook: genericWebhook({ webhookFormat }),
+          }),
+          encryptedPayload: buildV4Payload(),
+          logMeta: { action: 'test' },
+          growthbook: growthbookWithFlags({ enableMrfWebhooks }),
+        })
+
+        expect(result.isOk()).toBe(true)
+        expect(MockSnapshotStore.writeSnapshot).toHaveBeenCalledTimes(
+          expectWritten ? 1 : 0,
+        )
+      },
+    )
+
+    it('does not write a snapshot for a generic V4 row on update when the webhook would not be delivered', async () => {
+      const Model = getMultirespondentSubmissionModel(mongoose)
+      const row = await Model.create({
+        form: mockFormId,
+        submissionType: SubmissionType.Multirespondent,
+        form_fields: [],
+        form_logics: [],
+        workflow: twoStepWorkflow,
+        submissionPublicKey: 'pk',
+        encryptedSubmissionSecretKey: 'esk',
+        encryptedContent: 'ec',
+        version: 2,
+        workflowStep: 0,
+        submittedSteps: [
+          { isApproval: false, submittedAt: new Date().toISOString() },
+        ],
+      })
+
+      const result = await updateMultiRespondentFormSubmission({
+        submissionId: row._id.toString(),
+        snapshottedFormDef: buildSnapshottedFormDef({
+          webhook: genericV4Webhook(),
+        }),
+        encryptedPayload: buildV4Payload({ workflowStep: 1 }),
+        logMeta: { action: 'test' },
+        growthbook: growthbookWithFlags({ enableMrfWebhooks: false }),
+      })
+
+      expect(result.isOk()).toBe(true)
+      expect(MockSnapshotStore.writeSnapshot).not.toHaveBeenCalled()
+    })
+
+    it('still writes a snapshot for a plumber V4 row with no flags on', async () => {
+      const result = await createMultiRespondentFormSubmission({
+        form: buildV4Form(),
+        encryptedPayload: buildV4Payload(),
+        logMeta: { action: 'test' },
+        growthbook: growthbookWithFlags({}),
+      })
+
+      expect(result.isOk()).toBe(true)
+      expect(MockSnapshotStore.writeSnapshot).toHaveBeenCalledTimes(1)
+    })
+
+    it('does not write a snapshot when retries are disabled', async () => {
+      const result = await createMultiRespondentFormSubmission({
+        form: buildV4Form({
+          webhook: { url: PLUMBER_URL, isRetryEnabled: false } as any,
+        }),
+        encryptedPayload: buildV4Payload(),
+        logMeta: { action: 'test' },
+      })
+
+      expect(result.isOk()).toBe(true)
+      expect(MockSnapshotStore.writeSnapshot).not.toHaveBeenCalled()
+    })
+
+    it.each<[string, FormWebhook | undefined]>([
+      ['no webhook', undefined],
+      ['empty URL', { url: '', isRetryEnabled: true }],
+    ])('does not prepare a snapshot with %s', async (_label, webhook) => {
+      const result = await createMultiRespondentFormSubmission({
+        form: buildV4Form({ workflow: oneStepWorkflow, webhook }),
+        encryptedPayload: buildV4Payload(),
+        logMeta: { action: 'test' },
+        growthbook: growthbookWithFlags({ enableMrfWebhooks: true }),
+      })
+
+      expect(result._unsafeUnwrap().snapshot).toBeUndefined()
+      expect(MockSnapshotStore.writeSnapshot).not.toHaveBeenCalled()
+    })
+
+    it('delivers V1 with an in-memory snapshot when retries are disabled', async () => {
+      const form = buildV4Form({
+        workflow: oneStepWorkflow,
+        webhook: {
+          url: GENERIC_URL,
+          webhookFormat: 'v1',
+          isRetryEnabled: false,
+        },
+      })
+      const encryptedPayload = buildV4Payload()
+      const growthbook = growthbookWithFlags({ enableMrfWebhooks: true })
+      const created = await createMultiRespondentFormSubmission({
+        form,
+        encryptedPayload,
+        logMeta: { action: 'test' },
+        growthbook,
+      })
+      const { submission, snapshot } = created._unsafeUnwrap()
+
+      expect(snapshot?.contentFormat).toBe('v1')
+      expect(MockSnapshotStore.writeSnapshot).not.toHaveBeenCalled()
+
+      await performMultiRespondentPostSubmissionCreateActions({
+        submission,
+        snapshot,
+        submissionId: submission._id.toString(),
+        form,
+        encryptedPayload,
+        logMeta: { action: 'test' },
+        growthbook,
+      })
+      await flushPromises()
+
+      expect(WebhookFactory.sendInitialWebhook).toHaveBeenCalledTimes(1)
+    })
+
+    it('aborts the save (fail-loud) when the snapshot write fails', async () => {
+      MockSnapshotStore.writeSnapshot.mockReturnValue(
+        errAsync(new SnapshotWriteError()),
+      )
+      const saveSpy = jest.spyOn(
+        getMultirespondentSubmissionModel(mongoose).prototype,
+        'save',
+      )
+
+      const result = await createMultiRespondentFormSubmission({
+        form: buildV4Form(),
+        encryptedPayload: buildV4Payload(),
+        logMeta: { action: 'test' },
+      })
+
+      expect(result.isErr()).toBe(true)
+      expect(result._unsafeUnwrapErr()).toBeInstanceOf(SnapshotWriteError)
+      expect(saveSpy).not.toHaveBeenCalled()
+      saveSpy.mockRestore()
+    })
+
+    it('does not commit the appended step when the snapshot write fails on update', async () => {
+      const Model = getMultirespondentSubmissionModel(mongoose)
+      const row = await Model.create({
+        form: mockFormId,
+        submissionType: SubmissionType.Multirespondent,
+        form_fields: [],
+        form_logics: [],
+        workflow: twoStepWorkflow,
+        submissionPublicKey: 'pk',
+        encryptedSubmissionSecretKey: 'esk',
+        encryptedContent: 'ec',
+        version: 2,
+        workflowStep: 0,
+        submittedSteps: [
+          { isApproval: false, submittedAt: new Date().toISOString() },
+        ],
+      })
+      MockSnapshotStore.writeSnapshot.mockReturnValue(
+        errAsync(new SnapshotWriteError()),
+      )
+
+      const result = await updateMultiRespondentFormSubmission({
+        submissionId: row._id.toString(),
+        snapshottedFormDef: buildSnapshottedFormDef(),
+        encryptedPayload: buildV4Payload({ workflowStep: 1 }),
+        logMeta: { action: 'test' },
+      })
+
+      expect(result.isErr()).toBe(true)
+      expect(result._unsafeUnwrapErr()).toBeInstanceOf(SnapshotWriteError)
+
+      // S3-first ordering: the row is untouched, so the respondent's retry
+      // starts from the same committed state.
+      const saved = await Model.findById(row._id)
+      expect(saved?.submittedSteps).toHaveLength(1)
+      expect(saved?.workflowStep).toBe(0)
+      expect(saved?.encryptedContent).toBe('ec')
+    })
+
+    // ---- Send gate table ----
+
+    it.each`
+      label                                | url            | webhookFormat | workflow           | enableMrfWebhooks | expectSent
+      ${'plumber, flag off'}               | ${PLUMBER_URL} | ${undefined}  | ${twoStepWorkflow} | ${false}          | ${true}
+      ${'plumber, flag on'}                | ${PLUMBER_URL} | ${undefined}  | ${twoStepWorkflow} | ${true}           | ${true}
+      ${'generic v4, flag off'}            | ${GENERIC_URL} | ${'v4'}       | ${twoStepWorkflow} | ${false}          | ${false}
+      ${'generic v4, flag on'}             | ${GENERIC_URL} | ${'v4'}       | ${twoStepWorkflow} | ${true}           | ${true}
+      ${'zapier v4, flag off'}             | ${ZAPIER_URL}  | ${'v4'}       | ${twoStepWorkflow} | ${false}          | ${false}
+      ${'zapier v4, flag on'}              | ${ZAPIER_URL}  | ${'v4'}       | ${twoStepWorkflow} | ${true}           | ${true}
+      ${'generic v1 by default, 2 steps'}  | ${GENERIC_URL} | ${undefined}  | ${twoStepWorkflow} | ${true}           | ${false}
+      ${'generic v1 explicit, 2 steps'}    | ${GENERIC_URL} | ${'v1'}       | ${twoStepWorkflow} | ${true}           | ${false}
+      ${'zapier v1 by default, 2 steps'}   | ${ZAPIER_URL}  | ${undefined}  | ${twoStepWorkflow} | ${true}           | ${false}
+      ${'plumber, 2 steps, v1 requested'}  | ${PLUMBER_URL} | ${'v1'}       | ${twoStepWorkflow} | ${true}           | ${true}
+      ${'generic v1 by default, 1 step'}   | ${GENERIC_URL} | ${undefined}  | ${oneStepWorkflow} | ${true}           | ${true}
+      ${'generic v1 explicit, 1 step'}     | ${GENERIC_URL} | ${'v1'}       | ${oneStepWorkflow} | ${true}           | ${true}
+      ${'generic v4, 1 step'}              | ${GENERIC_URL} | ${'v4'}       | ${oneStepWorkflow} | ${true}           | ${true}
+      ${'generic v1 by default, no steps'} | ${GENERIC_URL} | ${undefined}  | ${[]}              | ${true}           | ${true}
+    `(
+      'send gate: $label -> sent=$expectSent',
+      async ({
+        url,
+        webhookFormat,
+        workflow,
+        enableMrfWebhooks,
+        expectSent,
+      }) => {
+        const sendSpy = jest.mocked(WebhookFactory.sendInitialWebhook)
+        const form = buildV4Form({
+          workflow,
+          webhook:
+            url === PLUMBER_URL
+              ? ({ url, isRetryEnabled: true, webhookFormat } as any)
+              : genericWebhook({ url, webhookFormat }),
+        })
+        const growthbook = growthbookWithFlags({ enableMrfWebhooks })
+
+        // RATIONALE: The snapshot comes from the real create path rather than a
+        // hand-built fixture, so the test cannot restate the format-resolution
+        // rules it is meant to be exercising.
+        const created = await createMultiRespondentFormSubmission({
+          form,
+          encryptedPayload: buildV4Payload(),
+          logMeta: { action: 'test' },
+          growthbook,
+        })
+        const { submission, snapshot } = created._unsafeUnwrap()
+        // The live row is stubbed so the gate, not the view, decides the send.
+        submission.getWebhookView = jest
+          .fn()
+          .mockResolvedValue(buildLiveWebhookView())
+
+        await performMultiRespondentPostSubmissionCreateActions({
+          submission,
+          snapshot,
+          submissionId: submission._id.toString(),
+          form,
+          encryptedPayload: buildV4Payload(),
+          logMeta: {} as any,
+          growthbook,
+        })
+        await flushPromises()
+
+        expect(sendSpy).toHaveBeenCalledTimes(expectSent ? 1 : 0)
+      },
+    )
+
+    // ---- Delivery across every step of a multi-step form ----
+
+    it.each`
+      label                     | webhookFormat | expectedSends
+      ${'V4'}                   | ${'v4'}       | ${2}
+      ${'V1 (format unset)'}    | ${undefined}  | ${0}
+      ${'V1 (format explicit)'} | ${'v1'}       | ${0}
+    `(
+      'a two-step generic form on the $label shape delivers $expectedSends payload(s) across its 2 steps',
+      async ({ webhookFormat, expectedSends }) => {
+        const sendSpy = jest.mocked(WebhookFactory.sendInitialWebhook)
+        const webhook = genericWebhook({ webhookFormat })
+        const growthbook = growthbookWithFlags({ enableMrfWebhooks: true })
+
+        const created = await createMultiRespondentFormSubmission({
+          form: buildV4Form({ webhook }),
+          encryptedPayload: buildV4Payload(),
+          logMeta: { action: 'test' },
+          growthbook,
+        })
+        const { submission, snapshot } = created._unsafeUnwrap()
+
+        await performMultiRespondentPostSubmissionCreateActions({
+          submission,
+          snapshot,
+          submissionId: submission._id.toString(),
+          form: buildV4Form({ webhook }),
+          encryptedPayload: buildV4Payload(),
+          logMeta: {} as any,
+          growthbook,
+        })
+        await flushPromises()
+
+        const updated = await updateMultiRespondentFormSubmission({
+          submissionId: submission._id.toString(),
+          snapshottedFormDef: buildSnapshottedFormDef({ webhook }),
+          encryptedPayload: buildV4Payload({ workflowStep: 1 }),
+          logMeta: { action: 'test' },
+          growthbook,
+        })
+        const { submission: advanced, snapshot: advancedSnapshot } =
+          updated._unsafeUnwrap()
+
+        await performMultiRespondentPostSubmissionUpdateActions({
+          submission: advanced,
+          snapshot: advancedSnapshot,
+          submissionId: advanced._id.toString(),
+          snapshottedFormDef: buildSnapshottedFormDef({ webhook }),
+          currentStepNumber: 1,
+          encryptedPayload: buildV4Payload({ workflowStep: 1 }),
+          logMeta: {} as any,
+          growthbook,
+        })
+        await flushPromises()
+
+        expect(sendSpy).toHaveBeenCalledTimes(expectedSends)
+      },
+    )
+
+    // ---- Generic never takes the legacy raw-getWebhookView path ----
+
+    it.each([
+      ['with a snapshot', true],
+      ['without a snapshot', false],
+    ])(
+      'routes a generic V4 send through reconstruction, never the legacy live-row path (%s)',
+      async (_label, withSnapshot) => {
+        const sendSpy = jest.mocked(WebhookFactory.sendInitialWebhook)
+        const submission = buildSubmissionWithToken(
+          withSnapshot ? 'tok-generic' : undefined,
+        )
+
+        await performMultiRespondentPostSubmissionCreateActions({
+          submission,
+          snapshot: withSnapshot ? buildSnapshot() : undefined,
+          submissionId: submission._id.toString(),
+          form: buildV4Form({
+            webhook: genericV4Webhook(),
+          }),
+          encryptedPayload: buildV4Payload(),
+          logMeta: {} as any,
+          growthbook: growthbookWithFlags({ enableMrfWebhooks: true }),
+        })
+        await flushPromises()
+
+        expect(sendSpy).toHaveBeenCalledTimes(1)
+        // The legacy branch is identified by the absent 4th argument.
+        expect(sendSpy.mock.calls[0][3]).toBeDefined()
+      },
+    )
+
+    // ---- Generic never receives the step token (write credential) ----
+
+    const STEP_TOKEN_HASH = 'SVC-STEP-TOKEN-HASH-SENTINEL'.padEnd(64, '0')
+    const ENCRYPTED_STEP_TOKEN =
+      'SVC-SENDER-PK-SENTINEL;SVC-NONCE-SENTINEL:SVC-CIPHER-SENTINEL'
+
+    /** Every key at every depth of the value. */
+    const collectKeys = (value: unknown): string[] => {
+      if (Array.isArray(value)) return value.flatMap(collectKeys)
+      if (value && typeof value === 'object') {
+        return Object.entries(value as Record<string, unknown>).flatMap(
+          ([key, child]) => [key, ...collectKeys(child)],
+        )
+      }
+      return []
+    }
+
+    it.each`
+      label                 | url            | enableMrfWebhooks
+      ${'plumber'}          | ${PLUMBER_URL} | ${false}
+      ${'plumber, flag on'} | ${PLUMBER_URL} | ${true}
+      ${'generic'}          | ${GENERIC_URL} | ${true}
+      ${'zapier'}           | ${ZAPIER_URL}  | ${true}
+    `(
+      'never puts a step token in the posted body ($label)',
+      async ({ url, enableMrfWebhooks }) => {
+        const sendSpy = jest.mocked(WebhookFactory.sendInitialWebhook)
+        const Model = getMultirespondentSubmissionModel(mongoose)
+
+        // RATIONALE: For test correctness, we write a real row,
+        // read back through the real getWebhookView, so the
+        // assertion cannot pass merely because the fixture had no token.
+        const row = await Model.create({
+          form: mockFormId,
+          submissionType: SubmissionType.Multirespondent,
+          form_fields: [],
+          form_logics: [],
+          workflow: twoStepWorkflow,
+          submissionPublicKey: 'pk',
+          encryptedSubmissionSecretKey: 'esk',
+          encryptedContent: 'ec',
+          verifiedContent: 'vc',
+          version: 2,
+          workflowStep: 0,
+          mrfVersion: 2,
+          submittedSteps: [
+            { isApproval: false, submittedAt: new Date().toISOString() },
+          ],
+          stepTokenHash: STEP_TOKEN_HASH,
+          encryptedStepToken: ENCRYPTED_STEP_TOKEN,
+        })
+        expect(row.encryptedStepToken).toBe(ENCRYPTED_STEP_TOKEN)
+
+        for (const snapshot of [buildSnapshot(), undefined]) {
+          await performMultiRespondentPostSubmissionCreateActions({
+            submission: row,
+            snapshot,
+            submissionId: row._id.toString(),
+            form: buildV4Form({
+              webhook:
+                url === PLUMBER_URL
+                  ? ({ url, isRetryEnabled: true } as any)
+                  : genericV4Webhook(url),
+            }),
+            encryptedPayload: buildV4Payload(),
+            logMeta: {} as any,
+            growthbook: growthbookWithFlags({ enableMrfWebhooks }),
+          })
+        }
+        await flushPromises()
+
+        expect(sendSpy).toHaveBeenCalled()
+        for (const call of sendSpy.mock.calls) {
+          const body = call[3]
+          expect(body).toBeDefined()
+          const serialised = JSON.stringify(body)
+          expect(serialised).not.toContain(STEP_TOKEN_HASH)
+          expect(serialised).not.toContain(ENCRYPTED_STEP_TOKEN)
+          expect(serialised).not.toContain('SENTINEL')
+          expect(collectKeys(body)).not.toContain(
+            expect.stringMatching(/steptoken/i),
+          )
+        }
+      },
+    )
+
+    // ---- D10: no S3 GET on the initial send ----
+
+    it('reconstructs from the in-memory snapshot, with the S3 read path stubbed to fail', async () => {
+      const sendSpy = jest.mocked(WebhookFactory.sendInitialWebhook)
+      // Any S3 GET on the initial send is a defect: stub the read path to fail
+      // so a surviving read-back would drop the webhook.
+      MockSnapshotStore.readSnapshot.mockReturnValue(
+        errAsync(new SnapshotDataIntegrityError('S3 GET must not be reached')),
+      )
+      MockSnapshotStore.writeSnapshot.mockReturnValue(
+        okAsync({ token: 'tok-inmem', key: 'key-inmem' }),
+      )
+
+      const created = await createMultiRespondentFormSubmission({
+        form: buildV4Form(),
+        encryptedPayload: buildV4Payload(),
+        logMeta: { action: 'test' },
+      })
+      expect(created.isOk()).toBe(true)
+      const { submission, snapshot } = created._unsafeUnwrap()
+      expect(snapshot?.encryptedContent).toBe('v4-encrypted-content')
+
+      await performMultiRespondentPostSubmissionCreateActions({
+        submission,
+        snapshot,
+        submissionId: submission._id.toString(),
+        form: buildV4Form(),
+        encryptedPayload: buildV4Payload(),
+        logMeta: {} as any,
+        growthbook: growthbookWithFlags({ enableMrfWebhooks: true }),
+      })
+      await flushPromises()
+
+      expect(MockSnapshotStore.readSnapshot).not.toHaveBeenCalled()
+      expect(sendSpy).toHaveBeenCalledTimes(1)
+      const view = sendSpy.mock.calls[0][3]
+      expect(view?.data.encryptedContent).toBe('v4-encrypted-content')
+      expect(view?.data.encryptedSubmissionSecretKey).toBe(
+        'wrapped-read-key-v4',
+      )
+    })
+
+    // ---- Reconstruction wired ----
+
+    it('passes a reconstructed pre-built view for a plumber v4 send', async () => {
+      const sendSpy = jest.mocked(WebhookFactory.sendInitialWebhook)
+      const submission = buildSubmissionWithToken('tok-A')
+
+      await performMultiRespondentPostSubmissionCreateActions({
+        submission,
+        snapshot: buildSnapshot({
+          encryptedSubmissionSecretKey: 'frozen-read-key',
+        }),
+        submissionId: submission._id.toString(),
+        form: buildV4Form(),
+        encryptedPayload: buildV4Payload(),
+        logMeta: {} as any,
+        growthbook: growthbookWithFlags({ enableMrfWebhooks: true }),
+      })
+      await flushPromises()
+
+      expect(sendSpy).toHaveBeenCalledTimes(1)
+      const view = sendSpy.mock.calls[0][3]
+      expect(view).toBeDefined()
+      expect(view?.data.version).toBe(4)
+      expect(view?.data.encryptedSubmissionSecretKey).toBe('frozen-read-key')
+      // frozen content wins over the live row.
+      expect(view?.data.encryptedContent).toBe('frozen-content')
+    })
+
+    it('passes snapshotRef so a retry reconstructs from the frozen snapshot', async () => {
+      const sendSpy = jest.mocked(WebhookFactory.sendInitialWebhook)
+      const submission = buildSubmissionWithToken('tok-A')
+
+      await performMultiRespondentPostSubmissionCreateActions({
+        submission,
+        snapshot: buildSnapshot(),
+        submissionId: submission._id.toString(),
+        form: buildV4Form(),
+        encryptedPayload: buildV4Payload(),
+        logMeta: {} as any,
+        growthbook: growthbookWithFlags({ enableMrfWebhooks: true }),
+      })
+      await flushPromises()
+
+      expect(sendSpy.mock.calls[0][4]).toEqual({
+        submissionIndex: (submission.submittedSteps?.length ?? 1) - 1,
+        contentFormat: 'v4',
+      })
+    })
+
+    it('omits snapshotRef when no snapshot was frozen so a retry uses the live row', async () => {
+      const sendSpy = jest.mocked(WebhookFactory.sendInitialWebhook)
+      const submission = buildSubmissionWithToken(
+        undefined,
+        buildLiveWebhookView(),
+      )
+
+      await performMultiRespondentPostSubmissionCreateActions({
+        submission,
+        submissionId: submission._id.toString(),
+        form: buildV4Form(),
+        encryptedPayload: buildV4Payload(),
+        logMeta: {} as any,
+        growthbook: growthbookWithFlags({ enableMrfWebhooks: true }),
+      })
+      await flushPromises()
+
+      expect(sendSpy.mock.calls[0][4]).toBeUndefined()
+    })
+
+    it('passes snapshotRef for the current sending step to send as initialWebhook, not the previous step', async () => {
+      const Model = getMultirespondentSubmissionModel(mongoose)
+      const row = await Model.create({
+        form: mockFormId,
+        submissionType: SubmissionType.Multirespondent,
+        form_fields: [],
+        form_logics: [],
+        workflow: twoStepWorkflow,
+        submissionPublicKey: 'pk',
+        encryptedSubmissionSecretKey: 'esk',
+        encryptedContent: 'ec',
+        version: 2,
+        workflowStep: 0,
+        submittedSteps: [
+          { isApproval: false, submittedAt: new Date().toISOString() },
+        ],
+      })
+      MockSnapshotStore.writeSnapshot.mockReturnValue(
+        okAsync({ token: 'tok-step-2', key: 'key-step-2' }),
+      )
+
+      const updated = await updateMultiRespondentFormSubmission({
+        submissionId: row._id.toString(),
+        snapshottedFormDef: buildSnapshottedFormDef(),
+        encryptedPayload: buildV4Payload({ workflowStep: 1 }),
+        logMeta: { action: 'test' },
+      })
+      const { submission, snapshot } = updated._unsafeUnwrap()
+
+      const sendSpy = jest.mocked(WebhookFactory.sendInitialWebhook)
+      await performMultiRespondentPostSubmissionUpdateActions({
+        submission,
+        snapshot,
+        submissionId: submission._id.toString(),
+        snapshottedFormDef: buildSnapshottedFormDef(),
+        currentStepNumber: 1,
+        encryptedPayload: buildV4Payload({ workflowStep: 1 }),
+        logMeta: {} as any,
+        growthbook: growthbookWithFlags({ enableMrfWebhooks: true }),
+      })
+      await flushPromises()
+
+      expect(sendSpy.mock.calls[0][4]).toEqual({
+        submissionIndex: 1,
+        contentFormat: 'v4',
+      })
+    })
+
+    it('reconstructs the live row (not the legacy path) for a plumber V4 row with no snapshot', async () => {
+      const sendSpy = jest.mocked(WebhookFactory.sendInitialWebhook)
+      const liveView = buildLiveWebhookView()
+      const submission = buildSubmissionWithToken(undefined, liveView)
+
+      await performMultiRespondentPostSubmissionCreateActions({
+        submission,
+        submissionId: submission._id.toString(),
+        form: buildV4Form(),
+        encryptedPayload: buildV4Payload(),
+        logMeta: {} as any,
+        growthbook: growthbookWithFlags({ enableMrfWebhooks: true }),
+      })
+      await flushPromises()
+
+      expect(sendSpy).toHaveBeenCalledTimes(1)
+      expect(sendSpy.mock.calls[0][3]?.data).toEqual(liveView.data)
+      expect(MockSnapshotStore.readSnapshot).not.toHaveBeenCalled()
+    })
+
+    // ---- D10: a recorded token never triggers a read on the initial send ----
+
+    it('ignores the recorded token on the initial send and never reads S3', async () => {
+      const sendSpy = jest.mocked(WebhookFactory.sendInitialWebhook)
+      // A token IS recorded on the row, yet the send must still not read S3 —
+      // the object it needs is already in hand.
+      const submission = buildSubmissionWithToken('tok-A')
+
+      await performMultiRespondentPostSubmissionUpdateActions({
+        submission,
+        snapshot: buildSnapshot(),
+        submissionId: submission._id.toString(),
+        snapshottedFormDef: buildSnapshottedFormDef(),
+        currentStepNumber: 0,
+        encryptedPayload: buildV4Payload(),
+        logMeta: {} as any,
+        growthbook: growthbookWithFlags({ enableMrfWebhooks: true }),
+      })
+      await flushPromises()
+
+      expect(MockSnapshotStore.readSnapshot).not.toHaveBeenCalled()
+      expect(sendSpy).toHaveBeenCalledTimes(1)
+      expect(sendSpy.mock.calls[0][3]?.data.encryptedContent).toBe(
+        'frozen-content',
+      )
+    })
+
+    // ---- Case A winner / 409 ----
+
+    it("records the winner token and hands the winner's own snapshot to reconstruction (Case A / 409 winner)", async () => {
+      const Model = getMultirespondentSubmissionModel(mongoose)
+      const row = await Model.create({
+        form: mockFormId,
+        submissionType: SubmissionType.Multirespondent,
+        form_fields: [],
+        form_logics: [],
+        workflow: twoStepWorkflow,
+        submissionPublicKey: 'pk',
+        encryptedSubmissionSecretKey: 'esk',
+        encryptedContent: 'ec',
+        version: 2,
+        workflowStep: 0,
+        submittedSteps: [
+          { isApproval: false, submittedAt: new Date().toISOString() },
+        ],
+      })
+      MockSnapshotStore.writeSnapshot.mockReturnValue(
+        okAsync({ token: 'winner-token', key: 'winner-key' }),
+      )
+
+      const result = await updateMultiRespondentFormSubmission({
+        submissionId: row._id.toString(),
+        snapshottedFormDef: buildSnapshottedFormDef(),
+        encryptedPayload: buildV4Payload({ workflowStep: 1 }),
+        logMeta: { action: 'test' },
+      })
+      expect(result.isOk()).toBe(true)
+      const { submission: winner, snapshot: winnerSnapshot } =
+        result._unsafeUnwrap()
+      expect(winner.submittedSteps?.[1]?.snapshotTokens?.v4).toBe(
+        'winner-token',
+      )
+      // The winner's own object is what travels to reconstruction — the token
+      // is recorded for the RETRY path, not consumed by the initial send.
+      expect(winnerSnapshot?.submissionIndex).toBe(1)
+
+      const sendSpy = jest.mocked(WebhookFactory.sendInitialWebhook)
+      await performMultiRespondentPostSubmissionUpdateActions({
+        submission: winner,
+        snapshot: winnerSnapshot,
+        submissionId: winner._id.toString(),
+        snapshottedFormDef: buildSnapshottedFormDef(),
+        currentStepNumber: 1,
+        encryptedPayload: buildV4Payload({ workflowStep: 1 }),
+        logMeta: {} as any,
+        growthbook: growthbookWithFlags({ enableMrfWebhooks: true }),
+      })
+      await flushPromises()
+
+      expect(MockSnapshotStore.readSnapshot).not.toHaveBeenCalled()
+      expect(sendSpy).toHaveBeenCalledTimes(1)
+      expect(sendSpy.mock.calls[0][3]?.data.encryptedContent).toBe(
+        'v4-encrypted-content',
+      )
+    })
+
+    it('surfaces a lost concurrent-write race as a 409 even after a successful snapshot write', async () => {
+      const Model = getMultirespondentSubmissionModel(mongoose)
+      const doc = await Model.create({
+        form: mockFormId,
+        submissionType: SubmissionType.Multirespondent,
+        form_fields: [],
+        form_logics: [],
+        workflow: twoStepWorkflow,
+        submissionPublicKey: 'pk',
+        encryptedSubmissionSecretKey: 'esk',
+        encryptedContent: 'ec',
+        version: 2,
+        workflowStep: 0,
+        submittedSteps: [
+          { isApproval: false, submittedAt: new Date().toISOString() },
+        ],
+      })
+      const versionError = new mongoose.Error.VersionError(
+        doc as any,
+        (doc as any).__v,
+        ['submittedSteps'],
+      )
+      const saveSpy = jest
+        .spyOn(Model.prototype, 'save')
+        .mockRejectedValueOnce(versionError)
+
+      const result = await updateMultiRespondentFormSubmission({
+        submissionId: doc._id.toString(),
+        snapshottedFormDef: buildSnapshottedFormDef(),
+        encryptedPayload: buildV4Payload({ workflowStep: 1 }),
+        logMeta: { action: 'test' },
+      })
+
+      expect(MockSnapshotStore.writeSnapshot).toHaveBeenCalledTimes(1)
+      expect(result.isErr()).toBe(true)
+      expect(result._unsafeUnwrapErr()).toBeInstanceOf(DatabaseConflictError)
+      expect(mapRouteError(result._unsafeUnwrapErr()).statusCode).toBe(409)
+      saveSpy.mockRestore()
+    })
+
+    // ---- Case B/C benign orphan ----
+
+    it('leaves the snapshot as a benign orphan (no delete) when the save fails after a successful write, and a resubmit writes a NEW token', async () => {
+      const Model = getMultirespondentSubmissionModel(mongoose)
+      const row = await Model.create({
+        form: mockFormId,
+        submissionType: SubmissionType.Multirespondent,
+        form_fields: [],
+        form_logics: [],
+        workflow: twoStepWorkflow,
+        submissionPublicKey: 'pk',
+        encryptedSubmissionSecretKey: 'esk',
+        encryptedContent: 'ec',
+        version: 2,
+        workflowStep: 0,
+        submittedSteps: [
+          { isApproval: false, submittedAt: new Date().toISOString() },
+        ],
+      })
+      MockSnapshotStore.writeSnapshot.mockReturnValueOnce(
+        okAsync({ token: 'orphan-token-1', key: 'orphan-key-1' }),
+      )
+      const saveSpy = jest
+        .spyOn(Model.prototype, 'save')
+        .mockRejectedValueOnce(new Error('transient write failure'))
+
+      const failed = await updateMultiRespondentFormSubmission({
+        submissionId: row._id.toString(),
+        snapshottedFormDef: buildSnapshottedFormDef(),
+        encryptedPayload: buildV4Payload({ workflowStep: 1 }),
+        logMeta: { action: 'test' },
+      })
+
+      expect(failed.isErr()).toBe(true)
+      // The store exposes no delete/wipe primitive at all — an orphan is never
+      // reclaimed inline.
+      expect(
+        (SnapshotStore as Record<string, unknown>).deleteV4Snapshot,
+      ).toBeUndefined()
+      expect(
+        (SnapshotStore as Record<string, unknown>).removeV4Snapshot,
+      ).toBeUndefined()
+
+      saveSpy.mockRestore()
+
+      // Resubmit: a fresh write mints a NEW token, recorded on the row.
+      MockSnapshotStore.writeSnapshot.mockReturnValueOnce(
+        okAsync({ token: 'orphan-token-2', key: 'orphan-key-2' }),
+      )
+      const resubmit = await updateMultiRespondentFormSubmission({
+        submissionId: row._id.toString(),
+        snapshottedFormDef: buildSnapshottedFormDef(),
+        encryptedPayload: buildV4Payload({ workflowStep: 1 }),
+        logMeta: { action: 'test' },
+      })
+
+      expect(resubmit.isOk()).toBe(true)
+      const saved = await Model.findById(row._id)
+      expect(saved?.submittedSteps?.[1]?.snapshotTokens?.v4).toBe(
+        'orphan-token-2',
+      )
+    })
+  })
+
+  describe('performMultirespondentPaymentPostSubmissionActions', () => {
+    const MOCK_GENERIC_WEBHOOK_URL = 'https://example.com/webhook'
+    const MOCK_PLUMBER_WEBHOOK_URL = 'https://plumber.gov.sg/webhooks/abc'
+    const MOCK_ADMIN_EMAIL = 'admin@example.gov.sg'
+    // No mrfVersion, so the send takes the v3 legacy shape (raw submission,
+    // no reconstructed webhook view).
+    const mockSubmission = {
+      id: mockSubmissionId,
+      form: mockFormId,
+      submissionType: SubmissionType.Multirespondent,
+    } as unknown as IMultirespondentSubmissionSchema
+
+    const mockPaymentMrfFormWithWebhook = (webhookUrl: string) =>
+      okAsync({
+        _id: mockFormId,
+        admin: { email: MOCK_ADMIN_EMAIL },
+        webhook: { url: webhookUrl, isRetryEnabled: true },
+      } as unknown as IPopulatedForm)
+
+    const growthbookWithFlags = ({
+      enableMrfWebhooks = false,
+    }: {
+      enableMrfWebhooks?: boolean
+    }) =>
+      ({
+        isOn: jest.fn(
+          (flag: string) =>
+            flag === featureFlags.enableMrfWebhooks && enableMrfWebhooks,
+        ),
+        getAttributes: jest.fn(() => ({})),
+        setAttributes: jest.fn(),
+      }) as any
+
+    afterEach(() => jest.restoreAllMocks())
+
+    it('should suppress the webhook to a generic endpoint when no growthbook instance is available (flags fail closed)', async () => {
+      // Arrange
+      jest
+        .spyOn(FormService, 'retrieveFullFormById')
+        .mockReturnValue(
+          mockPaymentMrfFormWithWebhook(MOCK_GENERIC_WEBHOOK_URL),
+        )
+      const webhookSpy = jest.spyOn(WebhookFactory, 'sendInitialWebhook')
+
+      // Act
+      const actualResult =
+        await MultirespondentSubmissionService.performMultirespondentPaymentPostSubmissionActions(
+          mockSubmission,
+          mockSubmissionId,
+        )
+
+      // Assert
+      expect(webhookSpy).not.toHaveBeenCalled()
+      expect(actualResult.isOk()).toBeTrue()
+    })
+
+    it('should suppress the webhook to a generic endpoint when the MRF webhook flags are off', async () => {
+      // Arrange
+      jest
+        .spyOn(FormService, 'retrieveFullFormById')
+        .mockReturnValue(
+          mockPaymentMrfFormWithWebhook(MOCK_GENERIC_WEBHOOK_URL),
+        )
+      const webhookSpy = jest.spyOn(WebhookFactory, 'sendInitialWebhook')
+
+      // Act
+      const actualResult =
+        await MultirespondentSubmissionService.performMultirespondentPaymentPostSubmissionActions(
+          mockSubmission,
+          mockSubmissionId,
+          growthbookWithFlags({ enableMrfWebhooks: false }),
+        )
+
+      // Assert
+      expect(webhookSpy).not.toHaveBeenCalled()
+      expect(actualResult.isOk()).toBeTrue()
+    })
+
+    it('should fire the webhook to a generic endpoint when the MRF webhook flags are on, targeting the flags by form and admin', async () => {
+      // Arrange
+      jest
+        .spyOn(FormService, 'retrieveFullFormById')
+        .mockReturnValue(
+          mockPaymentMrfFormWithWebhook(MOCK_GENERIC_WEBHOOK_URL),
+        )
+      const webhookSpy = jest
+        .spyOn(WebhookFactory, 'sendInitialWebhook')
+        .mockReturnValue(okAsync(true))
+      const mockGrowthbook = growthbookWithFlags({
+        enableMrfWebhooks: true,
+      })
+
+      // Act
+      const actualResult =
+        await MultirespondentSubmissionService.performMultirespondentPaymentPostSubmissionActions(
+          mockSubmission,
+          mockSubmissionId,
+          mockGrowthbook,
+        )
+
+      // Assert
+      expect(mockGrowthbook.setAttributes).toHaveBeenCalledWith({
+        formId: String(mockFormId),
+        adminEmail: MOCK_ADMIN_EMAIL,
+      })
+      expect(webhookSpy).toHaveBeenCalledWith(
+        mockSubmission,
+        MOCK_GENERIC_WEBHOOK_URL,
+        true,
+      )
+      expect(actualResult.isOk()).toBeTrue()
+    })
+
+    it('should fire the webhook to a plumber endpoint even without a growthbook instance', async () => {
+      // Arrange
+      jest
+        .spyOn(FormService, 'retrieveFullFormById')
+        .mockReturnValue(
+          mockPaymentMrfFormWithWebhook(MOCK_PLUMBER_WEBHOOK_URL),
+        )
+      const webhookSpy = jest
+        .spyOn(WebhookFactory, 'sendInitialWebhook')
+        .mockReturnValue(okAsync(true))
+
+      // Act
+      const actualResult =
+        await MultirespondentSubmissionService.performMultirespondentPaymentPostSubmissionActions(
+          mockSubmission,
+          mockSubmissionId,
+        )
+
+      // Assert
+      expect(webhookSpy).toHaveBeenCalledWith(
+        mockSubmission,
+        MOCK_PLUMBER_WEBHOOK_URL,
+        true,
+      )
+      expect(actualResult.isOk()).toBeTrue()
+    })
+
+    it('should not fire a webhook when the form has none configured', async () => {
+      // Arrange
+      jest
+        .spyOn(FormService, 'retrieveFullFormById')
+        .mockReturnValue(okAsync({ webhook: { url: '' } } as IPopulatedForm))
+      const webhookSpy = jest.spyOn(WebhookFactory, 'sendInitialWebhook')
+
+      // Act
+      const actualResult =
+        await MultirespondentSubmissionService.performMultirespondentPaymentPostSubmissionActions(
+          mockSubmission,
+          mockSubmissionId,
+        )
+
+      // Assert
+      expect(webhookSpy).not.toHaveBeenCalled()
+      expect(actualResult.isOk()).toBeTrue()
+    })
+  })
+})

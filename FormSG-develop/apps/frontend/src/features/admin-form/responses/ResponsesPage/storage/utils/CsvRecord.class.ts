@@ -1,0 +1,180 @@
+import { cloneDeep } from 'lodash'
+
+import {
+  SubmissionMrfMetadata,
+  SubmissionPaymentDto,
+} from 'formsg-shared/types'
+
+import {
+  CSV_DOWNLOAD_STATUS_COLUMN_ID,
+  CSV_MRF_PENDING_RESPONSE_AT_COLUMN_ID,
+  CSV_MRF_WORKFLOW_STATUS_COLUMN_ID,
+  CSV_PAYMENT_COLUMN_IDS,
+  MRF_PENDING_RESPONSE_AT_LABEL,
+  MRF_WORKFLOW_STATUS_LABEL,
+} from '~features/admin-form/responses/constants'
+
+import { getPaymentDataView } from '../../../common/utils/getPaymentDataView'
+import {
+  getPendingResponseAtString,
+  getStatusFromWorkflowStatus,
+  MRF_STATUS,
+} from '../../../common/utils/mrfSubmissionView'
+import {
+  CsvRecordData,
+  CsvRecordStatus,
+  DecryptedSubmissionData,
+} from '../types'
+
+/** @class CsvRecord represents the CSV data to be passed back, along with helper functions */
+export class CsvRecord {
+  submissionData?: DecryptedSubmissionData
+
+  #statusMessage: string
+  #record: CsvRecordData[]
+
+  /**
+   * Creates an instance of CsvRecord
+   *
+   * @constructor
+   * @param id The ID of the submission
+   * @param created The time of submission
+   * @param status The status of the submission decryption/download process
+   */
+  constructor(
+    public id: string,
+    public created: string,
+    public status: CsvRecordStatus,
+    public form: string,
+    public hostOrigin: string,
+    public paymentData?: SubmissionPaymentDto,
+    public mrfData?: SubmissionMrfMetadata,
+  ) {
+    this.#statusMessage = status
+    this.#record = []
+  }
+
+  /**
+   * Sets the decryption/download status
+   *
+   * @param status A status code indicating the decryption success to be consumed by submissions.client.factory.js
+   * @param msg A human readable status message to be presented as part of the CSV download
+   */
+  setStatus(status: CsvRecordStatus, msg: string) {
+    this.status = status
+    this.#statusMessage = msg
+  }
+
+  /**
+   * Sets the decrypted CSV record
+   *
+   * @param record The decrypted submission record
+   */
+  setRecord(record: CsvRecordData[]) {
+    this.#record = record
+  }
+
+  // Function mapping mrf data keys to ids. This is necessary to maintain
+  // static mapping from keys to IDs which is important for the csv generator to
+  // put the correct values in the correct columns.
+  private mrfDataKeyToId(
+    key:
+      | typeof MRF_WORKFLOW_STATUS_LABEL
+      | typeof MRF_PENDING_RESPONSE_AT_LABEL,
+  ): string {
+    switch (key) {
+      case MRF_WORKFLOW_STATUS_LABEL:
+        return CSV_MRF_WORKFLOW_STATUS_COLUMN_ID
+      case MRF_PENDING_RESPONSE_AT_LABEL:
+        return CSV_MRF_PENDING_RESPONSE_AT_COLUMN_ID
+      default: {
+        // eslint-disable-next-line @typescript-eslint/no-unused-vars
+        const _: never = key
+        throw new Error('Invalid key')
+      }
+    }
+  }
+
+  /**
+   * Materializes the `submissionData` field
+   *
+   * This function should be called before the CsvRecord is passed back using `postMessage`.
+   * Since `postMessage` does not support code being passed back to the main thread, the
+   * `CsvRecord` received will only contain simple fields (e.g. `created`, `status`, etc...).
+   *
+   * This function creates a `submissionData` field in the object containing the final
+   * answers to be added to the CSV file. This `submissionData` field will be passed back
+   * using `postMessage` since it does not contain code.
+   */
+  materializeSubmissionData() {
+    const downloadStatus: CsvRecordData = {
+      _id: CSV_DOWNLOAD_STATUS_COLUMN_ID,
+      fieldType: 'textfield',
+      question: 'Download Status',
+      answer: this.#statusMessage,
+    }
+    const output = cloneDeep(this.#record)
+
+    // Inject the payment details into the csv
+    if (this.paymentData) {
+      getPaymentDataView(this.hostOrigin, this.paymentData, this.form).forEach(
+        ({ key, name, value }) =>
+          output.push({
+            _id: CSV_PAYMENT_COLUMN_IDS[key],
+            fieldType: 'textfield',
+            question: name,
+            answer: value,
+          }),
+      )
+    }
+
+    if (this.mrfData) {
+      const workflowStatus = this.mrfData.workflowStatus
+      const isStopped = !!this.mrfData.stoppedAt
+      const mrfSubmissionStatus = isStopped
+        ? MRF_STATUS.STOPPED
+        : workflowStatus
+          ? getStatusFromWorkflowStatus(workflowStatus)
+          : ''
+      const workFlowStatusColumn: CsvRecordData = {
+        _id: this.mrfDataKeyToId(MRF_WORKFLOW_STATUS_LABEL),
+        fieldType: 'textfield',
+        question: MRF_WORKFLOW_STATUS_LABEL,
+        answer: mrfSubmissionStatus,
+      }
+
+      const workflowCurrentStepNumber = this.mrfData.workflowCurrentStepNumber
+      const workflowNumTotalSteps = this.mrfData.workflowNumTotalSteps
+
+      const pendingAtString = isStopped
+        ? '-'
+        : workflowStatus === undefined ||
+            workflowCurrentStepNumber === undefined ||
+            workflowNumTotalSteps === undefined
+          ? ''
+          : getPendingResponseAtString({
+              workflowStatus,
+              workflowCurrentStepNumber,
+              workflowNumTotalSteps,
+            })
+
+      const pendingAtColumn: CsvRecordData = {
+        _id: this.mrfDataKeyToId(MRF_PENDING_RESPONSE_AT_LABEL),
+        fieldType: 'textfield',
+        question: MRF_PENDING_RESPONSE_AT_LABEL,
+        answer: pendingAtString,
+      }
+
+      output.unshift(workFlowStatusColumn, pendingAtColumn)
+    }
+
+    output.unshift(downloadStatus)
+
+    this.submissionData = {
+      created: this.created,
+      submissionId: this.id,
+      mrfMeta: this.mrfData,
+      record: output,
+    }
+  }
+}

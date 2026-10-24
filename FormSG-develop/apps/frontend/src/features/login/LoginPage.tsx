@@ -1,0 +1,227 @@
+import { useEffect, useMemo, useState } from 'react'
+import { useTranslation } from 'react-i18next'
+import { useSearchParams } from 'react-router-dom'
+import { Stack, Text } from '@chakra-ui/react'
+import { useFeatureIsOn, useFeatureValue } from '@growthbook/growthbook-react'
+import { StatusCodes } from 'http-status-codes'
+
+import { featureFlags, WogadLoginFeatureValue } from 'formsg-shared/constants'
+
+import { LOGGED_IN_KEY } from '~constants/localStorage'
+import { DASHBOARD_ROUTE } from '~constants/routes'
+import { useIsMobile } from '~hooks/useIsMobile'
+import { useLocalStorage } from '~hooks/useLocalStorage'
+import { useToast } from '~hooks/useToast'
+import { sendLoginOtp, verifyLoginOtp } from '~services/AuthService'
+import Spinner from '~components/Spinner'
+
+import {
+  trackAdminLogin,
+  trackAdminLoginFailure,
+} from '~features/analytics/AnalyticsService'
+
+import { LoginForm, LoginFormInputs } from './components/LoginForm'
+import { ONE_LOGIN_URL, OneLoginButton } from './components/OneLoginButton'
+import { OrDivider } from './components/OrDivider'
+import { OtpForm, OtpFormInputs } from './components/OtpForm'
+import { SgidLoginButton } from './components/SgidLoginButton'
+import { WogadLoginButton } from './components/WogadLoginButton'
+import { LoginPageTemplate } from './LoginPageTemplate'
+import { useIsIntranetCheck, useIsOgpIpCheck, useIsRbiIpCheck } from './queries'
+
+export type LoginOtpData = {
+  email: string
+}
+
+const isWogadLoginEnabled = ({
+  wogadLoginFeatureValue,
+  isIntranetIp,
+  isRbiIp,
+}: {
+  wogadLoginFeatureValue: string
+  isIntranetIp: boolean
+  isRbiIp: boolean
+}) => {
+  return (
+    wogadLoginFeatureValue === WogadLoginFeatureValue.ALL ||
+    (wogadLoginFeatureValue === WogadLoginFeatureValue.INTRANET_AND_RBI_ONLY &&
+      (isIntranetIp || isRbiIp))
+  )
+}
+
+const LoginOptionButtons = ({
+  shouldShowWogadLogin,
+  shouldShowOneLogin,
+  shouldShowSgidLogin,
+}: {
+  shouldShowWogadLogin: boolean
+  shouldShowOneLogin: boolean
+  shouldShowSgidLogin: boolean
+}) => {
+  return (
+    <Stack spacing="1rem">
+      {shouldShowWogadLogin && <WogadLoginButton />}
+      {shouldShowOneLogin && <OneLoginButton />}
+      {shouldShowSgidLogin && <SgidLoginButton />}
+    </Stack>
+  )
+}
+
+const isDev = import.meta.env.MODE === 'development'
+export const LoginPage = (): JSX.Element => {
+  const { t } = useTranslation()
+  const { data: isIntranetIp = false } = useIsIntranetCheck()
+  const { data: isRbiIp = false } = useIsRbiIpCheck()
+  const { data: isOgpIp = false } = useIsOgpIpCheck()
+  // RATIONALE: one.gov.sg is the suite rebuild of sso.gov.sg, so it inherits
+  // sso's gate as-is. The IP check is a rollout knob, not a security control —
+  // the backend already whitelists domains and one.gov.sg verifies officers.
+  const showOgpSuiteSso = useFeatureIsOn(featureFlags.ogpSuiteSso)
+  const shouldShowOneLogin = (isOgpIp && showOgpSuiteSso) || isDev
+  const wogadLoginFeatureValue = useFeatureValue(
+    featureFlags.wogadLogin,
+    WogadLoginFeatureValue.OFF,
+  )
+  const shouldShowWogadLogin = isWogadLoginEnabled({
+    wogadLoginFeatureValue,
+    isIntranetIp,
+    isRbiIp,
+  })
+  const enableIntranetSgidLogin = useFeatureIsOn(
+    featureFlags.enableIntranetSgidLogin,
+  )
+  const shouldShowSgidLogin = !isIntranetIp || enableIntranetSgidLogin
+
+  const isMobile = useIsMobile()
+
+  const [, setIsAuthenticated] = useLocalStorage<boolean>(LOGGED_IN_KEY)
+  const [email, setEmail] = useState<string>()
+  const [otpPrefix, setOtpPrefix] = useState<string>('')
+
+  const [params] = useSearchParams()
+  const toast = useToast({ isClosable: true, status: 'danger' })
+
+  const statusCode = params.get('status')
+  const toastMessage = useMemo(() => {
+    switch (statusCode) {
+      case null:
+        return
+      case StatusCodes.OK.toString():
+        {
+          window.location.assign(DASHBOARD_ROUTE)
+          setIsAuthenticated(true)
+        }
+        return
+      case StatusCodes.FORBIDDEN.toString():
+        return t('features.login.LoginPage.forbidden')
+      case StatusCodes.UNAUTHORIZED.toString():
+        return t('features.login.LoginPage.expiredSession')
+      default: {
+        const code = parseInt(statusCode ?? '')
+        if (code >= 500 && code < 600) {
+          return t('features.common.errors.serverError')
+        }
+        return t('features.common.errors.generic')
+      }
+    }
+  }, [statusCode])
+
+  // RATIONALE: this page is the RP's initiate_login_uri, not the API endpoint,
+  // so the launcher hop lands in the officer's own browser before /authorize.
+  // On GSIB, Menlo keeps its remote-tab pairing in window.name; left in place,
+  // the next one.gov.sg navigation re-attaches to the stale remote tab (parked
+  // on this page) and bounces back here forever. The backend validates iss.
+  const iss = params.get('iss')
+  useEffect(() => {
+    if (!iss) return
+    window.name = ''
+    window.location.assign(
+      `${ONE_LOGIN_URL}?${new URLSearchParams({ iss }).toString()}`,
+    )
+  }, [iss])
+
+  useEffect(() => {
+    if (!toastMessage) return
+    toast({ description: toastMessage })
+  }, [toast, toastMessage])
+
+  const handleSendOtp = async ({ email }: LoginFormInputs) => {
+    const trimmedEmail = email.trim()
+    await sendLoginOtp(trimmedEmail).then(({ otpPrefix }) => {
+      setOtpPrefix(otpPrefix)
+      setEmail(trimmedEmail)
+    })
+  }
+
+  const handleVerifyOtp = async ({ otp }: OtpFormInputs) => {
+    // Should not happen, since OtpForm component is only shown when there is
+    // already an email state set.
+    if (!email) {
+      throw new Error('Something went wrong')
+    }
+    try {
+      await verifyLoginOtp({ otp, email })
+      trackAdminLogin()
+      return setIsAuthenticated(true)
+    } catch (error) {
+      if (error instanceof Error) {
+        trackAdminLoginFailure(error.message)
+      }
+      throw error
+    }
+  }
+
+  const handleResendOtp = async () => {
+    // Should not happen, since OtpForm component is only shown when there is
+    // already an email state set.
+    if (!email) {
+      throw new Error('Something went wrong')
+    }
+    await sendLoginOtp(email).then(({ otpPrefix }) => setOtpPrefix(otpPrefix))
+  }
+
+  // Same layout as OneHoldingPage, so the launcher hop doesn't flash the form.
+  if (iss) {
+    return (
+      <Stack spacing={4} align="center" justify="center" height="100%">
+        <Spinner />
+        <Text>{t('features.login.LoginPage.signingInWithOne')}</Text>
+      </Stack>
+    )
+  }
+
+  return (
+    <LoginPageTemplate>
+      {!email ? (
+        <Stack gap="2rem" divider={<OrDivider />}>
+          {isMobile
+            ? [
+                <LoginOptionButtons
+                  key="buttons"
+                  shouldShowWogadLogin={shouldShowWogadLogin}
+                  shouldShowOneLogin={shouldShowOneLogin}
+                  shouldShowSgidLogin={shouldShowSgidLogin}
+                />,
+                <LoginForm key="form" onSubmit={handleSendOtp} />,
+              ]
+            : [
+                <LoginForm key="form" onSubmit={handleSendOtp} />,
+                <LoginOptionButtons
+                  key="buttons"
+                  shouldShowWogadLogin={shouldShowWogadLogin}
+                  shouldShowOneLogin={shouldShowOneLogin}
+                  shouldShowSgidLogin={shouldShowSgidLogin}
+                />,
+              ]}
+        </Stack>
+      ) : (
+        <OtpForm
+          email={email}
+          otpPrefix={otpPrefix}
+          onSubmit={handleVerifyOtp}
+          onResendOtp={handleResendOtp}
+        />
+      )}
+    </LoginPageTemplate>
+  )
+}

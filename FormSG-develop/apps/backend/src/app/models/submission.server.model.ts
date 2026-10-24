@@ -1,0 +1,1404 @@
+import {
+  FormAuthType,
+  MyInfoAttribute,
+  SubmissionAuthType,
+  SubmissionMetadata,
+  SubmissionType,
+  WebhookResponse,
+  WorkflowEventType,
+  WorkflowStatus,
+} from 'formsg-shared/types'
+import moment from 'moment-timezone'
+import mongoose, {
+  Cursor as QueryCursor,
+  Mongoose,
+  QueryOptions,
+  Schema,
+} from 'mongoose'
+
+import {
+  FindFormsWithSubsAboveResult,
+  IEmailSubmissionModel,
+  IEmailSubmissionSchema,
+  IEncryptedSubmissionSchema,
+  IEncryptSubmissionModel,
+  IMultirespondentSubmissionModel,
+  IMultirespondentSubmissionSchema,
+  IPaymentSchema,
+  IPopulatedWebhookSubmission,
+  ISubmissionModel,
+  ISubmissionSchema,
+  IWebhookResponseSchema,
+  MultirespondentSubmissionCursorData,
+  MultirespondentSubmissionData,
+  StorageModeSubmissionCursorData,
+  StorageModeSubmissionData,
+  SubmissionCursorData,
+  SubmissionData,
+  SubmissionWebhookInfo,
+  WebhookData,
+  WebhookView,
+} from '../../types'
+import { getPaymentWebhookEventObject } from '../modules/payments/payment.service.utils'
+import { MultirespondentSubmissionContent } from '../modules/submission/multirespondent-submission/multirespondent-submission.types'
+import { buildWebhookFormFields } from '../modules/submission/multirespondent-submission/webhook/webhook-form-fields'
+import {
+  contentFormatToWebhookVersion,
+  mrfVersionToContentFormat,
+} from '../modules/submission/multirespondent-submission/webhook/webhook-payload-policy'
+import { buildMrfMetadata } from '../modules/submission/submission.utils'
+import {
+  buildAdminSubmittedStepsMongoProjection,
+  projectSubmittedStepForWebhook,
+} from '../modules/submission/submitted-step-visibility'
+import { createQueryWithDateParam } from '../utils/date'
+
+import { FORM_SCHEMA_ID } from './form.server.model'
+import { PAYMENT_SCHEMA_ID } from './payment.server.model'
+import { USER_SCHEMA_ID } from './user.server.model'
+
+export const SUBMISSION_SCHEMA_ID = 'Submission'
+
+const webhookResponseSchema = new Schema<IWebhookResponseSchema>(
+  {
+    webhookUrl: {
+      type: String,
+      required: true,
+    },
+    signature: {
+      type: String,
+      required: true,
+    },
+    response: {
+      status: {
+        type: Number,
+        required: true,
+      },
+      headers: String,
+      data: String,
+    },
+  },
+  {
+    timestamps: {
+      createdAt: 'created',
+      updatedAt: false,
+    },
+  },
+)
+
+// Exported for use in pending submissions model
+export const SubmissionSchema = new Schema<ISubmissionSchema, ISubmissionModel>(
+  {
+    form: {
+      type: Schema.Types.ObjectId,
+      ref: FORM_SCHEMA_ID,
+      required: true,
+    },
+    authType: {
+      type: String,
+      enum: Object.values(SubmissionAuthType.enum),
+      default: FormAuthType.NIL,
+    },
+    submitterId: {
+      type: String,
+    },
+    myInfoFields: {
+      type: [
+        {
+          type: String,
+          trim: true,
+          enum: Object.values(MyInfoAttribute),
+        },
+      ],
+    },
+    myInfoReadOnlyFields: {
+      type: [String],
+      // Mongoose otherwise defaults array paths to [].
+      default: undefined,
+    },
+    submissionType: {
+      type: String,
+      enum: Object.values(SubmissionType),
+      required: true,
+    },
+    responseMetadata: {
+      responseTimeMs: {
+        type: Number,
+      },
+      numVisibleFields: {
+        type: Number,
+      },
+    },
+    webhookResponses: [webhookResponseSchema],
+  },
+  {
+    timestamps: {
+      createdAt: 'created',
+      updatedAt: 'lastModified',
+    },
+    discriminatorKey: 'submissionType',
+    read: 'secondary',
+  },
+)
+
+SubmissionSchema.index({
+  form: 1,
+  submissionType: 1,
+  created: -1,
+})
+
+// Base schema static methods
+SubmissionSchema.statics.findFormsWithSubsAbove = function (
+  minSubCount: number,
+): Promise<FindFormsWithSubsAboveResult[]> {
+  return this.aggregate<FindFormsWithSubsAboveResult>([
+    {
+      $group: {
+        _id: '$form',
+        count: { $sum: 1 },
+      },
+    },
+    {
+      $match: {
+        count: {
+          $gt: minSubCount,
+        },
+      },
+    },
+  ]).exec()
+}
+
+SubmissionSchema.statics.addWebhookResponse = function (
+  this: ISubmissionModel,
+  submissionId: string,
+  webhookResponse: WebhookResponse,
+): Promise<ISubmissionSchema | null> {
+  return this.findByIdAndUpdate(
+    submissionId,
+    { $push: { webhookResponses: webhookResponse } },
+    { new: true, setDefaultsOnInsert: true, runValidators: true },
+  ).exec()
+}
+
+SubmissionSchema.statics.retrieveWebhookInfoById = async function (
+  this: ISubmissionModel,
+  submissionId: string,
+): Promise<SubmissionWebhookInfo | null> {
+  const populatedSubmission = (await this.findById(submissionId).populate([
+    { path: 'form', select: 'webhook' },
+    { path: 'paymentId' },
+  ])) as IPopulatedWebhookSubmission | null
+  if (!populatedSubmission) return null
+  const webhookView = await populatedSubmission.getWebhookView()
+  const submittedStepSnapshotTokens = (
+    (populatedSubmission as IMultirespondentSubmissionSchema).submittedSteps ??
+    []
+  ).map((step) => step.snapshotTokens)
+
+  // RATIONALE: For payments submissions, first-step snapshots are keyed under the pending submission id.
+  // This might differ from _id after duplicate-key recovery at payment confirmation.
+  const pendingSubmissionId =
+    populatedSubmission.submissionType === SubmissionType.Multirespondent
+      ? populatedSubmission.paymentId?.pendingSubmissionId
+      : undefined
+
+  return {
+    webhookUrl: populatedSubmission.form.webhook?.url ?? '',
+    isRetryEnabled: !!populatedSubmission.form.webhook?.isRetryEnabled,
+    webhookView,
+    ...(submittedStepSnapshotTokens.length > 0
+      ? { submittedStepSnapshotTokens }
+      : {}),
+    ...(pendingSubmissionId
+      ? { pendingSubmissionId: String(pendingSubmissionId) }
+      : {}),
+  }
+}
+
+/**
+ * Creates a new email submission only if provided submitterId is unique.
+ * This method ensures that isSingleSubmission is enforced.
+ * @param submitterId uniquely identifies the submitter
+ * @returns created submission if successful, null otherwise
+ */
+SubmissionSchema.statics.saveIfSubmitterIdIsUnique = async function (
+  formId,
+  submitterId,
+  submissionContent,
+) {
+  const session = await this.startSession()
+  session.startTransaction()
+  const beforeCreateRes = await this.exists({
+    form: formId,
+    submitterId,
+  })
+    .setOptions({ readPreference: 'primary' })
+    .session(session)
+    .exec()
+  if (beforeCreateRes) {
+    await session.abortTransaction()
+    await session.endSession()
+    return null
+  }
+
+  await this.create([submissionContent], { session })
+
+  const afterCreateRes = await this.find({ form: formId, submitterId }, null, {
+    limit: 2,
+    readPreference: 'primary',
+  })
+    .session(session)
+    .exec()
+  if (afterCreateRes.length > 1) {
+    await session.abortTransaction()
+    await session.endSession()
+    return null
+  }
+
+  await session.commitTransaction()
+  await session.endSession()
+  return afterCreateRes[0]
+}
+
+SubmissionSchema.statics.findEncryptedOrMultirespondentSubmissionById =
+  function (
+    this: ISubmissionModel,
+    formId: string,
+    submissionId: string,
+  ): Promise<SubmissionData | null> {
+    // Multirespondent forms mode-migrated from storage mode retain their
+    // pre-migration encrypt submissions, so this lookup spans both types.
+    // Email submissions have no encrypted content and stay excluded.
+    return this.findOne({
+      _id: submissionId,
+      form: formId,
+      submissionType: {
+        $in: [SubmissionType.Encrypt, SubmissionType.Multirespondent],
+      },
+    })
+      .select({
+        submissionType: 1,
+        encryptedContent: 1,
+        verifiedContent: 1,
+        attachmentMetadata: 1,
+        paymentId: 1,
+        created: 1,
+        version: 1,
+        form_fields: 1,
+        form_logics: 1,
+        myInfoReadOnlyFields: 1,
+        workflow: 1,
+        submissionPublicKey: 1,
+        encryptedSubmissionSecretKey: 1,
+        workflowStep: 1,
+        mrfVersion: 1,
+        ...buildAdminSubmittedStepsMongoProjection(),
+        encryptedStepToken: 1,
+        workflowEvents: 1,
+        stoppedAt: 1,
+      })
+      .exec() as Promise<SubmissionData | null>
+  }
+
+/**
+ * Builds a metadata entry for a document of either admin-viewable submission
+ * type. Both types carry payment metadata; multirespondent docs additionally
+ * carry workflow-derived mrf metadata, so the dashboard renders encrypt docs
+ * like a multirespondent submission with no workflow (empty cells).
+ */
+const buildMixedSubmissionMetadata = (
+  result: MixedMetadataAggregateResult,
+  currentNumber: number,
+): SubmissionMetadata => {
+  if (result.submissionType === SubmissionType.Multirespondent) {
+    return buildSubmissionMetadata({
+      result,
+      currentNumber,
+      paymentMeta: result.payments?.[0],
+      mrfMeta: {
+        workflowStep: result.workflowStep ?? 0,
+        workflow: result.workflow ?? [],
+        submittedSteps: result.submittedSteps,
+        stoppedAt: result.stoppedAt,
+      },
+    })
+  }
+  return buildSubmissionMetadata({
+    result,
+    currentNumber,
+    paymentMeta: result.payments?.[0],
+  })
+}
+
+const MIXED_METADATA_MATCH_SUBMISSION_TYPES = {
+  $in: [SubmissionType.Encrypt, SubmissionType.Multirespondent],
+}
+
+const MIXED_METADATA_AGGREGATE_PROJECTION = {
+  _id: 1,
+  created: 1,
+  submissionType: 1,
+  workflowStep: 1,
+  workflow: 1,
+  submittedSteps: 1,
+  stoppedAt: 1,
+  'payments.payout': 1,
+  'payments.completedPayment': 1,
+  'payments.amount': 1,
+  'payments.email': 1,
+}
+
+SubmissionSchema.statics.findEncryptedOrMultirespondentSingleMetadata =
+  function (
+    this: ISubmissionModel,
+    formId: string,
+    submissionId: string,
+  ): Promise<SubmissionMetadata | null> {
+    const pageResults: Promise<MixedMetadataAggregateResult[]> = this.aggregate(
+      [
+        {
+          $match: {
+            submissionType: MIXED_METADATA_MATCH_SUBMISSION_TYPES,
+            form: new mongoose.Types.ObjectId(formId),
+            _id: new mongoose.Types.ObjectId(submissionId),
+          },
+        },
+        { $limit: 1 },
+        {
+          $lookup: {
+            from: 'payments',
+            localField: 'paymentId',
+            foreignField: '_id',
+            as: 'payments',
+          },
+        },
+        { $project: MIXED_METADATA_AGGREGATE_PROJECTION },
+      ],
+    ).exec()
+
+    return Promise.resolve(pageResults).then((results) => {
+      if (!results || results.length <= 0) {
+        return null
+      }
+      return buildMixedSubmissionMetadata(results[0], 1)
+    })
+  }
+
+SubmissionSchema.statics.findAllEncryptedOrMultirespondentMetadataByFormId =
+  function (
+    this: ISubmissionModel,
+    formId: string,
+    {
+      page = 1,
+      pageSize = 10,
+      startDate,
+      endDate,
+    }: {
+      page?: number
+      pageSize?: number
+      startDate?: string
+      endDate?: string
+    } = {},
+  ): Promise<{
+    metadata: SubmissionMetadata[]
+    count: number
+  }> {
+    const numToSkip = (page - 1) * pageSize
+    // Multirespondent forms mode-migrated from storage mode retain their
+    // pre-migration encrypt submissions; the page and the count must both
+    // span the same two submission types so rows and totals agree. Email
+    // submissions stay excluded from both. The date range must match the
+    // decrypted responses stream, or rows outside it render with no answers.
+    const match = {
+      submissionType: MIXED_METADATA_MATCH_SUBMISSION_TYPES,
+      form: new mongoose.Types.ObjectId(formId),
+      ...createQueryWithDateParam(startDate, endDate),
+    }
+    const pageResults: Promise<MixedMetadataAggregateResult[]> = this.aggregate(
+      [
+        { $match: match },
+        { $sort: { created: -1 } },
+        { $skip: numToSkip },
+        { $limit: pageSize },
+        {
+          $lookup: {
+            from: 'payments',
+            localField: 'paymentId',
+            foreignField: '_id',
+            as: 'payments',
+          },
+        },
+        { $project: MIXED_METADATA_AGGREGATE_PROJECTION },
+      ],
+    ).exec()
+
+    const count = this.countDocuments(match).exec() ?? 0
+
+    return Promise.all([pageResults, count]).then(([results, count]) => {
+      let currentNumber = count - numToSkip
+
+      const metadata = results.map((result) => {
+        const metadataEntry = buildMixedSubmissionMetadata(
+          result,
+          currentNumber,
+        )
+        currentNumber--
+        return metadataEntry
+      })
+
+      return {
+        metadata,
+        count,
+      }
+    })
+  }
+
+SubmissionSchema.statics.getEncryptedOrMultirespondentSubmissionCursorByFormId =
+  function (
+    this: ISubmissionModel,
+    formId: string,
+    dateRange: {
+      startDate?: string
+      endDate?: string
+    } = {},
+    isSortByLatest = false,
+    limit?: number,
+  ): QueryCursor<SubmissionCursorData, QueryOptions<ISubmissionSchema>> {
+    // Multirespondent forms mode-migrated from storage mode retain their
+    // pre-migration encrypt submissions, so the stream must span both types
+    // in one cursor to keep sort order and completeness. Email submissions
+    // have no encrypted content and stay excluded.
+    const streamQuery = {
+      form: formId,
+      submissionType: {
+        $in: [SubmissionType.Encrypt, SubmissionType.Multirespondent],
+      },
+      ...createQueryWithDateParam(dateRange?.startDate, dateRange?.endDate),
+    }
+    let query = this.find(streamQuery).select({
+      submissionType: 1,
+      encryptedContent: 1,
+      verifiedContent: 1,
+      attachmentMetadata: 1,
+      // Payment references appear on pre-migration encrypt submissions and
+      // on payment-enabled (zero-step) multirespondent submissions alike.
+      paymentId: 1,
+      created: 1,
+      version: 1,
+      form_fields: 1,
+      form_logics: 1,
+      myInfoReadOnlyFields: 1,
+      workflow: 1,
+      workflowStep: 1,
+      ...buildAdminSubmittedStepsMongoProjection(),
+      stoppedAt: 1,
+      encryptedSubmissionSecretKey: 1,
+      mrfVersion: 1,
+      id: 1,
+    })
+    if (isSortByLatest) {
+      query = query.sort({ created: -1 })
+    }
+    if (limit && limit > 0 && Number.isSafeInteger(limit)) {
+      query = query.limit(limit)
+    }
+    return (
+      query
+        .batchSize(2000)
+        .read('secondary')
+        .lean()
+        // Override typing: Map is converted to Object once passed through
+        // `lean()`, and the base model's document type does not carry the
+        // per-discriminator fields the union projection selects.
+        .cursor() as unknown as QueryCursor<
+        SubmissionCursorData,
+        QueryOptions<ISubmissionSchema>
+      >
+    )
+  }
+
+// Exported for use in pending submissions model
+export const EmailSubmissionSchema = new Schema<IEmailSubmissionSchema>({
+  recipientEmails: {
+    type: [
+      {
+        type: String,
+        trim: true,
+      },
+    ],
+  },
+  responseHash: {
+    type: String,
+    trim: true,
+    required: true,
+  },
+  responseSalt: {
+    type: String,
+    trim: true,
+    required: true,
+  },
+  hasBounced: {
+    type: Boolean,
+    default: false,
+  },
+})
+
+// EmailSubmission Instance methods
+/**
+ * Returns null as email submission does not have a webhook view
+ */
+EmailSubmissionSchema.methods.getWebhookView = function (): Promise<null> {
+  return Promise.resolve(null)
+}
+
+// Exported for use in pending submissions model
+export const EncryptSubmissionSchema = new Schema<
+  IEncryptedSubmissionSchema,
+  IEncryptSubmissionModel
+>({
+  encryptedContent: {
+    type: String,
+    trim: true,
+    required: true,
+  },
+  verifiedContent: {
+    type: String,
+    trim: true,
+  },
+  attachmentMetadata: {
+    type: Map,
+    of: String,
+  },
+  version: {
+    type: Number,
+    required: true,
+  },
+  paymentId: {
+    type: Schema.Types.ObjectId,
+    // Defer loading of the ref due to circular dependency on schema IDs.
+    ref: () => PAYMENT_SCHEMA_ID,
+  },
+})
+
+/**
+ * Returns an object which represents the encrypted submission
+ * which will be posted to the webhook URL.
+ */
+EncryptSubmissionSchema.methods.getWebhookView = async function (
+  this: IEncryptedSubmissionSchema | IPopulatedWebhookSubmission,
+): Promise<WebhookView> {
+  const formId = this.populated('form')
+    ? String((this as IPopulatedWebhookSubmission).form._id)
+    : String(this.form)
+  const attachmentRecords = Object.fromEntries(
+    this.attachmentMetadata ?? new Map(),
+  )
+
+  if (this.paymentId) {
+    await (this as IEncryptedSubmissionSchema).populate('paymentId')
+  }
+  const paymentContent = this.populated('paymentId')
+    ? getPaymentWebhookEventObject(this.paymentId)
+    : {}
+
+  const webhookData: WebhookData = {
+    formId,
+    submissionId: String(this._id),
+    encryptedContent: this.encryptedContent,
+    verifiedContent: this.verifiedContent,
+    version: this.version,
+    created: this.created,
+    attachmentDownloadUrls: attachmentRecords,
+    paymentContent,
+  }
+
+  return {
+    data: webhookData,
+  }
+}
+
+EncryptSubmissionSchema.statics.findSingleMetadata = function (
+  formId: string,
+  submissionId: string,
+): Promise<SubmissionMetadata | null> {
+  const pageResults: Promise<MetadataAggregateResult[]> = this.aggregate([
+    {
+      $match: {
+        submissionType: SubmissionType.Encrypt,
+        form: new mongoose.Types.ObjectId(formId),
+        _id: new mongoose.Types.ObjectId(submissionId),
+      },
+    },
+    { $limit: 1 },
+    {
+      $lookup: {
+        from: 'payments',
+        localField: 'paymentId',
+        foreignField: '_id',
+        as: 'payments',
+      },
+    },
+    {
+      $project: {
+        _id: 1,
+        created: 1,
+        'payments.payout': 1,
+        'payments.completedPayment': 1,
+        'payments.amount': 1,
+        'payments.email': 1,
+      },
+    },
+  ]).exec()
+
+  return Promise.resolve(pageResults).then((results) => {
+    if (!results || results.length <= 0) {
+      return null
+    }
+
+    const result = results[0]
+    const paymentMeta = result.payments?.[0]
+
+    // Build submissionMetadata object.
+    const metadata = buildSubmissionMetadata({
+      result,
+      currentNumber: 1,
+      paymentMeta,
+    })
+
+    return metadata
+  })
+}
+
+/**
+ * Unexported as the type is only used in {@see findAllMetadataByFormId} for
+ * now.
+ */
+type MetadataAggregateResult = Pick<ISubmissionSchema, '_id' | 'created'> & {
+  payments?: PaymentAggregates[]
+}
+type PaymentAggregates = Pick<
+  IPaymentSchema,
+  'amount' | 'payout' | 'completedPayment' | 'email'
+>
+
+EncryptSubmissionSchema.statics.findAllMetadataByFormId = function (
+  formId: string,
+  {
+    page = 1,
+    pageSize = 10,
+    startDate,
+    endDate,
+  }: {
+    page?: number
+    pageSize?: number
+    startDate?: string
+    endDate?: string
+  } = {},
+): Promise<{
+  metadata: SubmissionMetadata[]
+  count: number
+}> {
+  const numToSkip = (page - 1) * pageSize
+  const dateQuery = createQueryWithDateParam(startDate, endDate)
+  // return documents within the page
+  const pageResults: Promise<MetadataAggregateResult[]> = this.aggregate([
+    { $match: { form: new mongoose.Types.ObjectId(formId), ...dateQuery } },
+    { $sort: { created: -1 } },
+    { $skip: numToSkip },
+    { $limit: pageSize },
+    {
+      $lookup: {
+        from: 'payments',
+        localField: 'paymentId',
+        foreignField: '_id',
+        as: 'payments',
+      },
+    },
+    {
+      $project: {
+        _id: 1,
+        created: 1,
+        'payments.payout': 1,
+        'payments.completedPayment': 1,
+        'payments.amount': 1,
+        'payments.email': 1,
+      },
+    },
+  ]).exec()
+
+  const count =
+    this.countDocuments({
+      form: new mongoose.Types.ObjectId(formId),
+      submissionType: SubmissionType.Encrypt,
+      ...dateQuery,
+    }).exec() ?? 0
+
+  return Promise.all([pageResults, count]).then(([results, count]) => {
+    let currentNumber = count - numToSkip
+
+    const metadata = results.map((result) => {
+      const paymentMeta = result.payments?.[0]
+      const metadataEntry = buildSubmissionMetadata({
+        result,
+        currentNumber,
+        paymentMeta,
+      })
+
+      currentNumber--
+      return metadataEntry
+    })
+
+    return {
+      metadata,
+      count,
+    }
+  })
+}
+
+EncryptSubmissionSchema.statics.getSubmissionCursorByFormId = function (
+  formId: string,
+  dateRange: {
+    startDate?: string
+    endDate?: string
+  } = {},
+  isSortByLatest = false,
+  limit?: number,
+): QueryCursor<
+  StorageModeSubmissionCursorData,
+  QueryOptions<IEncryptedSubmissionSchema>
+> {
+  const streamQuery = {
+    form: formId,
+    ...createQueryWithDateParam(dateRange?.startDate, dateRange?.endDate),
+  }
+  let query = this.find(streamQuery).select({
+    submissionType: 1,
+    encryptedContent: 1,
+    verifiedContent: 1,
+    attachmentMetadata: 1,
+    paymentId: 1,
+    created: 1,
+    version: 1,
+    id: 1,
+  })
+  if (isSortByLatest) {
+    query = query.sort({ created: -1 })
+  }
+  if (limit && limit > 0 && Number.isSafeInteger(limit)) {
+    query = query.limit(limit)
+  }
+  return (
+    query
+      .batchSize(2000)
+      .read('secondary')
+      .lean()
+      // Override typing as Map is converted to Object once passed through `lean()`.
+      .cursor() as QueryCursor<
+      StorageModeSubmissionCursorData,
+      QueryOptions<IEncryptedSubmissionSchema>
+    >
+  )
+}
+
+EncryptSubmissionSchema.statics.findEncryptedSubmissionById = function (
+  formId: string,
+  submissionId: string,
+): Promise<StorageModeSubmissionData | null> {
+  return this.findOne({
+    _id: submissionId,
+    form: formId,
+    submissionType: SubmissionType.Encrypt,
+  })
+    .select({
+      submissionType: 1,
+      encryptedContent: 1,
+      verifiedContent: 1,
+      attachmentMetadata: 1,
+      paymentId: 1,
+      created: 1,
+      version: 1,
+    })
+    .exec()
+}
+
+const submittedStepSchema = new Schema(
+  {
+    isApproval: {
+      type: Boolean,
+      required: true,
+    },
+    submittedAt: {
+      type: String,
+      required: true,
+    },
+    nextStepRecipientEmails: {
+      type: [String],
+    },
+    submitterId: {
+      type: String,
+    },
+    status: {
+      type: String,
+      enum: [WorkflowStatus.APPROVED, WorkflowStatus.REJECTED],
+    },
+    snapshotTokens: {
+      v4: {
+        type: String,
+      },
+      v1: {
+        type: String,
+      },
+    },
+  },
+  { _id: false },
+)
+
+const workflowEventSchema = new Schema(
+  {
+    type: {
+      type: String,
+      enum: Object.values(WorkflowEventType),
+      required: true,
+    },
+    actorId: {
+      type: Schema.Types.ObjectId,
+      ref: USER_SCHEMA_ID,
+      required: true,
+    },
+    actorEmail: {
+      type: String,
+      required: true,
+    },
+    stepNumber: {
+      type: Number,
+      min: 1,
+      required: true,
+    },
+    emails: {
+      type: [String],
+      default: [],
+    },
+    created: {
+      type: Date,
+      required: true,
+    },
+  },
+  { _id: false },
+)
+
+export const MultirespondentSubmissionSchema = new Schema<
+  IMultirespondentSubmissionSchema,
+  IMultirespondentSubmissionModel
+>({
+  //TODO(MRF/FRM-1592): Clean this up
+  form_fields: [],
+  form_logics: [],
+  workflow: [],
+
+  submissionPublicKey: {
+    type: String,
+    trim: true,
+    required: true,
+  },
+  encryptedSubmissionSecretKey: {
+    type: String,
+    trim: true,
+    required: true,
+  },
+  encryptedContent: {
+    type: String,
+    trim: true,
+    required: true,
+  },
+  verifiedContent: {
+    type: String,
+    trim: true,
+  },
+  attachmentMetadata: {
+    type: Map,
+    of: String,
+  },
+  version: {
+    type: Number,
+    required: true,
+  },
+  workflowStep: {
+    type: Number,
+    required: true,
+  },
+  mrfVersion: {
+    type: Number,
+  },
+  submittedSteps: {
+    type: [submittedStepSchema],
+    default: [],
+  },
+  stepTokenHash: {
+    type: String,
+    trim: true,
+  },
+  encryptedStepToken: {
+    type: String,
+    trim: true,
+  },
+  paymentId: {
+    type: Schema.Types.ObjectId,
+    // Defer loading of the ref due to circular dependency on schema IDs.
+    ref: () => PAYMENT_SCHEMA_ID,
+  },
+  // RATIONALE: admin actions live on the submission so that an action and its
+  // log entry are written in one conditional update. Only ever $push to this
+  // array; assigning it from a loaded document and saving drops newer events.
+  workflowEvents: {
+    type: [workflowEventSchema],
+    default: undefined,
+  },
+  stoppedAt: {
+    type: Date,
+  },
+  stoppedBy: {
+    type: Schema.Types.ObjectId,
+    ref: USER_SCHEMA_ID,
+  },
+})
+
+type MultiRespondentAggregates = Pick<
+  IMultirespondentSubmissionSchema,
+  'workflowStep' | 'workflow' | 'submittedSteps' | 'stoppedAt'
+>
+type MultiRespondentAggregateResult = MetadataAggregateResult &
+  MultiRespondentAggregates
+
+/**
+ * Aggregate row spanning both admin-viewable submission types: the
+ * multirespondent fields are absent on encrypt documents.
+ */
+type MixedMetadataAggregateResult = MetadataAggregateResult &
+  Partial<MultiRespondentAggregates> & {
+    submissionType: SubmissionType
+  }
+
+/**
+ * Returns an object which represents the encrypted submission
+ * which will be posted to the webhook URL.
+ */
+MultirespondentSubmissionSchema.methods.getWebhookView = async function (
+  this: IMultirespondentSubmissionSchema,
+): Promise<WebhookView> {
+  const contentFormat = mrfVersionToContentFormat(this.mrfVersion)
+  const formId = this.populated('form')
+    ? String((this as IMultirespondentSubmissionSchema).form._id)
+    : String(this.form)
+  const attachmentRecords = Object.fromEntries(
+    this.attachmentMetadata ?? new Map(),
+  )
+
+  if (this.paymentId) {
+    await (this as IMultirespondentSubmissionSchema).populate('paymentId')
+  }
+  const paymentContent = this.populated('paymentId')
+    ? getPaymentWebhookEventObject(this.paymentId)
+    : {}
+
+  const webhookData: WebhookData = {
+    formId,
+    submissionId: String(this._id),
+    encryptedContent: this.encryptedContent,
+    encryptedSubmissionSecretKey: this.encryptedSubmissionSecretKey,
+    ...(contentFormat === 'v4'
+      ? {
+          formFields: buildWebhookFormFields(this.form_fields),
+        }
+      : {}),
+    verifiedContent: this.verifiedContent,
+    version: contentFormatToWebhookVersion(contentFormat),
+    created: this.created,
+    attachmentDownloadUrls: attachmentRecords,
+    paymentContent,
+    workflowContent: {
+      workflow: this.workflow,
+      workflowStep: this.workflowStep,
+      submittedSteps: (this.submittedSteps ?? []).map(
+        projectSubmittedStepForWebhook,
+      ),
+    },
+  }
+
+  return {
+    data: webhookData,
+  }
+}
+
+MultirespondentSubmissionSchema.statics.saveIfSubmitterIdIsUnique =
+  async function (
+    formId: string,
+    submitterId: string,
+    zeroIndexedStepNumber: number,
+    submissionContent: MultirespondentSubmissionContent,
+  ): Promise<
+    (IMultirespondentSubmissionSchema & { _id: mongoose.Types.ObjectId }) | null
+  > {
+    const submitterIdKey = `submittedSteps.${zeroIndexedStepNumber}.submitterId`
+    const session = await this.startSession()
+    session.startTransaction()
+    const beforeCreateRes = await this.exists({
+      form: formId,
+      submissionType: SubmissionType.Multirespondent,
+      [submitterIdKey]: submitterId,
+    })
+      .setOptions({ readPreference: 'primary' })
+      .session(session)
+      .exec()
+
+    if (beforeCreateRes) {
+      await session.abortTransaction()
+      await session.endSession()
+      return null
+    }
+
+    await this.create([submissionContent], { session })
+
+    const afterCreateRes = await this.find(
+      {
+        form: formId,
+        submissionType: SubmissionType.Multirespondent,
+        [submitterIdKey]: submitterId,
+      },
+      null,
+      {
+        limit: 2,
+        readPreference: 'primary',
+      },
+    )
+      .session(session)
+      .exec()
+    if (afterCreateRes.length != 1) {
+      await session.abortTransaction()
+      await session.endSession()
+      return null
+    }
+
+    await session.commitTransaction()
+    await session.endSession()
+    return afterCreateRes[0]
+  }
+
+MultirespondentSubmissionSchema.statics.findSingleMetadata = function (
+  formId: string,
+  submissionId: string,
+): Promise<SubmissionMetadata | null> {
+  const pageResults: Promise<MultiRespondentAggregateResult[]> = this.aggregate(
+    [
+      {
+        $match: {
+          submissionType: SubmissionType.Multirespondent,
+          form: new mongoose.Types.ObjectId(formId),
+          _id: new mongoose.Types.ObjectId(submissionId),
+        },
+      },
+      { $limit: 1 },
+      {
+        $lookup: {
+          from: 'payments',
+          localField: 'paymentId',
+          foreignField: '_id',
+          as: 'payments',
+        },
+      },
+    ],
+  ).exec()
+
+  return Promise.resolve(pageResults).then((results) => {
+    if (!results || results.length <= 0) {
+      return null
+    }
+
+    const result = results[0]
+    const paymentMeta = result.payments?.[0]
+    const mrfMeta = {
+      workflowStep: result.workflowStep,
+      workflow: result.workflow,
+      submittedSteps: result.submittedSteps,
+      stoppedAt: result.stoppedAt,
+    }
+    // Build submissionMetadata object.
+    const metadata = buildSubmissionMetadata({
+      result,
+      currentNumber: 1,
+      paymentMeta,
+      mrfMeta,
+    })
+
+    return metadata
+  })
+}
+
+MultirespondentSubmissionSchema.statics.findAllMetadataByFormId = function (
+  formId: string,
+  {
+    page = 1,
+    pageSize = 10,
+    startDate,
+    endDate,
+  }: {
+    page?: number
+    pageSize?: number
+    startDate?: string
+    endDate?: string
+  } = {},
+): Promise<{
+  metadata: SubmissionMetadata[]
+  count: number
+}> {
+  const numToSkip = (page - 1) * pageSize
+  const dateQuery = createQueryWithDateParam(startDate, endDate)
+  // return documents within the page
+  const pageResults: Promise<MultiRespondentAggregateResult[]> = this.aggregate(
+    [
+      { $match: { form: new mongoose.Types.ObjectId(formId), ...dateQuery } },
+      { $sort: { created: -1 } },
+      { $skip: numToSkip },
+      { $limit: pageSize },
+      {
+        $lookup: {
+          from: 'payments',
+          localField: 'paymentId',
+          foreignField: '_id',
+          as: 'payments',
+        },
+      },
+      {
+        $project: {
+          _id: 1,
+          created: 1,
+          workflowStep: 1,
+          workflow: 1,
+          submittedSteps: 1,
+          stoppedAt: 1,
+          'payments.payout': 1,
+          'payments.completedPayment': 1,
+          'payments.amount': 1,
+          'payments.email': 1,
+        },
+      },
+    ],
+  ).exec()
+
+  const count =
+    this.countDocuments({
+      form: new mongoose.Types.ObjectId(formId),
+      submissionType: SubmissionType.Multirespondent,
+      ...dateQuery,
+    }).exec() ?? 0
+
+  return Promise.all([pageResults, count]).then(([results, count]) => {
+    let currentNumber = count - numToSkip
+
+    const metadata = results.map((result) => {
+      const paymentMeta = result.payments?.[0]
+      const mrfMeta = {
+        workflowStep: result.workflowStep,
+        workflow: result.workflow,
+        submittedSteps: result.submittedSteps,
+        stoppedAt: result.stoppedAt,
+      }
+      const metadataEntry = buildSubmissionMetadata({
+        result,
+        currentNumber,
+        paymentMeta,
+        mrfMeta,
+      })
+
+      currentNumber--
+      return metadataEntry
+    })
+
+    return {
+      metadata,
+      count,
+    }
+  })
+}
+
+MultirespondentSubmissionSchema.statics.getSubmissionCursorByFormId = function (
+  formId: string,
+  dateRange: {
+    startDate?: string
+    endDate?: string
+  } = {},
+  isSortByLatest = false,
+  limit?: number,
+): QueryCursor<
+  MultirespondentSubmissionCursorData,
+  QueryOptions<IEncryptedSubmissionSchema>
+> {
+  const streamQuery = {
+    form: formId,
+    ...createQueryWithDateParam(dateRange?.startDate, dateRange?.endDate),
+  }
+  let query = this.find(streamQuery).select({
+    submissionType: 1,
+    form_fields: 1,
+    form_logics: 1,
+    myInfoReadOnlyFields: 1,
+    workflow: 1,
+    workflowStep: 1,
+    ...buildAdminSubmittedStepsMongoProjection(),
+    stoppedAt: 1,
+    encryptedSubmissionSecretKey: 1,
+    encryptedContent: 1,
+    verifiedContent: 1,
+    attachmentMetadata: 1,
+    paymentId: 1,
+    created: 1,
+    version: 1,
+    mrfVersion: 1,
+    id: 1,
+  })
+  if (isSortByLatest) {
+    query = query.sort({ created: -1 })
+  }
+  if (limit && limit > 0 && Number.isSafeInteger(limit)) {
+    query = query.limit(limit)
+  }
+  return (
+    query
+      .batchSize(2000)
+      .read('secondary')
+      .lean()
+      // Override typing as Map is converted to Object once passed through `lean()`.
+      .cursor() as QueryCursor<
+      MultirespondentSubmissionCursorData,
+      QueryOptions<IEncryptedSubmissionSchema>
+    >
+  )
+}
+
+MultirespondentSubmissionSchema.statics.findEncryptedSubmissionById = function (
+  formId: string,
+  submissionId: string,
+): Promise<MultirespondentSubmissionData | null> {
+  return this.findOne({
+    _id: submissionId,
+    form: formId,
+    submissionType: SubmissionType.Multirespondent,
+  })
+    .select({
+      submissionType: 1,
+      form_fields: 1,
+      form_logics: 1,
+      myInfoReadOnlyFields: 1,
+      workflow: 1,
+      submissionPublicKey: 1,
+      encryptedSubmissionSecretKey: 1,
+      encryptedContent: 1,
+      verifiedContent: 1,
+      attachmentMetadata: 1,
+      paymentId: 1,
+      created: 1,
+      version: 1,
+      workflowStep: 1,
+      mrfVersion: 1,
+      ...buildAdminSubmittedStepsMongoProjection(),
+      encryptedStepToken: 1,
+      workflowEvents: 1,
+      stoppedAt: 1,
+    })
+    .exec()
+}
+
+const compileSubmissionModel = (db: Mongoose): ISubmissionModel => {
+  const Submission = db.model<ISubmissionSchema, ISubmissionModel>(
+    SUBMISSION_SCHEMA_ID,
+    SubmissionSchema,
+  )
+  Submission.discriminator(SubmissionType.Email, EmailSubmissionSchema)
+  Submission.discriminator(SubmissionType.Encrypt, EncryptSubmissionSchema)
+  Submission.discriminator(
+    SubmissionType.Multirespondent,
+    MultirespondentSubmissionSchema,
+  )
+  return db.model<ISubmissionSchema, ISubmissionModel>(
+    SUBMISSION_SCHEMA_ID,
+    SubmissionSchema,
+  )
+}
+
+const getSubmissionModel = (db: Mongoose): ISubmissionModel => {
+  try {
+    return db.model<ISubmissionSchema, ISubmissionModel>(SUBMISSION_SCHEMA_ID)
+  } catch {
+    return compileSubmissionModel(db)
+  }
+}
+
+export const getEmailSubmissionModel = (
+  db: Mongoose,
+): IEmailSubmissionModel => {
+  getSubmissionModel(db)
+  return db.model<IEmailSubmissionSchema, IEmailSubmissionModel>(
+    SubmissionType.Email,
+  )
+}
+
+export const getEncryptSubmissionModel = (
+  db: Mongoose,
+): IEncryptSubmissionModel => {
+  getSubmissionModel(db)
+  return db.model<IEncryptedSubmissionSchema, IEncryptSubmissionModel>(
+    SubmissionType.Encrypt,
+  )
+}
+
+export const getMultirespondentSubmissionModel = (
+  db: Mongoose,
+): IMultirespondentSubmissionModel => {
+  getSubmissionModel(db)
+  return db.model<
+    IMultirespondentSubmissionSchema,
+    IMultirespondentSubmissionModel
+  >(SubmissionType.Multirespondent)
+}
+
+const buildSubmissionMetadata = ({
+  result,
+  currentNumber,
+  paymentMeta,
+  mrfMeta,
+}: {
+  result: MetadataAggregateResult
+  currentNumber: number
+  paymentMeta?: PaymentAggregates
+  mrfMeta?: MultiRespondentAggregates
+}): SubmissionMetadata => {
+  return {
+    number: currentNumber,
+    refNo: result._id,
+    submissionTime: moment(result.created)
+      .tz('Asia/Singapore')
+      .format('Do MMM YYYY, h:mm:ss a'),
+    payments: paymentMeta
+      ? {
+          payoutDate: paymentMeta.payout
+            ? moment(paymentMeta.payout.payoutDate)
+                .tz('Asia/Singapore')
+                .format('ddd, D MMM YYYY')
+            : null,
+
+          paymentAmt: paymentMeta.amount,
+          transactionFee: paymentMeta.completedPayment?.transactionFee ?? null,
+          email: paymentMeta.email,
+        }
+      : null,
+    mrf: mrfMeta
+      ? buildMrfMetadata({
+          workflow: mrfMeta.workflow,
+          workflowStep: mrfMeta.workflowStep,
+          submittedSteps: mrfMeta.submittedSteps,
+          stoppedAt: mrfMeta.stoppedAt,
+        })
+      : undefined,
+  }
+}
+
+export default getSubmissionModel

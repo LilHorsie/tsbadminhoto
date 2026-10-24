@@ -1,0 +1,308 @@
+name: Deploy to AWS ECS
+on:
+  workflow_call:
+    inputs:
+      gha-environment:
+        description: 'GitHub Actions environment for pulling the appropriate environment variables/secrets'
+        required: true
+        type: string
+      environment:
+        description: 'Deployment environment'
+        required: true
+        type: string
+      environment-site-name:
+        description: 'Deployment environment site name'
+        required: true
+        type: string # stg, stg-alt, stg-alt2, stg-alt3, prod, uat
+      ecs-cpu:
+        description: 'ECS CPU units to use'
+        required: true
+        type: number
+      ecs-memory:
+        description: 'ECS memory to use'
+        required: true
+        type: number
+      aws-region:
+        description: 'AWS region to use'
+        required: true
+        default: 'ap-southeast-1'
+        type: string
+      ecs-cluster-name:
+        description: 'ECS cluster to deploy to'
+        required: true
+        type: string
+      ecs-task-definition:
+        description: 'ECS task definition to use'
+        required: true
+        type: string
+      ecs-task-definition-path:
+        description: 'ECS task definition path'
+        default: 'ecs-task-definition.json'
+        type: string
+      ecs-service-name:
+        description: 'ECS service to deploy to'
+        required: true
+        type: string
+      ecs-container-name:
+        description: 'Name of container in ECS task definition'
+        required: true
+        type: string
+      codedeploy-application:
+        description: 'CodeDeploy application to use'
+        required: true
+        type: string
+      codedeploy-appspec-path:
+        description: 'CodeDeploy appspec.json/yml file path'
+        default: 'appspec.json'
+        type: string
+      codedeploy-deployment-group:
+        description: 'CodeDeploy deployment group to use'
+        required: true
+        type: string
+      app-version:
+        description: 'Version of the app'
+        required: true
+        type: string
+      app-url:
+        description: 'app url for the frontend'
+        required: true
+        type: string
+      react-app-form-sg-sdk-mode:
+        description: 'FormSG SDK mode'
+        required: true
+        type: string
+      formsg-app-reserved-cpu:
+        description: 'FormSG app reserved CPU units'
+        required: true
+        type: number
+      dd-env:
+        description: 'Datadog environment'
+        required: true
+        type: string
+      ecr-repository:
+        description: 'ECR repository to push image to'
+        required: true
+        type: string
+      ref:
+        description: 'Git ref (tag/branch/SHA) to check out and deploy. Empty falls back to the ref that triggered the run (used by the branch-triggered stg-alt/uat callers).'
+        required: false
+        default: ''
+        type: string
+
+    secrets:
+      cicd-role:
+        description: 'AWS IAM role to assume by GitHub action runner'
+        required: true
+      aws-account-id:
+        description: 'AWS account ID to use'
+        required: true
+      ga-tracking-id:
+        description: 'Google Analytics tracking ID'
+        required: true
+      dd-rum-app-id:
+        description: 'Datadog RUM app ID'
+        required: true
+      dd-rum-client-token:
+        description: 'Datadog RUM client token'
+        required: true
+      dd-sample-rate:
+        description: 'Datadog sample rate'
+        required: true
+      DD_API_KEY:
+        description: 'Datadog API key'
+        required: true
+      S3_STATIC_ASSETS_BUCKET_NAME:
+        description: 'S3 domain style bucket name for static assets'
+        required: true
+
+concurrency:
+  group: deploy-${{ inputs.environment-site-name }}
+  cancel-in-progress: false
+
+# used to configure IAM to trust Github's OIDC provider
+permissions:
+  id-token: write
+  contents: read
+  packages: write
+
+jobs:
+  ensure-base-images:
+    name: Ensure base images
+    uses: ./.github/workflows/build-base-images.yml
+    permissions:
+      contents: read
+      packages: write
+
+  deploy:
+    name: Deploy to ECS
+    needs: ensure-base-images
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.gha-environment }}
+    env:
+      IMAGE_TAG: github-actions-${{ github.sha }}-${{ github.run_id }}-${{  github.run_attempt  }}
+    steps:
+      - name: Checkout branch source code into runner environment
+        # Required for the frontend build env vars
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          # When called from the release workflow this is the new vX.Y.Z tag; for
+          # the branch-triggered stg-alt/uat callers inputs.ref is empty and we
+          # fall back to the ref that triggered the run.
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 1
+
+      - name: Setup secrets for datadog sourcemap deployment
+        # Derive the version label from the checked-out ref/commit, not the run's
+        # GITHUB_REF/GITHUB_SHA which point at the caller (develop) when the
+        # release workflow drives this deploy.
+        env:
+          REF_NAME: ${{ inputs.ref || github.ref_name }}
+        run: |
+          echo "APP_VERSION=$(jq -r .version package.json)-${REF_NAME}-$(git rev-parse HEAD | cut -c1-8)" >> "$GITHUB_ENV"
+
+      - name: Grant runner AWS credentials
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        with:
+          role-to-assume: ${{ secrets.cicd-role }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check for pre-built release image
+        id: check-release-image
+        run: |
+          VERSION="v$(jq -r .version package.json)"
+          IMAGE="ghcr.io/opengovsg/formsg:release-${VERSION}"
+          CURRENT_SHA="$(git rev-parse HEAD)"
+          TAG_SHA="$(git rev-list -n 1 "$VERSION" 2>/dev/null || true)"
+
+          if [ -z "$TAG_SHA" ]; then
+            echo "image=" >> "$GITHUB_OUTPUT"
+            echo "Release tag ${VERSION} not found locally; will build from scratch"
+            exit 0
+          fi
+          if [ "$CURRENT_SHA" != "$TAG_SHA" ]; then
+            echo "image=" >> "$GITHUB_OUTPUT"
+            echo "Current commit ${CURRENT_SHA} does not match release tag ${VERSION} commit (${TAG_SHA}); will build from scratch"
+            exit 0
+          fi
+          echo "Looking for pre-built release image: $IMAGE"
+          if docker manifest inspect "$IMAGE" > /dev/null 2>&1; then
+            echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+            echo "Found pre-built release image for tagged commit, will skip Docker build"
+          else
+            echo "image=" >> "$GITHUB_OUTPUT"
+            echo "No pre-built release image found for tagged commit, will build from scratch"
+          fi
+
+      - name: Copy pre-built image to ECR
+        if: steps.check-release-image.outputs.image != ''
+        env:
+          ECR_REPOSITORY: ${{ inputs.ecr-repository }}
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          SRC_IMAGE: ${{ steps.check-release-image.outputs.image }}
+        run: |
+          # Registry-to-registry copy: crane streams the manifest and blobs from
+          # GHCR straight to ECR without pulling the whole image onto the runner,
+          # which is far faster than docker pull + tag + push. crane authenticates
+          # from the ~/.docker/config.json entries the ECR and GHCR login steps
+          # above already wrote.
+          CRANE_VERSION=0.21.7
+          curl -fsSL "https://github.com/google/go-containerregistry/releases/download/v${CRANE_VERSION}/go-containerregistry_Linux_x86_64.tar.gz" \
+            | tar -xzf - -C /usr/local/bin crane
+          chmod +x /usr/local/bin/crane
+          crane copy "$SRC_IMAGE" "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+
+      - name: Set up Docker Buildx
+        if: steps.check-release-image.outputs.image == ''
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - name: Build and push Docker image
+        if: steps.check-release-image.outputs.image == ''
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        env:
+          ECR_REPOSITORY: ${{ inputs.ecr-repository }}
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        with:
+          context: .
+          file: Dockerfile.production
+          push: true
+          load: true
+          tags: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
+          build-args: |
+            BUILD_BASE_IMAGE=${{ needs.ensure-base-images.outputs.build-base-image }}
+            RUNTIME_BASE_IMAGE=${{ needs.ensure-base-images.outputs.runtime-base-image }}
+            APP_VERSION=${{ env.APP_VERSION }}
+            DD_RUM_APP_ID=${{ secrets.dd-rum-app-id }}
+            DD_RUM_CLIENT_TOKEN=${{ secrets.dd-rum-client-token }}
+            DD_SAMPLE_RATE=${{ secrets.dd-sample-rate }}
+            GA_TRACKING_ID=${{ secrets.ga-tracking-id }}
+
+      - name: Replace variables in task definition file
+        id: replace-variables
+        run: |
+          sed -i "s/<AWS_ACCOUNT_ID>/${{ secrets.aws-account-id }}/g" ${{ inputs.ecs-task-definition-path }}
+          sed -i 's/<DD_ENV>/${{ inputs.dd-env }}/g' ${{ inputs.ecs-task-definition-path }}
+          sed -i 's/<FORMSG_APP_RESERVED_CPU>/${{ inputs.formsg-app-reserved-cpu }}/g' ${{ inputs.ecs-task-definition-path }}
+          sed -i 's/<CPU>/${{ inputs.ecs-cpu }}/g' ${{ inputs.ecs-task-definition-path }}
+          sed -i 's/<MEMORY>/${{ inputs.ecs-memory }}/g' ${{ inputs.ecs-task-definition-path }}
+          sed -i 's/<ENVIRONMENT_SITE_NAME>/${{ inputs.environment-site-name }}/g' ${{ inputs.ecs-task-definition-path }}
+
+      - name: Fill in the new image ID in the Amazon ECS task definition
+        # Create a new task definition file with the image to be deployed
+        id: task-def
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          CONTAINER_NAME: ${{ inputs.ecs-container-name }}
+        uses: aws-actions/amazon-ecs-render-task-definition@8d79160660ad39c402a16e5fc7cd2a32e8f7d6b7 # v1.9.1
+        with:
+          task-definition: ${{ inputs.ecs-task-definition-path }}
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ steps.login-ecr.outputs.registry }}/${{ inputs.ecr-repository }}:${{ env.IMAGE_TAG }}
+          # TODO: check again if ENV_TYPE and ENV_SITE_NAME is still required here
+          environment-variables: |
+            ENV_TYPE=${{ inputs.environment }}
+            ENV_SITE_NAME=${{ inputs.environment-site-name }}
+
+      - name: Copy Static Assets from Docker Image and Push to S3
+        env:
+          S3_STATIC_ASSETS_BUCKET_NAME: ${{ secrets.S3_STATIC_ASSETS_BUCKET_NAME }}
+          ECR_REPOSITORY: ${{ inputs.ecr-repository }}
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          mkdir -p /tmp/s3static
+          chmod 777 /tmp/s3static
+          docker run --rm -v /tmp/s3static:/tmp/s3static $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG cp -r ./apps/frontend/dist/. /tmp/s3static
+          aws s3 sync /tmp/s3static s3://$S3_STATIC_ASSETS_BUCKET_NAME
+
+      - name: Upload Datadog sourcemaps
+        env:
+          DATADOG_API_KEY: ${{ secrets.DD_API_KEY }}
+        run: |
+          curl -L --fail "https://github.com/DataDog/datadog-ci/releases/download/v5.11.0/datadog-ci_linux-x64" --output /usr/local/bin/datadog-ci
+          chmod +x /usr/local/bin/datadog-ci
+          datadog-ci sourcemaps upload /tmp/s3static \
+            --service=formsg-react \
+            --release-version=${{ env.APP_VERSION }} \
+            --minified-path-prefix=${{ inputs.app-url }} \
+            --repository-url=${{ github.server_url }}/${{ github.repository }}
+
+      - name: Deploy Amazon ECS task definition
+        uses: aws-actions/amazon-ecs-deploy-task-definition@df9643053eda01f169e64a0e60233aacca83799a # v1.4.11
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ inputs.ecs-service-name }}
+          cluster: ${{ inputs.ecs-cluster-name }}
+          wait-for-service-stability: true
+          codedeploy-appspec: ${{ inputs.codedeploy-appspec-path }}
+          codedeploy-application: ${{ inputs.codedeploy-application }}
+          codedeploy-deployment-group: ${{ inputs.codedeploy-deployment-group }}

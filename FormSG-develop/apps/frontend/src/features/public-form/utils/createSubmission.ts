@@ -1,0 +1,603 @@
+import { datadogLogs } from '@datadog/browser-logs'
+import {
+  ADDRESS_SUBFIELD_KEYS,
+  type AddressAnswerV4,
+  type AnswerV4,
+  type ChildrenAnswerV4,
+  generateUUID,
+  type ResponseProvenance,
+  type TableAnswerV4,
+} from '@opengovsg/formsg-sdk'
+import { encode as encodeBase64 } from '@stablelib/base64'
+import { chain, forOwn, isEmpty, keyBy, omit, pick } from 'lodash'
+
+import { E2EE_SUBMISSION_VERSION } from 'formsg-shared/constants'
+import { ProductItem } from 'formsg-shared/types'
+import {
+  BasicField,
+  FormFieldDto,
+  PaymentFieldsDto,
+} from 'formsg-shared/types/field'
+import {
+  EmailResponse,
+  FieldResponse,
+  MobileResponse,
+} from 'formsg-shared/types/response'
+import {
+  ResponseMetadata,
+  StorageModeSubmissionContentDto,
+  SubmissionAttachment,
+  SubmissionAttachmentsMap,
+} from 'formsg-shared/types/submission'
+import { validateResponses } from 'formsg-shared/utils/validate-responses'
+
+import fileArrayBuffer from '~/utils/fileArrayBuffer'
+
+import formsgSdk from '~utils/formSdk'
+import {
+  AttachmentFieldSchema,
+  FormFieldValue,
+  FormFieldValues,
+} from '~templates/Field'
+import { RADIO_OTHERS_INPUT_VALUE } from '~templates/Field/Radio/constants'
+
+import { FieldIdToQuarantineKeyType } from '../PublicFormService'
+
+import { transformInputsToOutputs } from './inputTransformation'
+
+/**
+ * @returns StorageModeSubmissionContentDto
+ * @throws Error if form inputs are invalid.
+ */
+export const createEncryptedSubmissionData = async ({
+  formFields,
+  formInputs,
+  publicKey,
+  responseMetadata,
+  paymentReceiptEmail,
+  payments,
+  paymentProducts,
+}: {
+  formFields: FormFieldDto[]
+  formInputs: FormFieldValues
+  publicKey: string
+  responseMetadata?: ResponseMetadata
+  paymentReceiptEmail?: string
+  payments?: PaymentFieldsDto
+  paymentProducts?: Array<ProductItem>
+}): Promise<StorageModeSubmissionContentDto> => {
+  const responses = createResponsesArray(formFields, formInputs)
+  const encryptedContent = formsgSdk.crypto.encrypt(responses, publicKey)
+  // Edge case: We still send email/verifiable fields to the server in plaintext
+  // even with end-to-end encryption in order to support email autoreplies and
+  // signature verification (for when signature has expired).
+  const filteredResponses = filterSendableStorageModeResponses(
+    formFields,
+    responses,
+  )
+  const attachments = await getEncryptedAttachmentsMap(
+    formFields,
+    formInputs,
+    publicKey,
+  )
+
+  return {
+    attachments,
+    responses: filteredResponses,
+    encryptedContent,
+    paymentReceiptEmail,
+    paymentProducts,
+    payments,
+    version: E2EE_SUBMISSION_VERSION,
+    responseMetadata,
+  }
+}
+
+type CreateEmailSubmissionFormDataArgs = {
+  formFields: FormFieldDto[]
+  formInputs: FormFieldValues
+  responseMetadata?: ResponseMetadata
+  respondentEmails?: string[]
+}
+
+type CreateStorageSubmissionFormDataArgs = CreateEmailSubmissionFormDataArgs & {
+  paymentReceiptEmail?: string
+  paymentProducts?: ProductItem[]
+  payments?: PaymentFieldsDto
+  version: number
+}
+
+type CreateMultirespondentSubmissionFormDataArgs =
+  CreateEmailSubmissionFormDataArgs & {
+    submissionSecretKey?: string
+    stepToken?: string
+    version: number
+    paymentReceiptEmail?: string
+    paymentProducts?: ProductItem[]
+    payments?: PaymentFieldsDto
+  }
+
+/**
+ * Used for both Email mode submissions and Storage mode submissions after encryption boundary shift.
+ * @returns formData containing form responses and attachments.
+ * @throws Error if form inputs are invalid.
+ */
+export const createClearSubmissionFormData = (
+  formDataArgs:
+    | CreateEmailSubmissionFormDataArgs
+    | CreateStorageSubmissionFormDataArgs,
+) => {
+  const { formFields, formInputs, ...formDataArgsRest } = formDataArgs
+  const responses = createResponsesArray(formFields, formInputs)
+  const attachments = getAttachmentsMap(formFields, formInputs)
+
+  // Convert content to FormData object.
+  const formData = new FormData()
+  formData.append(
+    'body',
+    JSON.stringify({
+      responses,
+      ...formDataArgsRest,
+    }),
+  )
+
+  if (!isEmpty(attachments)) {
+    forOwn(attachments, (attachment, fieldId) => {
+      if (attachment) {
+        formData.append(attachment.name, attachment, fieldId)
+      }
+    })
+  }
+
+  return formData
+}
+
+/**
+ * Used for Storage mode submissions v2.1+ (after virus scanning).
+ * @returns formData containing form responses and attachments.
+ * @throws Error if form inputs are invalid or contain malicious attachment(s).
+ */
+export const createClearSubmissionWithVirusScanningFormData = (
+  formDataArgs:
+    | CreateEmailSubmissionFormDataArgs
+    | CreateStorageSubmissionFormDataArgs,
+  fieldIdToQuarantineKeyMap: FieldIdToQuarantineKeyType[],
+) => {
+  const { formFields, formInputs, ...formDataArgsRest } = formDataArgs
+  const responses = createResponsesArray(formFields, formInputs).map(
+    (response) => {
+      if (response.fieldType === BasicField.Attachment && response.answer) {
+        // for each attachment response, find the corresponding quarantine bucket key
+        const fieldIdToQuarantineKeyEntry = fieldIdToQuarantineKeyMap.find(
+          (v) => v.fieldId === response._id,
+        )
+        if (!fieldIdToQuarantineKeyEntry)
+          throw new Error(
+            `Attachment response with fieldId ${response._id} not found among attachments uploaded to quarantine bucket`,
+          )
+        // set response.answer as the quarantine bucket key
+        response.answer = fieldIdToQuarantineKeyEntry.quarantineBucketKey
+      }
+      return response
+    },
+  )
+
+  const attachments = getAttachmentsMap(formFields, formInputs)
+
+  // Convert content to FormData object.
+  const formData = new FormData()
+  formData.append(
+    'body',
+    JSON.stringify({
+      responses,
+      ...formDataArgsRest,
+    }),
+  )
+
+  if (!isEmpty(attachments)) {
+    forOwn(attachments, (attachment, fieldId) => {
+      if (attachment) {
+        formData.append(
+          attachment.name,
+          // Set content as empty array buffer.
+          new File([], attachment.name, { type: attachment.type }),
+          fieldId,
+        )
+      }
+    })
+  }
+
+  return formData
+}
+
+/**
+ * Used for MRF submissions v4 (after virus scanning).
+ * @returns formData containing form responses and attachments.
+ * @throws Error if form inputs are invalid or contain malicious attachment(s).
+ */
+export const createClearSubmissionWithVirusScanningFormDataV4 = (
+  formDataArgs: CreateMultirespondentSubmissionFormDataArgs,
+  fieldIdToQuarantineKeyMap: FieldIdToQuarantineKeyType[],
+) => {
+  const { formFields, formInputs, ...formDataArgsRest } = formDataArgs
+
+  // Call this to validate responses, but don't actually use the result
+  // TODO: Move validation to before response array creation so it can be used for encryption v2-3
+  createResponsesArray(formFields, formInputs)
+
+  const responses = createResponsesV4(
+    formFields,
+    formInputs,
+    fieldIdToQuarantineKeyMap,
+  )
+
+  const attachments = getAttachmentsMap(formFields, formInputs)
+
+  // Convert content to FormData object.
+  const formData = new FormData()
+  formData.append(
+    'body',
+    JSON.stringify({
+      responses,
+      ...formDataArgsRest,
+    }),
+  )
+
+  if (!isEmpty(attachments)) {
+    forOwn(attachments, (attachment, fieldId) => {
+      if (attachment) {
+        formData.append(
+          attachment.name,
+          // Set content as empty array buffer.
+          new File([], attachment.name, { type: attachment.type }),
+          fieldId,
+        )
+      }
+    })
+  }
+
+  return formData
+}
+
+const createResponsesArray = (
+  formFields: FormFieldDto[],
+  formInputs: FormFieldValues,
+): FieldResponse[] => {
+  const transformedResponses = formFields
+    .map((ff) => transformInputsToOutputs(ff, formInputs[ff._id]))
+    .filter((output): output is FieldResponse => output !== null)
+  return validateResponses(transformedResponses)
+}
+
+/**
+ * Thin V4 wire response for MRF submissions: the FE sends fieldType + answer
+ * and the BE enriches the rest (question is sourced from the form definition).
+ *
+ * `provenance` is intentionally always present, even when empty: the SDK's
+ * isFieldResponsesV4 duck-types V4 responses on its presence at read time
+ * (BE step comparison, FE next-step decrypt, admin viewer). Omitting it would
+ * make stored blobs misdetect as V3 and get double-adapted on read.
+ */
+type MrfWireFieldResponseV4 = {
+  fieldType: BasicField
+  answer: AnswerV4
+  provenance: ResponseProvenance
+}
+
+export type MrfWireResponsesV4 = Record<string, MrfWireFieldResponseV4>
+
+const toWireResponseV4 = (
+  fieldType: BasicField,
+  answer: AnswerV4,
+): MrfWireFieldResponseV4 => ({
+  fieldType,
+  answer,
+  provenance: {},
+})
+
+/**
+ * Builds V4-shaped MRF wire responses directly from form inputs.
+ * Applies per-field empty-skip semantics; answer shapes follow the SDK's
+ * adaptV3ToV4 conversions, which is what the BE receiver shim produces for
+ * stale V3 clients.
+ */
+export const createResponsesV4 = (
+  formFields: FormFieldDto[],
+  formInputs: FormFieldValues,
+  fieldIdToQuarantineKeyMap: FieldIdToQuarantineKeyType[],
+): MrfWireResponsesV4 => {
+  const returnedInputs: MrfWireResponsesV4 = {}
+  for (const ff of formFields) {
+    switch (ff.fieldType) {
+      case BasicField.Number:
+      case BasicField.Decimal:
+      case BasicField.ShortText:
+      case BasicField.LongText:
+      case BasicField.HomeNo:
+      case BasicField.Dropdown:
+      case BasicField.Rating:
+      case BasicField.Nric:
+      case BasicField.Uen:
+      case BasicField.Date:
+      case BasicField.CountryRegion:
+      case BasicField.YesNo: {
+        const input = formInputs[ff._id] as
+          | FormFieldValue<typeof ff.fieldType>
+          | undefined
+        if (!input) break
+        returnedInputs[ff._id] = toWireResponseV4(ff.fieldType, {
+          value: input,
+        })
+        break
+      }
+      case BasicField.Address: {
+        const input = formInputs[ff._id] as
+          | FormFieldValue<typeof ff.fieldType>
+          | undefined
+        if (
+          !input ||
+          Object.values(input.addressSubFields).every((value) => !value)
+        )
+          break
+        const answer: Record<string, { value: string }> = {}
+        for (const key of ADDRESS_SUBFIELD_KEYS) {
+          answer[key] = { value: input.addressSubFields[key] ?? '' }
+        }
+        returnedInputs[ff._id] = toWireResponseV4(
+          ff.fieldType,
+          answer as AddressAnswerV4,
+        )
+        break
+      }
+      case BasicField.Email:
+      case BasicField.Mobile: {
+        const input = formInputs[ff._id] as
+          | FormFieldValue<typeof ff.fieldType>
+          | undefined
+        if (!input?.value) break
+        returnedInputs[ff._id] = toWireResponseV4(ff.fieldType, {
+          value: input.value,
+          ...(input.signature !== undefined && { signature: input.signature }),
+        })
+        break
+      }
+      case BasicField.Table: {
+        const input = formInputs[ff._id] as
+          | FormFieldValue<typeof ff.fieldType>
+          | undefined
+        if (!input) break
+        if (input.every((row) => Object.values(row).every((value) => !value))) {
+          break
+        }
+        const answer: TableAnswerV4 = {}
+        input.forEach((row, rowNum) => {
+          answer[generateUUID()] = { rowNum, value: row }
+        })
+        returnedInputs[ff._id] = toWireResponseV4(ff.fieldType, answer)
+        break
+      }
+      case BasicField.Checkbox: {
+        const input = formInputs[ff._id] as
+          | FormFieldValue<typeof ff.fieldType>
+          | undefined
+        // `false` is a react-hook-form artifact of untouched checkbox groups,
+        // and `undefined` occurs when othersInput is set without the group
+        // ever firing a change event. Either way nothing is selected — and
+        // othersInput text is only submitted when the Others sentinel is
+        // selected — so the field is unanswered and must be omitted. Sending
+        // `value: undefined` would JSON-serialize to an answer with no
+        // `value` key at all, which the BE rejects.
+        if (!input?.value || input.value.length === 0) break
+        returnedInputs[ff._id] = toWireResponseV4(ff.fieldType, {
+          value: input.value,
+          ...(input.othersInput !== undefined && {
+            othersInput: input.othersInput,
+          }),
+        })
+        break
+      }
+      case BasicField.Children: {
+        const input = formInputs[ff._id] as
+          | FormFieldValue<typeof ff.fieldType>
+          | undefined
+        if (
+          !input ||
+          input.child.every((child) => child.every((value) => !value))
+        ) {
+          break
+        }
+        const answer: ChildrenAnswerV4 = {}
+        input.child.forEach((child, i) => {
+          const value: ChildrenAnswerV4[string]['value'] = {}
+          input.childFields.forEach((attr, j) => {
+            value[attr] = { value: child[j] ?? '', myInfo: { attr } }
+          })
+          // Scope derived by ChildrenCompoundField on child selection; inputs
+          // without a stamp (e.g. drafts saved before scopes existed) submit
+          // with no type.
+          const type = input.childTypes?.[i]
+          answer[`child${i}`] = { value, ...(type && { type }) }
+        })
+        returnedInputs[ff._id] = toWireResponseV4(ff.fieldType, answer)
+        break
+      }
+      case BasicField.Attachment: {
+        const input = formInputs[ff._id] as
+          | FormFieldValue<typeof ff.fieldType>
+          | undefined
+        if (!input) break
+        // for each attachment response, find the corresponding quarantine bucket key
+        const fieldIdToQuarantineKeyEntry = fieldIdToQuarantineKeyMap.find(
+          (v) => v.fieldId === ff._id,
+        )
+        if (!fieldIdToQuarantineKeyEntry)
+          throw new Error(
+            `Attachment response with fieldId ${ff._id} not found among attachments uploaded to quarantine bucket`,
+          )
+        returnedInputs[ff._id] = toWireResponseV4(ff.fieldType, {
+          value: fieldIdToQuarantineKeyEntry.quarantineBucketKey,
+          hasBeenScanned: false, //TODO: FRM-1839 + FRM-1590 conditionally set to true if not replaced by respondent 2 onwards
+        })
+        break
+      }
+      case BasicField.Radio: {
+        const input = formInputs[ff._id] as
+          | FormFieldValue<typeof ff.fieldType>
+          | undefined
+        const isOthersSelected = input?.value === RADIO_OTHERS_INPUT_VALUE
+        if (!isOthersSelected && input?.value) {
+          returnedInputs[ff._id] = toWireResponseV4(ff.fieldType, {
+            value: input.value,
+            isOthersInput: false,
+          })
+        } else if (isOthersSelected && input?.othersInput) {
+          returnedInputs[ff._id] = toWireResponseV4(ff.fieldType, {
+            value: input.othersInput,
+            isOthersInput: true,
+          })
+        }
+        break
+      }
+      case BasicField.Section:
+      case BasicField.Image:
+      case BasicField.Statement: {
+        break
+      }
+      case BasicField.Signature: {
+        const input = formInputs[ff._id] as
+          | FormFieldValue<typeof ff.fieldType>
+          | undefined
+        // since default value is {type: '', value: []}, empty array = no input
+        if (input && input?.value.length > 0) {
+          returnedInputs[ff._id] = toWireResponseV4(ff.fieldType, {
+            value: input.value,
+            type: 'draw',
+          })
+        }
+        break
+      }
+      default: {
+        // eslint-disable-next-line @typescript-eslint/no-unused-vars
+        const _: never = ff
+      }
+    }
+  }
+  return returnedInputs
+}
+
+const getEncryptedAttachmentsMap = async (
+  formFields: FormFieldDto[],
+  formInputs: FormFieldValues,
+  publicKey: string,
+): Promise<SubmissionAttachmentsMap> => {
+  const attachmentsMap = getAttachmentsMap(formFields, formInputs)
+
+  const attachmentPromises = Object.entries(attachmentsMap).map(
+    ([id, attachment]) => encryptAttachment(attachment, { id, publicKey }),
+  )
+
+  return Promise.all(attachmentPromises).then((encryptedAttachmentsMeta) =>
+    chain(encryptedAttachmentsMeta)
+      .keyBy('id')
+      // Remove id from object.
+      .mapValues((v) => omit(v, 'id'))
+      .value(),
+  )
+}
+
+export const getAttachmentsMap = (
+  formFields: FormFieldDto[],
+  formInputs: FormFieldValues,
+): Record<string, File> => {
+  const attachmentsMap: Record<string, File> = {}
+  const attachmentFields = formFields.filter(
+    (ff): ff is AttachmentFieldSchema => ff.fieldType === BasicField.Attachment,
+  )
+  attachmentFields.forEach((af) => {
+    const attachmentValue = formInputs[af._id]
+    if (!(attachmentValue instanceof File)) return
+    attachmentsMap[af._id] = attachmentValue
+  })
+
+  return attachmentsMap
+}
+
+/**
+ * Utility to filter out responses that should be sent to the server. This includes:
+ * 1. Email fields that have an autoreply enabled.
+ * 2. Verifiable fields to verify its signature on the backend.
+ */
+const filterSendableStorageModeResponses = (
+  formFields: FormFieldDto[],
+  responses: FieldResponse[],
+) => {
+  const mapFieldIdToField = keyBy(formFields, '_id')
+  return responses
+    .filter((r): r is EmailResponse | MobileResponse => {
+      switch (r.fieldType) {
+        case BasicField.Email: {
+          const field = mapFieldIdToField[r._id]
+          if (!field || field.fieldType !== r.fieldType) return false
+          // Only filter out fields with auto reply set to true, or if field is verifiable.
+          return field.autoReplyOptions.hasAutoReply || field.isVerifiable
+        }
+        case BasicField.Mobile: {
+          const field = mapFieldIdToField[r._id]
+          if (!field || field.fieldType !== r.fieldType) return false
+          return field.isVerifiable
+        }
+        default:
+          return false
+      }
+    })
+    .map((r) => pick(r, ['fieldType', '_id', 'answer', 'signature']))
+}
+const encryptAttachment = async (
+  attachment: File,
+  { id, publicKey }: { id: string; publicKey: string },
+): Promise<SubmissionAttachment & { id: string }> => {
+  let label
+
+  try {
+    label = 'Read file content'
+    const buffer = await fileArrayBuffer(attachment)
+
+    const fileContentsView = new Uint8Array(buffer)
+
+    label = 'Encrypt content'
+    const encryptedAttachment = await formsgSdk.crypto.encryptFile(
+      fileContentsView,
+      publicKey,
+    )
+
+    label = 'Base64-encode encrypted content'
+    const encodedEncryptedAttachment = {
+      ...encryptedAttachment,
+      binary: encodeBase64(encryptedAttachment.binary),
+    }
+
+    return { id, encryptedFile: encodedEncryptedAttachment }
+  } catch (err) {
+    const error = err as Error
+    // TODO: remove error logging when error about arrayBuffer not being a function is resolved
+    datadogLogs.logger.error(`encryptAttachment: ${label}: ${error?.message}`, {
+      meta: {
+        error: {
+          message: error?.message,
+          stack: error?.stack,
+        },
+        attachment: {
+          id,
+          type: typeof attachment,
+          extension: attachment.name?.split('.').pop(),
+          size: attachment.size,
+          isBlob: attachment instanceof Blob,
+          isFile: attachment instanceof File,
+          arrayBuffer: typeof attachment.arrayBuffer,
+        },
+      },
+    })
+    // Rethrow to maintain behaviour
+    throw error
+  }
+}

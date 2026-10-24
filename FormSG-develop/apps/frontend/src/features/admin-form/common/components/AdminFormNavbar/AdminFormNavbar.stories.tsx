@@ -1,0 +1,56 @@
+import { Meta, StoryFn } from '@storybook/react-vite'
+
+import { DateString } from 'formsg-shared/types/generic'
+
+import { getMobileViewGlobals, StoryRouter } from '~utils/storybook'
+
+import { AdminFormNavbar, AdminFormNavbarProps } from './AdminFormNavbar'
+
+const MOCK_FORM = {
+  title: 'Storybook Test Form',
+  lastModified: '2020-01-01T00:00:00.000Z' as DateString,
+} as NonNullable<AdminFormNavbarProps['formInfo']>
+
+export default {
+  title: 'Features/AdminForm/AdminFormNavbar',
+  component: AdminFormNavbar,
+  decorators: [StoryRouter({ path: 'test', initialEntries: ['/test'] })],
+  parameters: {
+    layout: 'fullscreen',
+    // Pages fill the viewport; fit-to-content would crop them.
+    argos: { fitToContent: false },
+  },
+  args: {
+    formInfo: MOCK_FORM,
+    previewFormLink: '/test',
+  },
+} as Meta<AdminFormNavbarProps>
+
+const Template: StoryFn<AdminFormNavbarProps> = (args) => (
+  <AdminFormNavbar {...args} />
+)
+export const DefaultEditor = Template.bind({})
+
+export const DefaultViewOnly = Template.bind({})
+DefaultViewOnly.args = {
+  formInfo: MOCK_FORM,
+  viewOnly: true,
+  previewFormLink: '/test',
+}
+
+export const Skeleton = Template.bind({})
+Skeleton.args = {
+  formInfo: undefined,
+  previewFormLink: '/test',
+}
+
+export const Mobile = Template.bind({})
+Mobile.args = {
+  formInfo: {
+    ...MOCK_FORM,
+    title:
+      'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+  },
+  previewFormLink: '/test',
+}
+Mobile.globals = getMobileViewGlobals()

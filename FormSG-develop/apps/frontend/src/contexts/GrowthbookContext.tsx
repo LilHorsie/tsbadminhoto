@@ -1,0 +1,83 @@
+import { ReactNode, useEffect, useMemo } from 'react'
+import {
+  GrowthBook,
+  GrowthBookProvider as BaseGrowthBookProvider,
+  useGrowthBook,
+} from '@growthbook/growthbook-react'
+
+import { UserDto } from 'formsg-shared/types/user'
+
+import { createGrowthbookInstance } from '~/growthbook'
+
+import { useAuth } from '~contexts/AuthContext'
+
+import { useEnv } from '~features/env/queries'
+import { useUser } from '~features/user/queries'
+
+const injectGrowthBookAttributes = (
+  growthbook: GrowthBook | undefined,
+  user: UserDto | undefined,
+) => {
+  if (!growthbook) return
+
+  const currentAttributes = growthbook.getAttributes()
+
+  // RATIONALE: Only update when values change — setAttributes publishes to all subscribers.
+  const hasChanges =
+    currentAttributes.adminEmail !== user?.email ||
+    currentAttributes.adminAgency !== user?.agency?.shortName
+
+  if (hasChanges) {
+    growthbook.setAttributes({
+      ...currentAttributes,
+      adminEmail: user?.email,
+      adminAgency: user?.agency?.shortName,
+    })
+  }
+}
+
+export const GrowthBookProvider = ({ children }: { children: ReactNode }) => {
+  const { data: { growthbookClientKey } = {} } = useEnv()
+  const { isAuthenticated } = useAuth()
+
+  const { user } = useUser({ enabled: !!isAuthenticated })
+
+  const growthbook = useMemo(
+    () =>
+      growthbookClientKey
+        ? createGrowthbookInstance(growthbookClientKey)
+        : undefined,
+    [growthbookClientKey],
+  )
+
+  useEffect(() => {
+    if (growthbook && user) {
+      injectGrowthBookAttributes(growthbook, user)
+    }
+    // RATIONALE: do not use 'user' in the dependency array as its reference can change.
+  }, [growthbook, user?.email, user?.agency?.shortName])
+
+  return (
+    <BaseGrowthBookProvider growthbook={growthbook}>
+      {children}
+    </BaseGrowthBookProvider>
+  )
+}
+
+/**
+ * Targets flags by form while an admin form page is mounted.
+ * RATIONALE: The provider sits above the router, so it cannot read the form ID itself.
+ * The ID is removed on unmount so workspace pages carry no stale formId.
+ */
+export const useGrowthBookFormId = (formId: string) => {
+  const growthbook = useGrowthBook()
+  useEffect(() => {
+    if (!growthbook) return
+    growthbook.setAttributes({ ...growthbook.getAttributes(), formId })
+    return () => {
+      const attributes = { ...growthbook.getAttributes() }
+      delete attributes.formId
+      growthbook.setAttributes(attributes)
+    }
+  }, [formId, growthbook])
+}

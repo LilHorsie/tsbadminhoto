@@ -1,0 +1,44 @@
+import { enSG as pagination } from './components/pagination'
+import { enSG as validationConstants } from './constants/validation'
+import { enSG as adminForm } from './features/admin-form'
+import { enSG as app } from './features/app'
+import { enSG as common } from './features/common'
+import { enSG as landingPage } from './features/landing-page'
+import { enSG as landingPayments } from './features/landing-payments'
+import { enSG as login } from './features/login'
+import { enSG as notFoundError } from './features/not-found-error'
+import { enSG as publicForm } from './features/public-form'
+import { enSG as user } from './features/user'
+import { enSG as workspace } from './features/workspace'
+import { enSG as fieldValidation } from './utils/field-validation'
+import { enSG as formValidation } from './utils/form-validation'
+import { enSG as workspaceValidation } from './utils/workspace-validation'
+import { FallbackTranslation } from './types'
+
+export const enSG: FallbackTranslation = {
+  translation: {
+    features: {
+      adminForm,
+      app,
+      common,
+      landingPage,
+      landingPayments,
+      notFoundError,
+      login,
+      publicForm,
+      workspace,
+      user,
+    },
+    utils: {
+      formValidation,
+      workspaceValidation,
+      fieldValidation,
+    },
+    components: {
+      pagination,
+    },
+    constants: {
+      validationConstants,
+    },
+  },
+}

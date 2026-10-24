@@ -1,0 +1,220 @@
+import { useCallback, useEffect, useState } from 'react'
+import {
+  SubmitHandler,
+  useForm,
+  UseFormReset,
+  UseFormTrigger,
+} from 'react-hook-form'
+import { useTranslation } from 'react-i18next'
+import {
+  Button,
+  ButtonGroup,
+  FormControl,
+  FormErrorMessage,
+  FormLabel,
+  Input,
+  Modal,
+  ModalBody,
+  ModalContent,
+  ModalHeader,
+  ModalOverlay,
+  Text,
+  useBreakpointValue,
+} from '@chakra-ui/react'
+import isEmail from 'validator/lib/isEmail'
+
+import { INVALID_EMAIL_ERROR, REQUIRED_ERROR } from '~constants/validation'
+import { ModalCloseButton } from '~components/Modal'
+
+import { useUserMutations } from '~features/user/mutations'
+import { useDashboard } from '~features/workspace/queries'
+
+import { useUser } from '../queries'
+
+interface TransferOwnershipModalProps {
+  isOpen: boolean
+  onClose: () => void
+}
+
+type TransferOwnershipInputs = {
+  email: string
+}
+
+type UseModalStateReturn = {
+  page: number
+  email: string
+  isOwnEmail: (value: string) => boolean
+  resetModal: () => void
+  onNext: SubmitHandler<TransferOwnershipInputs>
+  onConfirm: () => void
+}
+
+const useModalState = ({
+  onClose,
+  reset,
+  trigger,
+}: {
+  onClose: () => void
+  reset: UseFormReset<TransferOwnershipInputs>
+  trigger: UseFormTrigger<TransferOwnershipInputs>
+}): UseModalStateReturn => {
+  const { refetch } = useDashboard()
+
+  const [page, setPage] = useState(0)
+  const [email, setEmail] = useState('')
+
+  const { user } = useUser()
+  const { transferOwnershipMutation } = useUserMutations()
+
+  const isOwnEmail = useCallback(
+    (value: string) => {
+      return user?.email ? value.toLowerCase() === user.email : false
+    },
+    [user?.email],
+  )
+
+  const resetModal = useCallback(() => {
+    setPage(0)
+    reset()
+    trigger()
+    onClose()
+  }, [reset, trigger, onClose])
+
+  const onNext: SubmitHandler<TransferOwnershipInputs> = useCallback(
+    ({ email }) => {
+      setEmail(email)
+      setPage(1)
+    },
+    [],
+  )
+
+  const onConfirm = useCallback(() => {
+    if (!user) return
+    return transferOwnershipMutation.mutate(
+      { email },
+      {
+        onSuccess: () => {
+          resetModal()
+          refetch()
+        },
+      },
+    )
+  }, [user, transferOwnershipMutation, email, resetModal, refetch])
+
+  useEffect(() => {
+    trigger()
+  }, [trigger])
+
+  return { page, email, isOwnEmail, resetModal, onNext, onConfirm }
+}
+
+export const TransferOwnershipModal = ({
+  isOpen,
+  onClose,
+}: TransferOwnershipModalProps): JSX.Element => {
+  const { t } = useTranslation()
+
+  const {
+    reset,
+    trigger,
+    register,
+    handleSubmit,
+    formState: { errors },
+  } = useForm<TransferOwnershipInputs>({
+    mode: 'onChange',
+  })
+  const { page, email, isOwnEmail, resetModal, onNext, onConfirm } =
+    useModalState({
+      onClose,
+      reset,
+      trigger,
+    })
+
+  const modalSize = useBreakpointValue({
+    base: 'mobile',
+    xs: 'mobile',
+    md: 'md',
+  })
+
+  return (
+    <Modal size={modalSize} isOpen={isOpen} onClose={resetModal}>
+      <ModalOverlay />
+      <ModalContent>
+        <ModalCloseButton />
+        <ModalHeader color="secondary.700">
+          {t('features.user.transferOwnership.header')}
+        </ModalHeader>
+        <ModalBody whiteSpace="pre-wrap" pb="3.25rem">
+          {page === 0 && (
+            <form onSubmit={handleSubmit(onNext)}>
+              <FormControl isInvalid={!!errors['email']}>
+                <FormLabel>
+                  {t('features.user.transferOwnership.form.label')}
+                  <Text textStyle="body-2" color="secondary.500">
+                    {t('features.user.transferOwnership.form.description')}
+                  </Text>
+                </FormLabel>
+                <Input
+                  type="email"
+                  placeholder="me@example.com"
+                  {...register('email', {
+                    required: REQUIRED_ERROR,
+                    validate: (value) => {
+                      if (!isEmail(value)) {
+                        return INVALID_EMAIL_ERROR
+                      }
+                      return (
+                        !isOwnEmail(value) ||
+                        t(
+                          'constants.validationConstants.cannotTransferOwnershipToSelf',
+                        )
+                      )
+                    },
+                  })}
+                />
+                <FormErrorMessage>{errors['email']?.message}</FormErrorMessage>
+              </FormControl>
+              <section style={{ marginTop: '1rem', textAlign: 'right' }}>
+                <ButtonGroup spacing="6">
+                  <Button variant="link" onClick={resetModal}>
+                    {t('features.common.cancel')}
+                  </Button>
+                  <Button type="submit" isDisabled={!!errors['email']}>
+                    {t('features.user.transferOwnership.form.button')}
+                  </Button>
+                </ButtonGroup>
+              </section>
+            </form>
+          )}
+          {page === 1 && (
+            <section>
+              <Text textStyle="body-2" color="secondary.500">
+                {t(
+                  'features.user.transferOwnership.confirmation.transferringTo',
+                )}{' '}
+                <Text as="span" color="danger.500" fontWeight="bold">
+                  {email}
+                </Text>
+                {'. ' +
+                  t(
+                    'features.user.transferOwnership.confirmation.loseAccessWarning',
+                  ) +
+                  '.'}
+              </Text>
+              <section style={{ marginTop: '1rem', textAlign: 'right' }}>
+                <ButtonGroup spacing="6">
+                  <Button variant="link" onClick={resetModal}>
+                    {t('features.common.cancel')}
+                  </Button>
+                  <Button colorScheme="danger" onClick={onConfirm}>
+                    {t('features.user.transferOwnership.confirmation.button')}
+                  </Button>
+                </ButtonGroup>
+              </section>
+            </section>
+          )}
+        </ModalBody>
+      </ModalContent>
+    </Modal>
+  )
+}

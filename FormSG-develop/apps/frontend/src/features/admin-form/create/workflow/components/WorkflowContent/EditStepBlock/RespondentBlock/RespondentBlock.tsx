@@ -1,0 +1,124 @@
+import { UseFormReturn } from 'react-hook-form'
+import { useTranslation } from 'react-i18next'
+import { FormControl, Stack, Text } from '@chakra-ui/react'
+
+import { UserDto } from 'formsg-shared/types'
+
+import { textStyles } from '~theme/textStyles'
+import FormErrorMessage from '~components/FormControl/FormErrorMessage'
+import FormLabel from '~components/FormControl/FormLabel'
+import Radio from '~components/Radio'
+
+import { BASICFIELD_TO_DRAWER_META } from '~features/admin-form/create/constants'
+import { EditStepInputs } from '~features/admin-form/create/workflow/types'
+
+import { useAdminFormWorkflow } from '../../../../hooks/useAdminFormWorkflow'
+import { useIsWorkflowBuilderRedesign } from '../../../../hooks/useIsWorkflowBuilderRedesign'
+import { useIsSpotlightActiveSection } from '../../../Spotlight'
+import { isFirstStepByStepNumber } from '../../utils/isFirstStepByStepNumber'
+import { EditStepBlockContainer } from '../EditStepBlockContainer'
+
+import { ConditionalRoutingOption } from './Components/ConditionalRoutingOption'
+import { DynamicRespondentOption } from './Components/DynamicRespondentOption'
+import { StaticRespondentOption } from './Components/StaticRespondentOption'
+
+interface RespondentBlockProps {
+  stepNumber: number
+  isLoading: boolean
+  formMethods: UseFormReturn<EditStepInputs>
+  user: UserDto | undefined
+}
+
+export const RespondentBlock = ({
+  stepNumber,
+  isLoading,
+  formMethods,
+}: RespondentBlockProps): JSX.Element => {
+  const { t } = useTranslation()
+  const {
+    formState: { errors },
+    watch,
+  } = formMethods
+
+  const { emailFormFields = [], dropdownFormFields = [] } =
+    useAdminFormWorkflow()
+  const isRedesign = useIsWorkflowBuilderRedesign()
+  const isActiveSection = useIsSpotlightActiveSection()
+
+  const emailFieldItems = emailFormFields.map(
+    ({ _id, questionNumber, title, fieldType }) => ({
+      label: `${questionNumber}. ${title}`,
+      value: _id,
+      icon: BASICFIELD_TO_DRAWER_META[fieldType].icon,
+    }),
+  )
+
+  const selectedWorkflowType = watch('workflow_type')
+
+  const isFirstStep = isFirstStepByStepNumber(stepNumber)
+
+  return (
+    <EditStepBlockContainer>
+      {isFirstStep ? (
+        <Stack spacing="0.5rem">
+          <Text style={textStyles.h4}>
+            {t(
+              isRedesign
+                ? 'features.adminForm.sidebar.workflow.respondentBlock.stepRespondentRedesign'
+                : 'features.adminForm.sidebar.workflow.respondentBlock.stepRespondent',
+            )}
+          </Text>
+          <Text>
+            {t(
+              isRedesign
+                ? 'features.adminForm.sidebar.workflow.respondentBlock.anyoneRedesign'
+                : 'features.adminForm.sidebar.workflow.respondentBlock.anyone',
+            )}
+          </Text>
+        </Stack>
+      ) : (
+        <FormControl
+          isReadOnly={isLoading}
+          isRequired
+          isInvalid={!!errors.workflow_type}
+        >
+          <FormLabel style={textStyles.h4}>
+            {t(
+              isRedesign
+                ? 'features.adminForm.sidebar.workflow.respondentBlock.selectRedesign'
+                : 'features.adminForm.sidebar.workflow.respondentBlock.select',
+            )}
+          </FormLabel>
+          {isActiveSection ? (
+            <Text textStyle="body-2" color="secondary.400" mb="0.5rem">
+              {t('features.adminForm.sidebar.workflow.guidedHints.respondent')}
+            </Text>
+          ) : null}
+          <Stack spacing="0.25rem">
+            {/* Ordered by how often admins pick each one. */}
+            <Radio.RadioGroup value={selectedWorkflowType}>
+              <StaticRespondentOption
+                selectedWorkflowType={selectedWorkflowType}
+                formMethods={formMethods}
+                isLoading={isLoading}
+              />
+              <DynamicRespondentOption
+                selectedWorkflowType={selectedWorkflowType}
+                emailFieldItems={emailFieldItems}
+                formMethods={formMethods}
+                isLoading={isLoading}
+              />
+              <ConditionalRoutingOption
+                selectedWorkflowType={selectedWorkflowType}
+                conditionalFormFields={dropdownFormFields}
+                formMethods={formMethods}
+                isLoading={isLoading}
+              />
+            </Radio.RadioGroup>
+          </Stack>
+          <FormErrorMessage>{errors.workflow_type?.message}</FormErrorMessage>
+        </FormControl>
+      )}
+    </EditStepBlockContainer>
+  )
+}

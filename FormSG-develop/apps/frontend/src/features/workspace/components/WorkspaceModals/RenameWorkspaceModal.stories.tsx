@@ -1,0 +1,47 @@
+import { useDisclosure } from '@chakra-ui/react'
+import { Meta, StoryFn } from '@storybook/react-vite'
+
+import { UserId } from 'formsg-shared/types'
+import { Workspace, WorkspaceId } from 'formsg-shared/types/workspace'
+
+import { userHandlers } from '~/mocks/msw/handlers/user'
+
+import { viewportModes } from '~utils/storybook'
+
+import {
+  RenameWorkspaceModal,
+  RenameWorkspaceModalProps,
+} from './RenameWorkspaceModal'
+
+export default {
+  title: 'Pages/WorkspacePage/RenameWorkspaceModal',
+  component: RenameWorkspaceModal,
+  parameters: {
+    layout: 'fullscreen',
+    // Pages fill the viewport; fit-to-content would crop them.
+    argos: { fitToContent: false },
+    // Prevent flaky tests due to modal animating in.
+    msw: userHandlers({ delay: 0 }),
+  },
+} as Meta
+
+const Template: StoryFn<RenameWorkspaceModalProps> = (args) => {
+  const modalProps = useDisclosure({ defaultIsOpen: true })
+  const mockWorkspace: Workspace = {
+    _id: '' as WorkspaceId,
+    title: 'ImAWorkspace',
+    formIds: [],
+    admin: '' as UserId,
+  }
+
+  return (
+    <RenameWorkspaceModal
+      {...args}
+      {...modalProps}
+      onClose={() => console.log('close modal')}
+      activeWorkspace={mockWorkspace}
+    />
+  )
+}
+export const RenameWorkspace = Template.bind({})
+RenameWorkspace.parameters = { argos: { modes: viewportModes('mobile') } }

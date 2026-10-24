@@ -1,0 +1,114 @@
+export * from './en-sg'
+
+export interface Common {
+  entities: {
+    form: string
+    template: string
+    design: string
+    link: string
+    page: string
+    field: string
+    changes: string
+    step: string
+    paymentProof: string
+    credentials: string
+    product: string
+  }
+  save: string
+  saveField: string
+  create: string
+  charts: string
+  removeReenter: string
+  share: string
+  cancel: string
+  contact: string
+  title: string
+  question: string
+  option: string
+  options: string
+  optional: string
+  maximum: string
+  minimum: string
+  exact: string
+  export: string
+  delete: string
+  next: string
+  back: string
+  done: string
+  submit: string
+  edit: string
+  sending: string
+  loading: string
+  loadingWithEllipsis: string
+  saving: string
+  response: string
+  responses: string
+  feedback: string
+  verify: string
+  verified: string
+  goToDashboardCta: string
+  download: string
+  default: string
+  errors: {
+    required: string
+    validValue: string
+    image: {
+      notProvided: string
+    }
+    validation: {
+      mobileNoVerification: string
+      emailVerification: string
+      homeNo: string
+    }
+    pageNotFound: string
+    generic: string
+    serverError: string
+  }
+  tooltip: {
+    deleteField: string
+    duplicateField: string
+    editField: string
+  }
+  date: string
+  days: {
+    Mondays: string
+    Tuesdays: string
+    Wednesdays: string
+    Thursdays: string
+    Fridays: string
+    Saturdays: string
+    Sundays: string
+  }
+  today: string
+  tomorrow: string
+  yesterday: string
+  formStatus: {
+    closed: string
+    open: string
+  }
+  responseMode: {
+    email: string
+    storage: string
+  }
+  formName: string
+  editForm: {
+    text: string
+    ariaLabel: string
+  }
+  moreOptions: string
+  betaBadgeLabel: string
+  average: string
+  notApplicable: string
+  file: string
+  filename: string
+  previous: string
+  submission: string
+  attachments: string
+  success: string
+  pending: string
+  completed: string
+  approved: string
+  notApproved: string
+  stopped: string
+  logout: string
+}

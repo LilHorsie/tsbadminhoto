@@ -1,0 +1,55 @@
+import { Login } from '.'
+
+export const enSG: Login = {
+  LoginPage: {
+    slogan: 'Build secure government forms in minutes',
+    banner: 'You can now collect payments directly on your form!',
+    forbidden: 'You do not have access to this service.',
+    expiredSession: 'Your login session has expired. Please login again.',
+    signingInWithOne: 'Signing into one.gov.sg...',
+  },
+  SelectProfilePage: {
+    accountSelection: 'Choose an account to continue to FormSG',
+    manualLogin: 'Or, login manually using email and OTP',
+    noWorkEmailHeader: "Singpass login isn't available to you yet",
+    noWorkEmailBody:
+      'It is progressively being made available to agencies. In the meantime, please log in using your email address.',
+    noWorkEmailCta: 'Back to login',
+    invalidWorkEmailHeader: "You don't have access to this service",
+    invalidWorkEmailBodyRestriction:
+      'It may be available only to select agencies or authorised individuals. If you believe you should have access to this service, please',
+    invalidWorkEmailBodyContact: 'contact us',
+    invalidWorkEmailCta: 'Choose another account',
+  },
+  components: {
+    LoginForm: {
+      onlyAvailableForPublicOfficers:
+        'Log in with a .gov.sg or other whitelisted email address',
+      emailEmptyErrorMsg: 'Please enter an email address',
+      login: 'Log in',
+      haveAQuestion: 'Have a question?',
+    },
+    OTPForm: {
+      signin: 'Sign in',
+      otpRequired: 'OTP is required.',
+      otpLengthCheck: 'Please enter a {otpLength} character OTP.',
+      otpFromEmail: 'Enter OTP sent to {email}',
+    },
+    SgidLoginButton: {
+      loginText: 'Log in with',
+      appText: 'app',
+      onlyText: 'Only',
+      selectAgenciesText: 'select agencies',
+      canUseSingpassLoginText: 'can use Singpass login',
+    },
+    SsoLoginButton: {
+      loginText: 'Log in with OGP SSO',
+    },
+    WogadLoginButton: {
+      loginText: 'Log in with WOG AD',
+    },
+    OneLoginButton: {
+      loginText: 'Log in with one.gov.sg',
+    },
+  },
+}

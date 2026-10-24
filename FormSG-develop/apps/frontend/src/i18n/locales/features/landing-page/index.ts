@@ -1,0 +1,123 @@
+export * from './en-sg'
+
+export interface LandingPage {
+  hero: {
+    title: string
+    subtitle: string
+    ctaButtonLabel: string
+  }
+  featureSection: {
+    title: string
+    features: {
+      dragDropBuilder: {
+        title: string
+        description: string
+      }
+      singpassAndMyinfo: {
+        title: string
+        description: string
+      }
+      conditionalLogic: {
+        title: string
+        description: string
+      }
+      emailConfirmation: {
+        title: string
+        description: string
+      }
+      workflow: {
+        title: string
+        description: string
+      }
+      webhooks: {
+        title: string
+        description: string
+      }
+    }
+  }
+  getStartedSection: {
+    title: string
+    subtitle: string
+    ctaButtonLabel: string
+  }
+  usedByAgenciesSection: {
+    title: string
+    formsLaunched: string
+    submissionsReceived: string
+    publicOfficersOnboard: string
+    governmentAgencies: string
+    exampleUserTitle: string
+  }
+  useCaseSection: {
+    title: string
+    subtitle: string
+  }
+  securitySection: {
+    title: string
+    subtitle: string
+    classifications: {
+      security: {
+        title: string
+        description: string
+      }
+      sensitivity: {
+        title: string
+        description: string
+      }
+    }
+    guideCtaLabel: string
+  }
+  opensourceSection: {
+    title: string
+    subtitle: string
+    forkItCtaLabel: string
+  }
+  helpCenterSection: {
+    title: string
+    subtitle: string
+    visitHelpCenterCtaLabel: string
+    common: {
+      sourceLinkLabel: string
+    }
+    qnaAccordionItem: {
+      whoCanCreate: {
+        question: string
+        answer: string
+      }
+      highVolume: {
+        question: string
+        answer: string
+      }
+      isFree: {
+        question: string
+        answer: string
+      }
+      howDoesE2eWork: {
+        question: string
+        answer: string
+      }
+    }
+  }
+  howItWorksSection: {
+    title: string
+    description: string
+    steps: {
+      one: string
+      two: string
+      three: string
+      four: string
+      five: string
+      six: string
+      seven: string
+    }
+  }
+  ogpProductSuiteSection: {
+    title: string
+    subtitle: string
+    ctaLinkLabel: string
+  }
+  ctaSection: {
+    title: string
+    ctaButtonLabel: string
+  }
+}

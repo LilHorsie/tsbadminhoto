@@ -1,0 +1,13 @@
+{
+  "{apps/backend,packages,services}/**/*.{ts,js}": [" eslint --fix"],
+  "{apps/backend,packages,services}/**/*.tsx": [
+    " prettier --write",
+    "eslint --fix"
+  ],
+  "{apps/backend,packages,services}/**/*.html": [
+    "htmlhint",
+    "prettier --write"
+  ],
+  "apps/frontend/**/*.{ts,tsx,js}": ["prettier --write", "eslint --fix"],
+  "**/*.json": ["prettier --write"]
+}

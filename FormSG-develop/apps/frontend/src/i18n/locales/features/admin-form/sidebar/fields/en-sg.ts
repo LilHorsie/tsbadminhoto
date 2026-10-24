@@ -1,0 +1,402 @@
+import { Fields } from '.'
+
+export const enSG: Fields = {
+  loginIdentity: {
+    sectionLabel: 'Personal',
+    corppassPanelInfo:
+      "These fields fill in from the respondent's Corppass login.",
+    loginMissing:
+      'Enable {loginName} in the <settingsLink>Settings</settingsLink> tab to access these fields.',
+    convertFirst:
+      'This form collects NRIC/FIN/UENs through <settingsLink>Singpass settings</settingsLink>. Convert that setting to add these fields.',
+    convertedToast:
+      'Your form now collects NRIC/FIN/UENs with login fields at the bottom of the form.',
+    fieldLimit:
+      'Only {max} Myinfo, NRIC/FIN and UEN fields are allowed ({count}/{max}).',
+    // Keyed by login identity attribute.
+    details: {
+      uinfin:
+        'The NRIC/FIN of the respondent. This field is verified by ICA for Singaporeans/PRs & foreigners on Long-Term Visit Pass, and by MOM for Employment Pass holders.',
+      uen: "The UEN of the respondent's organisation. This field is verified by Corppass.",
+      uid: 'The NRIC/FIN or foreign ID of the respondent. This field is verified by Corppass.',
+    },
+  },
+  builder: {
+    title: 'Fields',
+    createField: 'Create field',
+    addFields: 'Add Fields',
+    searchPlaceholder: 'Search fields',
+    tabs: {
+      basic: 'Basic',
+      myInfo: 'Singpass',
+      corppass: 'Corppass',
+      payments: 'Payments',
+    },
+    image: 'Image',
+    statement: 'Paragraph',
+    section: 'Heading',
+    attachment: 'Attachment',
+    checkbox: 'Checkbox',
+    date: 'Date',
+    decimal: 'Decimal',
+    dropdown: 'Dropdown',
+    countryRegion: 'Country/Region',
+    email: 'Email',
+    homeNumber: 'Home number',
+    mobileNumber: 'Mobile number',
+    longText: 'Long answer',
+    nik: 'NIK / KK',
+    number: 'Number',
+    radio: 'Radio',
+    rating: 'Rating',
+    shortAnswer: 'Short answer',
+    table: 'Table',
+    yesNo: 'Yes/No',
+    children: 'Children',
+  },
+  builderAndDesignContent: {
+    webhookEnabledWarning:
+      'Webhooks are enabled on this form. Please ensure the webhook server is able to handle any field changes.',
+  },
+  builderAndDesignPlaceholder: {
+    dropFieldHere: 'Drop your field here',
+  },
+  emptyFormPlaceholder: {
+    or: 'OR',
+    dropFieldHere: 'Drop your field here',
+    tapToAddField: 'Tap here to add a field',
+    dragFromBuilderToStart: 'Drag a field from the left to start',
+  },
+  fieldRowContainer: {
+    hiddenByLogicTooltip: 'This field may be hidden by your form logic',
+  },
+  commonFieldComponents: {
+    title: 'Field Name',
+    description: 'Description',
+    required: 'Required',
+    noCharactersAllowed: 'Number of characters allowed',
+    charactersAllowedPlaceholder: 'Number of characters',
+  },
+  radio: {
+    options: {
+      title: 'Options',
+      placeholder: 'Enter one option per line',
+    },
+    duplicateOptionsError: 'Please remove duplicate options.',
+    otherInvalidInputError: 'Please specify a value for the "others" option',
+  },
+  checkbox: {
+    selectionLimit: {
+      label: 'Selection limits',
+      description:
+        'Customise the number of options that users are allowed to select',
+      minimum: 'Minimum',
+      maximum: 'Maximum',
+    },
+    error: {
+      selectionLimitRequired: 'Please enter selection limits',
+      min: 'Cannot be less than 1',
+      max: 'Cannot be more than 10,000',
+      minLargerThanMax: 'Minimum cannot be larger than maximum',
+      maxLessThanMin: 'Maximum cannot be less than minimum',
+      moreThanNumOptions: 'Cannot be more than number of options',
+    },
+  },
+  dropdown: {
+    conditionalRoutingWarning:
+      'This field is linked to a step in your workflow. If you make any changes, ensure that the options and emails are updated in your CSV file.',
+  },
+  paragraph: 'Paragraph',
+  section: {
+    heading: 'Section heading',
+  },
+  rating: {
+    numOfSteps: 'Number of steps',
+    shape: 'Shape',
+    shapes: {
+      Heart: 'Heart',
+      Star: 'Star',
+    },
+  },
+  email: {
+    otpVerification: {
+      title: 'OTP verification',
+      description: 'Respondents must verify by entering a code sent to them.',
+    },
+    restrictEmailDomains: {
+      title: 'Restrict email domains',
+      inputLabel: 'Domains allowed',
+      placeholder: '@*.gov.sg\n@open.gov.sg\n@agency.gov.sg',
+      error: {
+        duplicate: 'Please remove duplicate email domains',
+        empty: 'Please enter at least one email domain',
+        invalid: 'Please enter only valid email domains starting with @',
+      },
+    },
+    emailConfirmation: {
+      title: 'Email confirmation',
+      description: 'Customise an email acknowledgement to respondents',
+      subject: {
+        title: 'Subject',
+        placeholder: 'Thank you for submitting {formTitle}',
+      },
+      senderName: {
+        title: 'Sender name',
+        placeholder: 'Default sender name is your agency name',
+      },
+      content: {
+        title: 'Content',
+        placeholder:
+          'To whom it may concern,\n\nThank you for submitting this form.\n\nRegards,\n{agencyName}',
+      },
+      includeResponse: 'Include a copy of their responses',
+      includePdfResponseWarning:
+        'PDF responses are not available for payment forms.',
+      includeResponseDescription:
+        'Responses are included in the email and as a PDF attachment',
+    },
+  },
+  mobileNo: {
+    otpVerification: {
+      title: 'OTP Verification',
+      description: 'Respondents must verify by entering a code sent to them.',
+      smsUsed: '{smsCount} SMSes used',
+      thresholdWarning: 'If more than 10k SMSes are required,',
+      contact: 'contact support',
+    },
+    allowInternationalNumber: 'Allow international numbers',
+  },
+  date: {
+    dateValidation: {
+      title: 'Date validation',
+      NoPast: 'Disallow past dates',
+      NoFuture: 'Disallow future dates',
+      Custom: 'Custom date range',
+      atLeastOneDateError: 'You must specify at least one date.',
+      validDateError: 'Please enter a valid date',
+      maxMinError: 'Max date cannot be less than min date.',
+    },
+    customiseAvailableDays: {
+      title: 'Customise available days',
+      requiredError: 'Please select available days of the week',
+      noAvailableDaysError:
+        "The selected days aren't available within your custom date range",
+    },
+  },
+  imageAttachment: {
+    title: 'Uploaded image',
+    requiredError: 'Please upload an image',
+  },
+  table: {
+    minimumRows: 'Minimum rows',
+    maximumRows: 'Maximum rows allowed',
+    allowAddMoreRows: 'Allow respondent to add more rows',
+    error: {
+      minRow: 'Minimum rows must be greater than 0',
+      maxRow: 'Maximum rows must be greater than 0',
+      maxRowGreaterThanMin: 'Maximum rows must be greater than minimum rows',
+    },
+    column: 'Column',
+    columnType: 'Column type',
+    ariaLabelDelete: 'Delete column',
+    addColumn: 'Add column',
+  },
+  shortText: {
+    prefill: {
+      label: 'Enable pre-fill',
+      description:
+        'Use Field ID in the form URL to pre-fill this field for respondents. [Learn how]({guidePrefill})',
+      fieldIdPlaceholder:
+        'Field ID will be generated after this field is saved',
+      copyFieldIdAriaLabel: 'Copy field ID value',
+      lock: {
+        label: 'Prevent pre-fill editing',
+        description:
+          'This prevents respondents from clicking the field to edit it. However, field content can still be modified via the URL.',
+      },
+    },
+  },
+  number: {
+    validation: 'Number validation',
+    minValue: 'Minimum value',
+    maxValue: 'Maximum value',
+    maxValueGreaterThanMin: 'Minimum must be less than maximum',
+    fieldRestriction: {
+      title: 'Field restriction',
+      lengthRestriction: 'Length restriction',
+      Length: 'Number of characters allowed',
+      Range: 'Range of values allowed',
+    },
+    error: {
+      validationType: 'Please select a validation type',
+      numOfCharacter: 'Please enter number of characters',
+      validDecimal: 'Please enter a valid decimal',
+      validNumber: 'Please enter a valid number',
+      min: 'Cannot be less than 1',
+      max: 'Cannot be more than 10000',
+      rangeValue: 'Please enter range values',
+      minRangeValue: 'Minimum cannot be 0',
+      maxRangeValue: 'Maximum cannot be 0',
+    },
+  },
+  attachment: {
+    info: 'View our [complete list]({acceptedFileTypes}) of accepted file types. Please also read our [FAQ on email reliability]({guideEmailReliability}) relating to unaccepted file types.',
+    maximumSize: 'Maximum size of individual attachment',
+    error: {
+      exceedSize:
+        "You have exceeded your form's attachment size limit of {maxTotalSizeMb} MB",
+    },
+  },
+  fieldListOption: {
+    useForApprovals: 'Use for approvals',
+  },
+  myInfoPreview: {
+    dataSource: 'Data source',
+    verifiedFor: 'Verified for',
+    singaporeans: 'Singaporeans',
+    permanentResidents: 'Permanent Residents',
+    foreignersWithSingpass:
+      'Foreigners with <singpassLink>Singpass</singpassLink>',
+    fieldDetails: 'Field details',
+    children: {
+      collectChildData: 'Collect the following child data',
+      allowMultiple: 'Allow respondent to add multiple children',
+    },
+  },
+  myInfoPanel: {
+    sections: {
+      personal: 'Personal',
+      contact: 'Contact',
+      particulars: 'Particulars',
+      familyMarriage: 'Family (Marriage)',
+      familyChildren: 'Family (Children)',
+    },
+    singpassDisabledBefore: 'Enable Singpass in the',
+    singpassDisabledSettings: 'Settings',
+    singpassDisabledAfter: 'tab to access these fields.',
+    learnMore: 'Learn more',
+  },
+  fixedPaymentAmountField: {
+    label: 'Payment amount',
+    description: 'Including GST',
+    invoiceWarning:
+      'You would need to issue your own invoice for amounts above S$1000. [Learn more about this]({url})',
+  },
+  paymentsInputPanel: {
+    paymentType: {
+      label: 'Payment type',
+      placeholder: 'Select Payment Type',
+      options: {
+        products: {
+          label: 'Product or service',
+          description:
+            'Respondents pay based on products or services they select. e.g. Courses, tickets with tiered prices',
+        },
+        variable: {
+          label: 'Respondents choose what to pay',
+          description:
+            'Respondents enter the amount to pay. e.g. Donations, fines',
+        },
+        fixed: {
+          label: 'Fixed amount',
+          description:
+            'Every respondent pays the same amount, as set by the admin. e.g. Flat-rate tickets',
+        },
+      },
+    },
+    multiProduct: {
+      label: 'Allow selection of multiple types of products/services',
+    },
+    productServiceName: {
+      label: 'Product/service name',
+      description: 'This will be reflected on the proof of payment',
+      required: 'This field is required',
+    },
+    description: {
+      label: 'Description',
+    },
+    saveField: 'Save field',
+    disabled: {
+      storageModeOnly: 'Payments are only available in storage mode.',
+      // TODO [MRF-CUTOVER]: Remove after cutover.
+      cutoverLegacyOnly:
+        'Payments are only available in the legacy version of FormSG.',
+      mrfWorkflowSteps:
+        'Remove all workflow steps to enable payments. A form cannot have both a payment field and a workflow.',
+      mrfEmailNotifications:
+        'Remove email notifications in Settings to enable payments. A payment-enabled form does not send email notifications.',
+      stripeNotConnectedBefore: 'Connect your Stripe account in',
+      stripeNotConnectedSettings: 'Settings',
+      stripeNotConnectedAfter: 'to add payment field.',
+    },
+  },
+  productItem: {
+    table: {
+      amount: 'Amount',
+      quantityLimit: 'Quantity limit',
+      quantityRange: 'between {min} to {max}',
+    },
+  },
+  productModal: {
+    header: {
+      edit: 'Edit product/service',
+      add: 'Add product/service',
+    },
+    name: {
+      label: 'Product/service name',
+      description: 'This will appear on proof of payment',
+      required: 'This field is required',
+    },
+    description: {
+      label: 'Description',
+    },
+    amount: {
+      label: 'Amount',
+      includingGst: 'Including GST',
+    },
+    quantityLimit: {
+      label: 'Quantity limit',
+      description:
+        'Set the minimum and maximum quantities respondents can select',
+    },
+    minQuantity: {
+      label: 'Minimum quantity',
+      required: 'The minimum quantity is 1',
+    },
+    maxQuantity: {
+      label: 'Maximum quantity',
+      required: 'Enter a maximum quantity',
+    },
+    validation: {
+      greaterThanZero: 'Enter a value greater than 0',
+      smallerThanMax: 'Enter a value smaller than the maximum quantity',
+      greaterThanMin: 'Enter a value greater than the minimum quantity',
+      amountRange: 'Enter an amount between {min} and {max}',
+      minAmount: 'The minimum amount is {min}',
+      maxAmount: 'The maximum amount is {max}',
+      qtyLimitExceedsMax:
+        'Quantity limit could not be set because amount is above {max}',
+      maxQuantityForAmount: 'The maximum quantity for this amount is {maxQty}',
+    },
+    cancel: 'Cancel',
+    save: 'Save product',
+    saving: 'Saving',
+  },
+  productServiceBox: {
+    label: 'Product/service',
+    emptyState: "You haven't added any product/service",
+    add: 'Add',
+  },
+  variablePaymentAmountField: {
+    label: 'Payment amount limit',
+    description: 'Set the minimum and maximum amounts respondents can pay',
+    minAmount: {
+      label: 'Minimum amount',
+      error: 'The minimum amount is {amount}',
+    },
+    maxAmount: {
+      label: 'Maximum amount',
+      error: 'The maximum amount is {amount}',
+    },
+  },
+}

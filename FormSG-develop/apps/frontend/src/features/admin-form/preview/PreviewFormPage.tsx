@@ -1,0 +1,57 @@
+import { useParams } from 'react-router-dom'
+import { Flex } from '@chakra-ui/react'
+
+import { useGrowthBookFormId } from '~contexts/GrowthbookContext'
+import { fillHeightCss } from '~utils/fillHeightCss'
+import GovtMasthead from '~components/GovtMasthead'
+
+import FloatingToolBar from '~features/public-form/components/FloatingToolBar'
+import FormEndPage from '~features/public-form/components/FormEndPage'
+import FormFields from '~features/public-form/components/FormFields'
+import { FormSectionsProvider } from '~features/public-form/components/FormFields/FormSectionsContext'
+import { FormFooter } from '~features/public-form/components/FormFooter'
+import FormInstructions from '~features/public-form/components/FormInstructions'
+import { PublicFormLogo } from '~features/public-form/components/FormLogo'
+import FormStartPage from '~features/public-form/components/FormStartPage'
+import LanguageControl from '~features/public-form/components/LanguageControl'
+import { PublicFormWrapper } from '~features/public-form/components/PublicFormWrapper'
+
+import {
+  PreviewFormBannerContainer,
+  useHasStickyPreviewBanner,
+} from '../common/components/PreviewFormBanner'
+
+import { PreviewFormProvider } from './PreviewFormProvider'
+
+const PreviewFormStartPage = (): JSX.Element => (
+  <FormStartPage hasStickyPreviewBanner={useHasStickyPreviewBanner()} />
+)
+
+export const PreviewFormPage = (): JSX.Element => {
+  const { formId } = useParams()
+  if (!formId) throw new Error('No formId provided')
+  useGrowthBookFormId(formId)
+
+  return (
+    <Flex flexDir="column" css={fillHeightCss} pos="relative">
+      <PreviewFormProvider formId={formId}>
+        <GovtMasthead />
+        <PreviewFormBannerContainer />
+        <FormSectionsProvider>
+          <PublicFormLogo />
+          <PreviewFormStartPage />
+          <LanguageControl />
+          <PublicFormWrapper>
+            <FormInstructions />
+            <FormFields />
+            <FloatingToolBar />
+            <FormEndPage />
+            <FormFooter />
+          </PublicFormWrapper>
+        </FormSectionsProvider>
+      </PreviewFormProvider>
+    </Flex>
+  )
+}
+
+export default PreviewFormPage

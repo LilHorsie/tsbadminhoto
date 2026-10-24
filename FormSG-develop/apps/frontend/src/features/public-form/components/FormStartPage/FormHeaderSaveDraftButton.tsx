@@ -1,0 +1,61 @@
+import { useTranslation } from 'react-i18next'
+import { BiSave } from 'react-icons/bi'
+import { Text } from '@chakra-ui/react'
+
+import { useIsMobile } from '~hooks/useIsMobile'
+import Button from '~components/Button'
+import IconButton from '~components/IconButton'
+import Tooltip from '~components/Tooltip'
+
+import { useFormColorScheme } from '~features/public-form/utils/useFormColorScheme'
+
+export const FormHeaderSaveDraftButton = ({
+  onSaveDraft,
+  draftLastSavedDateTimeString,
+}: {
+  onSaveDraft: () => void
+  draftLastSavedDateTimeString?: string
+}) => {
+  const { t } = useTranslation()
+  const isMobile = useIsMobile()
+  const colorScheme = useFormColorScheme()
+
+  const tooltipLabel = draftLastSavedDateTimeString
+    ? t('features.publicForm.components.saveDraft.tooltip.lastSaved', {
+        lastSavedDateTimeString: draftLastSavedDateTimeString,
+      })
+    : ''
+
+  return (
+    <Tooltip
+      isDisabled={!tooltipLabel}
+      placement={isMobile ? 'top' : 'left'}
+      label={<Text data-visual-test="transparent">{tooltipLabel}</Text>}
+    >
+      {isMobile ? (
+        <IconButton
+          variant="solid"
+          colorScheme={colorScheme}
+          cursor="pointer"
+          aria-label={t(
+            'features.publicForm.components.saveDraft.button.label',
+          )}
+          icon={<BiSave />}
+          onClick={onSaveDraft}
+        />
+      ) : (
+        <Button
+          onClick={onSaveDraft}
+          outline="1px solid"
+          colorScheme={colorScheme}
+          leftIcon={<BiSave fontSize="1.25rem" />}
+          aria-label={t(
+            'features.publicForm.components.saveDraft.button.label',
+          )}
+        >
+          {t('features.publicForm.components.saveDraft.button.label')}
+        </Button>
+      )}
+    </Tooltip>
+  )
+}

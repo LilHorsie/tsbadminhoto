@@ -1,0 +1,335 @@
+import { datadogLogs } from '@datadog/browser-logs'
+
+import { FormSavedView, FormSavedViewInput } from 'formsg-shared/types'
+import {
+  FormSubmissionMetadataQueryDto,
+  SubmissionCountQueryDto,
+  SubmissionDto,
+  SubmissionMetadataList,
+  SubmissionType,
+} from 'formsg-shared/types/submission'
+
+import { env } from '~/env'
+
+import formsgSdk from '~utils/formSdk'
+import { ApiService } from '~services/ApiService'
+
+import { ADMIN_FORM_ENDPOINT } from '../common/AdminViewFormService'
+
+import {
+  killWorkers,
+  makeWorkerApiAndCleanup,
+} from './common/utils/decryptionWorker'
+import { getEncryptedResponsesStream } from './ResponsesPage/storage/StorageResponsesService'
+import { CleanableDecryptionWorkerApi } from './ResponsesPage/storage/types'
+import { augmentDecryptedResponses } from './ResponsesPage/storage/utils/augmentDecryptedResponses'
+import {
+  buildFormFieldMetaMap,
+  processDecryptedContent,
+  processDecryptedContentV4,
+} from './ResponsesPage/storage/utils/processDecryptedContent'
+
+export const createFormSavedView = async (
+  formId: string,
+  savedView: FormSavedViewInput,
+): Promise<FormSavedView[]> =>
+  ApiService.post<FormSavedView[]>(
+    `${ADMIN_FORM_ENDPOINT}/${formId}/saved-views`,
+    savedView,
+  ).then(({ data }) => data)
+
+export const updateFormSavedView = async (
+  formId: string,
+  savedViewId: string,
+  savedView: FormSavedViewInput,
+): Promise<FormSavedView[]> =>
+  ApiService.put<FormSavedView[]>(
+    `${ADMIN_FORM_ENDPOINT}/${formId}/saved-views/${savedViewId}`,
+    savedView,
+  ).then(({ data }) => data)
+
+export const deleteFormSavedView = async (
+  formId: string,
+  savedViewId: string,
+): Promise<FormSavedView[]> =>
+  ApiService.delete<FormSavedView[]>(
+    `${ADMIN_FORM_ENDPOINT}/${formId}/saved-views/${savedViewId}`,
+  ).then(({ data }) => data)
+
+/**
+ * Counts the number of submissions for a given form
+ * @param urlParameters Mapping of the url parameters to values
+ * @returns The number of form submissions
+ */
+export const countFormSubmissions = async ({
+  formId,
+  dates,
+}: {
+  formId: string
+  dates?: Partial<SubmissionCountQueryDto>
+}): Promise<number> => {
+  const queryUrl = `${ADMIN_FORM_ENDPOINT}/${formId}/submissions/count`
+  if (dates && dates.startDate && dates.endDate) {
+    return ApiService.get(queryUrl, {
+      params: dates,
+    }).then(({ data }) => data)
+  }
+  return ApiService.get(queryUrl).then(({ data }) => data)
+}
+
+/**
+ * Get of submissions metadata for a given form
+ * @param formId fomID to retrieve metadata on
+ * @returns The metadata of the form
+ */
+export const getFormSubmissionsMetadata = async (
+  formId: string,
+  queryParams: FormSubmissionMetadataQueryDto,
+): Promise<SubmissionMetadataList> => {
+  return ApiService.get(
+    `${ADMIN_FORM_ENDPOINT}/${formId}/submissions/metadata`,
+    {
+      params: queryParams,
+    },
+  ).then(({ data }) => data)
+}
+
+/**
+ * Returns the data of a single submission of a given storage mode form
+ * @param arg.formId The id of the form to query
+ * @param arg.submissionId The id of the submission
+ * @returns The data of the submission
+ */
+const getEncryptedSubmissionById = async ({
+  formId,
+  submissionId,
+}: {
+  formId: string
+  submissionId: string
+}): Promise<SubmissionDto> => {
+  return ApiService.get<SubmissionDto>(
+    `${ADMIN_FORM_ENDPOINT}/${formId}/submissions/${submissionId}`,
+  ).then(({ data }) => data)
+}
+
+export const getDecryptedSubmissionById = async ({
+  formId,
+  submissionId,
+  secretKey,
+}: {
+  formId: string
+  submissionId: string
+  secretKey?: string
+}) => {
+  if (!secretKey) return
+
+  const encryptedSubmission = await getEncryptedSubmissionById({
+    formId,
+    submissionId,
+  })
+
+  let processedContent, submissionSecretKey, mrfVersion, stepToken
+  switch (encryptedSubmission.submissionType) {
+    case SubmissionType.Encrypt: {
+      const decryptedContent = formsgSdk.crypto.decrypt(secretKey, {
+        encryptedContent: encryptedSubmission.content,
+        verifiedContent: encryptedSubmission.verified,
+        version: encryptedSubmission.version,
+      })
+      if (!decryptedContent) {
+        throw new Error('Could not decrypt the storage mode response')
+      }
+      processedContent = processDecryptedContent(decryptedContent)
+      break
+    }
+    case SubmissionType.Multirespondent: {
+      const formFieldsMeta = buildFormFieldMetaMap(
+        encryptedSubmission.form_fields,
+      )
+      const decryptedV4 = formsgSdk.cryptoV3.decryptToV4(
+        secretKey,
+        {
+          encryptedContent: encryptedSubmission.encryptedContent,
+          encryptedSubmissionSecretKey:
+            encryptedSubmission.encryptedSubmissionSecretKey,
+          verifiedContent: encryptedSubmission.verifiedContent,
+          version: encryptedSubmission.version,
+          encryptedStepToken: encryptedSubmission.encryptedStepToken,
+        },
+        formFieldsMeta,
+      )
+
+      if (!decryptedV4) {
+        datadogLogs.logger.error('Could not decrypt MRF response in v4', {
+          meta: {
+            action: 'getDecryptedSubmissionById',
+            formId,
+            submissionId,
+          },
+        })
+        throw new Error('Could not process submission content')
+      }
+
+      processedContent = processDecryptedContentV4(
+        encryptedSubmission.form_fields,
+        encryptedSubmission.form_logics,
+        decryptedV4.responses,
+        decryptedV4.verified,
+      )
+      submissionSecretKey = decryptedV4.submissionSecretKey
+      mrfVersion = encryptedSubmission.mrfVersion
+      stepToken = decryptedV4.stepToken
+      break
+    }
+  }
+
+  if (!processedContent) throw new Error('Could not process submission content')
+
+  const responses = augmentDecryptedResponses(
+    processedContent,
+    encryptedSubmission.attachmentMetadata,
+  )
+
+  // Add metadata for display.
+  return {
+    refNo: encryptedSubmission.refNo,
+    submissionTime: encryptedSubmission.submissionTime,
+    submissionSecretKey,
+    payment: encryptedSubmission.payment,
+    mrf:
+      encryptedSubmission.submissionType === SubmissionType.Multirespondent
+        ? encryptedSubmission.mrfMeta
+        : undefined,
+    responses,
+    mrfVersion,
+    stepToken,
+    workflowHistory:
+      encryptedSubmission.submissionType === SubmissionType.Multirespondent
+        ? {
+            submittedSteps: encryptedSubmission.submittedSteps ?? [],
+            workflow: encryptedSubmission.workflow,
+            workflowEvents: encryptedSubmission.workflowEvents ?? [],
+          }
+        : undefined,
+  }
+}
+
+export const stopWorkflow = ({
+  formId,
+  submissionId,
+  emails,
+}: {
+  formId: string
+  submissionId: string
+  emails: string[]
+}): Promise<{ stoppedAt: string }> =>
+  ApiService.post<{ stoppedAt: string }>(
+    `${ADMIN_FORM_ENDPOINT}/${formId}/submissions/${submissionId}/stop`,
+    { emails },
+  ).then(({ data }) => data)
+
+type DecryptedContent = NonNullable<ReturnType<typeof formsgSdk.crypto.decrypt>>
+export type DecryptedSubmission = Pick<DecryptedContent, 'responses'>
+
+export type IdentifiedDecryptedSubmission = DecryptedSubmission & {
+  submissionId: string
+}
+
+export const getAllDecryptedSubmission = async ({
+  formId,
+  secretKey,
+  startDate,
+  endDate,
+  downloadAttachments,
+  isSortByLatest,
+  limit,
+  onSubmissionDecrypted,
+}: {
+  formId: string
+  secretKey: string
+  startDate: string
+  endDate: string
+  downloadAttachments: boolean
+  isSortByLatest: boolean
+  limit: number
+  onSubmissionDecrypted?: (submission: IdentifiedDecryptedSubmission) => void
+}): Promise<IdentifiedDecryptedSubmission[]> => {
+  const numWorkers = window.navigator.hardwareConcurrency ?? 1
+  const workerPool: CleanableDecryptionWorkerApi[] = []
+  let currentSubmissionIndex = 0
+
+  for (let i = workerPool.length; i < numWorkers; i++) {
+    workerPool.push(makeWorkerApiAndCleanup())
+  }
+
+  const submissionsStream = await getEncryptedResponsesStream(formId, {
+    startDate,
+    endDate,
+    downloadAttachments,
+    isSortByLatest,
+    limit,
+  })
+
+  const decryptSubmissionPromises: Promise<IdentifiedDecryptedSubmission>[] = []
+
+  const reader = submissionsStream.getReader()
+  let read: (result: ReadableStreamReadResult<string>) => void
+
+  await reader.read().then(
+    (read = async (result) => {
+      if (result.done) return
+      const { workerApi } = workerPool[currentSubmissionIndex % numWorkers]
+      decryptSubmissionPromises.push(
+        workerApi
+          .parseAndDecryptSubmissionData({
+            submissionStreamDtoString: result.value,
+            secretKey,
+            workerCtxOptions: {
+              formsgSdkMode: env.formsgSdkMode,
+            },
+          })
+          .then((result) => {
+            if (!result.isParseSuccessful || !result.isDecryptionSuccessful) {
+              throw new Error('One or more responses failed to decrypt.')
+            }
+            const submission = {
+              submissionId: result.parsedSubmission._id,
+              responses: result.decryptedResponses,
+            }
+            onSubmissionDecrypted?.(submission)
+            return submission
+          }),
+      )
+      currentSubmissionIndex++
+      return reader.read().then(read)
+    }),
+  )
+
+  const decryptionResults = await Promise.all(
+    decryptSubmissionPromises,
+  ).finally(() => {
+    killWorkers(workerPool)
+  })
+  return decryptionResults
+}
+
+export const addAssignees = ({
+  formId,
+  submissionId,
+  emails,
+  submissionSecretKey,
+  stepToken,
+  expectedStepNumber,
+}: {
+  formId: string
+  submissionId: string
+  emails: string[]
+  submissionSecretKey: string
+  stepToken?: string
+  /** The pending step shown to the admin; the server rejects a stale page. */
+  expectedStepNumber: number
+}): Promise<{ stepNumber: number; emails: string[] }> =>
+  ApiService.post<{ stepNumber: number; emails: string[] }>(
+    `${ADMIN_FORM_ENDPOINT}/${formId}/submissions/${submissionId}/assignees`,
+    { emails, submissionSecretKey, stepToken, expectedStepNumber },
+  ).then(({ data }) => data)

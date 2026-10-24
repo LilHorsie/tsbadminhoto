@@ -1,0 +1,228 @@
+import { useCallback, useState } from 'react'
+import { useTranslation } from 'react-i18next'
+import { BiEditAlt } from 'react-icons/bi'
+import { GoEye, GoEyeClosed } from 'react-icons/go'
+import { useParams, useSearchParams } from 'react-router-dom'
+import {
+  Box,
+  Divider,
+  Flex,
+  HStack,
+  IconButton,
+  Skeleton,
+  Text,
+} from '@chakra-ui/react'
+import _ from 'lodash'
+
+import { Language } from 'formsg-shared/types'
+
+import {
+  convertUnicodeLocaleToLanguage,
+  getDefaultSupportedLanguages,
+} from '~utils/multiLanguage'
+import Badge from '~components/Badge'
+import Toggle from '~components/Toggle'
+import Tooltip from '~components/Tooltip'
+
+import { useMutateFormSettings } from '../../mutations'
+import { useAdminFormSettings } from '../../queries'
+
+interface LanguageTranslationRowProps {
+  unicodeLocale: Language
+  isDefaultLanguage: boolean
+  isLast?: boolean
+}
+
+interface LanguageTranslationSectionProps {
+  defaultLanguage: Language
+}
+
+const LanguageTranslationRow = ({
+  unicodeLocale,
+  isDefaultLanguage,
+  isLast,
+}: LanguageTranslationRowProps): JSX.Element => {
+  const { t } = useTranslation()
+  const { formId } = useParams()
+  const { data: settings } = useAdminFormSettings()
+  const [, setSearchParams] = useSearchParams()
+
+  if (!formId) throw new Error('No formId provided')
+
+  const supportedLanguages = settings?.supportedLanguages ?? null
+
+  const [isLanguageSupported, setIsLanguageSupported] = useState(
+    supportedLanguages?.indexOf(unicodeLocale) !== -1,
+  )
+
+  const languageToDisplay = convertUnicodeLocaleToLanguage(unicodeLocale)
+
+  const { mutateFormSupportedLanguages } = useMutateFormSettings()
+
+  const handleToggleSupportedLanguage = useCallback(
+    (language: Language) => {
+      if (supportedLanguages == null) return
+
+      const isLanguageSupportedPreviously = !!supportedLanguages.find(
+        (supportedLanguage) => supportedLanguage == language,
+      )
+      const isAddSupport = !isLanguageSupportedPreviously
+      const updatedSupportedLanguages = isAddSupport
+        ? supportedLanguages.concat(language)
+        : supportedLanguages.filter((l) => l !== language)
+
+      setIsLanguageSupported(isAddSupport)
+
+      return mutateFormSupportedLanguages.mutate({
+        nextSupportedLanguages: updatedSupportedLanguages,
+        selectedLanguage: language,
+      })
+    },
+    [mutateFormSupportedLanguages, supportedLanguages],
+  )
+
+  const handleLanguageTranslationEditClick = useCallback(
+    (language: Language) => {
+      setSearchParams({ unicodeLocale: language.toString() })
+    },
+    [setSearchParams],
+  )
+
+  return (
+    <>
+      <Flex alignItems="center" w="100%" py={2}>
+        <Flex marginRight="auto">
+          <Text mr="0.75rem">{languageToDisplay}</Text>
+          {isDefaultLanguage && (
+            <Badge variant="solid" colorScheme="success" color="secondary.700">
+              {t('features.common.default')}
+            </Badge>
+          )}
+        </Flex>
+        {!isDefaultLanguage && (
+          <HStack spacing="0.75rem">
+            <Tooltip
+              label={t(
+                'features.adminForm.settings.multiLanguage.languageRow.hideShowTooltip',
+              )}
+            >
+              <IconButton
+                variant="clear"
+                icon={
+                  isLanguageSupported ? (
+                    <GoEye width="44px" />
+                  ) : (
+                    <GoEyeClosed width="44px" />
+                  )
+                }
+                colorScheme="secondary"
+                aria-label={t(
+                  'features.adminForm.settings.multiLanguage.languageRow.selectDefaultAriaLabel',
+                  { language: unicodeLocale },
+                )}
+                onClick={() => handleToggleSupportedLanguage(unicodeLocale)}
+              />
+            </Tooltip>
+            <Tooltip
+              label={t(
+                'features.adminForm.settings.multiLanguage.languageRow.editTooltip',
+              )}
+            >
+              <IconButton
+                variant="clear"
+                icon={<BiEditAlt width="44px" />}
+                colorScheme="secondary"
+                aria-label={t(
+                  'features.adminForm.settings.multiLanguage.languageRow.addTranslationsAriaLabel',
+                  { language: unicodeLocale },
+                )}
+                onClick={() =>
+                  handleLanguageTranslationEditClick(unicodeLocale)
+                }
+              />
+            </Tooltip>
+          </HStack>
+        )}
+      </Flex>
+      {!isLast ? <Divider /> : null}
+    </>
+  )
+}
+
+const LanguageTranslationSection = ({
+  defaultLanguage,
+}: LanguageTranslationSectionProps): JSX.Element => {
+  let unicodeLocales = getDefaultSupportedLanguages()
+
+  const idxToRemove = unicodeLocales.indexOf(defaultLanguage)
+  unicodeLocales.splice(idxToRemove, 1)
+
+  unicodeLocales = [defaultLanguage, ...unicodeLocales]
+
+  return (
+    <Box pt={8}>
+      {unicodeLocales.map((unicodeLocale, id, arr) => {
+        return (
+          <LanguageTranslationRow
+            unicodeLocale={unicodeLocale}
+            isDefaultLanguage={unicodeLocale === defaultLanguage}
+            isLast={id === arr.length - 1}
+            key={unicodeLocale}
+          />
+        )
+      })}
+    </Box>
+  )
+}
+
+export const FormMultiLanguageToggle = (): JSX.Element => {
+  const { t } = useTranslation()
+  const { data: settings, isLoading: isLoadingSettings } =
+    useAdminFormSettings()
+
+  const { mutateFormSupportedLanguages, mutateFormHasMultiLang } =
+    useMutateFormSettings()
+
+  const hasMultiLang = settings && settings?.hasMultiLang
+
+  const handleToggleMultiLang = useCallback(() => {
+    if (!settings || isLoadingSettings || mutateFormHasMultiLang.isLoading)
+      return
+
+    const nextHasMultiLang = !settings.hasMultiLang
+
+    const currentSupportedLanguages = settings.supportedLanguages
+
+    // Add all languages as this is the first instance user turns on
+    // toggle
+    if (_.isEmpty(currentSupportedLanguages) && nextHasMultiLang) {
+      const nextSupportedLanguages = getDefaultSupportedLanguages()
+      mutateFormSupportedLanguages.mutate({ nextSupportedLanguages })
+    }
+
+    mutateFormHasMultiLang.mutate(nextHasMultiLang)
+  }, [
+    isLoadingSettings,
+    mutateFormHasMultiLang,
+    mutateFormSupportedLanguages,
+    settings,
+  ])
+
+  return (
+    <Skeleton isLoaded={!isLoadingSettings && !!settings} mt="2rem">
+      <Toggle
+        onChange={handleToggleMultiLang}
+        isChecked={hasMultiLang}
+        label={t('features.adminForm.settings.multiLanguage.toggle.label')}
+        description={t(
+          'features.adminForm.settings.multiLanguage.toggle.description',
+        )}
+      />
+      {settings && hasMultiLang ? (
+        <Skeleton isLoaded={true}>
+          <LanguageTranslationSection defaultLanguage={Language.ENGLISH} />
+        </Skeleton>
+      ) : null}
+    </Skeleton>
+  )
+}

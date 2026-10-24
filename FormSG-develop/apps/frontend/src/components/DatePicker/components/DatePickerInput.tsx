@@ -1,0 +1,68 @@
+import { useMemo } from 'react'
+import ReactInputMask from 'react-input-mask'
+import {
+  forwardRef,
+  Input as ChakraInput,
+  InputGroup,
+  InputRightAddon,
+  useMergeRefs,
+  VisuallyHidden,
+} from '@chakra-ui/react'
+
+import { CalendarButton } from '../components/CalendarButton'
+import { useDatePicker } from '../DatePickerContext'
+
+export const DatePickerInput = forwardRef<object, 'input'>((_props, ref) => {
+  const {
+    internalInputValue,
+    handleInputChange,
+    handleInputBlur,
+    handleInputClick,
+    fcProps,
+    allowManualInput,
+    placeholder,
+    inputRef,
+    internalValue,
+    isHighContrast,
+  } = useDatePicker()
+
+  const mergedInputRef = useMergeRefs(inputRef, ref)
+
+  const selectedDateAriaLiveText = useMemo(() => {
+    if (!internalValue) {
+      return 'No date selected'
+    }
+
+    return `Selected date: ${internalValue.toLocaleDateString()}`
+  }, [internalValue])
+
+  return (
+    <>
+      <VisuallyHidden aria-live="assertive">
+        {selectedDateAriaLiveText}
+      </VisuallyHidden>
+      <InputGroup>
+        <ChakraInput
+          inputMode="numeric" // Nudge Android mobile keyboard to be numeric
+          pattern="\d*" // Nudge numeric keyboard on iOS Safari.
+          as={ReactInputMask}
+          mask="99/99/9999"
+          value={internalInputValue}
+          onChange={handleInputChange}
+          placeholder={placeholder}
+          maskPlaceholder={placeholder}
+          ref={mergedInputRef}
+          {...fcProps}
+          borderRightRadius={0}
+          onBlur={handleInputBlur}
+          onClick={handleInputClick}
+          isReadOnly={fcProps.isReadOnly || !allowManualInput}
+          {...(isHighContrast && { variant: 'highContrast' })}
+        />
+        <InputRightAddon p={0} bg="none">
+          <CalendarButton />
+        </InputRightAddon>
+      </InputGroup>
+    </>
+  )
+})

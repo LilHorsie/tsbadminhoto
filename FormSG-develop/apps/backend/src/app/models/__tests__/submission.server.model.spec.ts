@@ -1,0 +1,1802 @@
+import dbHandler from '__tests__/unit/backend/helpers/jest-db'
+import { ObjectId } from 'bson'
+import { promises as dns } from 'dns'
+import {
+  BasicField,
+  FormAuthType,
+  FormResponseMode,
+  LegacySubmissionAuthType,
+  PaymentType,
+  SubmissionType,
+  WebhookResponse,
+  WorkflowStatus,
+  WorkflowType,
+} from 'formsg-shared/types'
+import { merge, omit, times } from 'lodash'
+import mongoose from 'mongoose'
+
+import { getMultirespondentFormModel } from 'src/app/models/form.server.model'
+import getSubmissionModel, {
+  getEmailSubmissionModel,
+  getEncryptSubmissionModel,
+  getMultirespondentSubmissionModel,
+} from 'src/app/models/submission.server.model'
+import { buildMrfMetadata } from 'src/app/modules/submission/submission.utils'
+import { WorkflowWebhookEventObject } from 'src/app/modules/webhook/webhook.types'
+
+import {
+  ISubmissionSchema,
+  MultirespondentSubmissionCursorData,
+  MultirespondentSubmissionData,
+  StorageModeSubmissionCursorData,
+} from '../../../types'
+import getPaymentModel from '../payment.server.model'
+import getPendingSubmissionModel from '../pending_submission.server.model'
+
+jest.mock('dns', () => ({
+  promises: {
+    lookup: jest.fn(),
+  },
+}))
+const MockDns = jest.mocked(dns)
+
+const Submission = getSubmissionModel(mongoose)
+const EncryptedSubmission = getEncryptSubmissionModel(mongoose)
+const MultirespondentSubmission = getMultirespondentSubmissionModel(mongoose)
+const EmailSubmission = getEmailSubmissionModel(mongoose)
+const PaymentSubmission = getPaymentModel(mongoose)
+const PendingSubmission = getPendingSubmissionModel(mongoose)
+
+// TODO: Add more tests for the rest of the submission schema.
+describe('Submission Model', () => {
+  beforeAll(async () => {
+    await dbHandler.connect()
+    MockDns.lookup.mockResolvedValue([
+      { address: '1.1.1.1', family: 4 },
+    ] as never)
+  })
+  afterEach(async () => await dbHandler.clearDatabase())
+  afterAll(async () => await dbHandler.closeDatabase())
+
+  const MOCK_ENCRYPTED_CONTENT = 'abcdefg encryptedContent'
+  const MOCK_VERIFIED_CONTENT = 'hijklmnop verifiedContent'
+  const MOCK_WEBHOOK_URL = 'https://test.web.site'
+
+  const MOCK_FORM_ID = new ObjectId()
+
+  const MOCK_SUBMISSION_PARAMS = {
+    form: MOCK_FORM_ID,
+    authType: FormAuthType.NIL,
+    myInfoFields: [],
+  }
+
+  const MOCK_EMAIL_SUBMISSION_PARAMS = merge(
+    // email schema params
+    {
+      submissionType: SubmissionType.Email,
+      recipientEmails: ['someone@something.gov.sg'],
+      responseHash: 'This is a hash',
+      responseSalt: 'This is a salt',
+      hasBounced: false,
+      webhookResponses: [],
+    },
+    MOCK_SUBMISSION_PARAMS,
+  )
+
+  const MOCK_ENCRYPT_SUBMISSION_PARAMS = merge(
+    // encrypt schema params
+    {
+      submissionType: SubmissionType.Encrypt,
+      encryptedContent: MOCK_ENCRYPTED_CONTENT,
+      verifiedContent: MOCK_VERIFIED_CONTENT,
+      version: 1,
+      webhookResponses: [],
+    },
+    MOCK_SUBMISSION_PARAMS,
+  )
+
+  const MOCK_MULTIRESPONDENT_SUBMISSION_PARAMS = merge(
+    // multirespondent schema params
+    {
+      submissionType: SubmissionType.Multirespondent,
+      form_fields: [{ _id: new ObjectId(), fieldType: BasicField.ShortText }],
+      form_logics: [],
+      workflow: [
+        { _id: new ObjectId(), workflow_type: WorkflowType.Static, emails: [] },
+        {
+          _id: new ObjectId(),
+          workflow_type: WorkflowType.Dynamic,
+          field: new ObjectId(),
+        },
+      ],
+      submittedSteps: [],
+      submissionPublicKey: 'This is a public key',
+      encryptedSubmissionSecretKey: 'This is an encrypted secret key',
+      encryptedContent: MOCK_ENCRYPTED_CONTENT,
+      version: 3,
+      workflowStep: 0,
+      webhookResponses: [],
+    },
+    MOCK_SUBMISSION_PARAMS,
+  )
+
+  describe('Schema', () => {
+    describe('SubmissionSchema', () => {
+      it('email schema should create and save successfully', async () => {
+        const validSubmission = new Submission(MOCK_EMAIL_SUBMISSION_PARAMS)
+        const saved = await validSubmission.save()
+
+        // Assert
+        expect(saved._id).toBeDefined()
+        expect(saved.created).toBeInstanceOf(Date)
+
+        const actualSavedObject = omit(saved.toObject(), [
+          '_id',
+          'created',
+          'lastModified',
+          '__v',
+        ])
+
+        const expectedObject = merge({}, MOCK_EMAIL_SUBMISSION_PARAMS)
+        expect(actualSavedObject).toEqual(expectedObject)
+      })
+
+      it('email schema should create and save successfully with responseMetadata', async () => {
+        const emailSubmissionWithResponseMetadata = merge(
+          { responseMetadata: { responseTimeMs: 1000, numVisibleFields: 10 } },
+          MOCK_EMAIL_SUBMISSION_PARAMS,
+        )
+        const validSubmission = new Submission(
+          emailSubmissionWithResponseMetadata,
+        )
+        const saved = await validSubmission.save()
+
+        // Assert
+        expect(saved._id).toBeDefined()
+        expect(saved.created).toBeInstanceOf(Date)
+        expect(saved.responseMetadata).toBeDefined()
+
+        const actualSavedObject = omit(saved.toObject(), [
+          '_id',
+          'created',
+          'lastModified',
+          '__v',
+        ])
+
+        const expectedObject = merge({}, emailSubmissionWithResponseMetadata)
+        expect(actualSavedObject).toEqual(expectedObject)
+      })
+
+      it('encrypt schema should create and save successfully', async () => {
+        const validSubmission = new Submission(MOCK_ENCRYPT_SUBMISSION_PARAMS)
+        const saved = await validSubmission.save()
+
+        // Assert
+        expect(saved._id).toBeDefined()
+        expect(saved.created).toBeInstanceOf(Date)
+
+        const actualSavedObject = omit(saved.toObject(), [
+          '_id',
+          'created',
+          'lastModified',
+          '__v',
+        ])
+
+        const expectedObject = merge({}, MOCK_ENCRYPT_SUBMISSION_PARAMS)
+        expect(actualSavedObject).toEqual(expectedObject)
+      })
+
+      it('encrypt schema should create and save successfully with responseMetadata', async () => {
+        const encryptSubmissionWithResponseMetadata = merge(
+          { responseMetadata: { responseTimeMs: 1000, numVisibleFields: 10 } },
+          MOCK_ENCRYPT_SUBMISSION_PARAMS,
+        )
+        const validSubmission = new Submission(
+          encryptSubmissionWithResponseMetadata,
+        )
+        const saved = await validSubmission.save()
+
+        // Assert
+        expect(saved._id).toBeDefined()
+        expect(saved.created).toBeInstanceOf(Date)
+        expect(saved.responseMetadata).toBeDefined()
+
+        const actualSavedObject = omit(saved.toObject(), [
+          '_id',
+          'created',
+          'lastModified',
+          '__v',
+        ])
+
+        const expectedObject = merge({}, encryptSubmissionWithResponseMetadata)
+        expect(actualSavedObject).toEqual(expectedObject)
+      })
+
+      it('multirespondent schema should create and save successfully', async () => {
+        const validSubmission = new Submission(
+          MOCK_MULTIRESPONDENT_SUBMISSION_PARAMS,
+        )
+        const saved = await validSubmission.save()
+
+        // Assert
+        expect(saved._id).toBeDefined()
+        expect(saved.created).toBeInstanceOf(Date)
+
+        const actualSavedObject = omit(saved.toObject(), [
+          '_id',
+          'created',
+          'lastModified',
+          '__v',
+        ])
+
+        const expectedObject = merge({}, MOCK_MULTIRESPONDENT_SUBMISSION_PARAMS)
+        expect(actualSavedObject).toEqual(expectedObject)
+      })
+
+      it('multirespondent schema should create and save successfully with responseMetadata', async () => {
+        const multirespondentSubmissionWithResponseMetadata = merge(
+          { responseMetadata: { responseTimeMs: 1000, numVisibleFields: 10 } },
+          MOCK_MULTIRESPONDENT_SUBMISSION_PARAMS,
+        )
+        const validSubmission = new Submission(
+          multirespondentSubmissionWithResponseMetadata,
+        )
+        const saved = await validSubmission.save()
+
+        // Assert
+        expect(saved._id).toBeDefined()
+        expect(saved.created).toBeInstanceOf(Date)
+        expect(saved.responseMetadata).toBeDefined()
+
+        const actualSavedObject = omit(saved.toObject(), [
+          '_id',
+          'created',
+          'lastModified',
+          '__v',
+        ])
+
+        const expectedObject = merge(
+          {},
+          multirespondentSubmissionWithResponseMetadata,
+        )
+        expect(actualSavedObject).toEqual(expectedObject)
+      })
+
+      // Forms can no longer use sgID, but submissions stored before its
+      // removal still carry these auth types and must remain saveable.
+      it.each(Object.values(LegacySubmissionAuthType))(
+        'should save a submission with legacy authType %s',
+        async (authType) => {
+          const saved = await new Submission({
+            ...MOCK_ENCRYPT_SUBMISSION_PARAMS,
+            authType,
+          }).save()
+
+          expect(saved.authType).toBe(authType)
+        },
+      )
+
+      // Confirming a pending submission re-saves it into the submissions
+      // collection, so pending submissions must accept the same values.
+      it.each(Object.values(LegacySubmissionAuthType))(
+        'should save a pending submission with legacy authType %s',
+        async (authType) => {
+          const saved = await new PendingSubmission({
+            ...MOCK_ENCRYPT_SUBMISSION_PARAMS,
+            authType,
+          }).save()
+
+          expect(saved.authType).toBe(authType)
+        },
+      )
+    })
+  })
+
+  describe('Statics', () => {
+    describe('retrieveWebhookInfoById', () => {
+      it('should return the populated submission when the submission and webhook URL exist', async () => {
+        const { form } = await dbHandler.insertEncryptForm({
+          formOptions: {
+            webhook: {
+              url: MOCK_WEBHOOK_URL,
+              isRetryEnabled: true,
+            },
+          },
+        })
+        const submission = await EncryptedSubmission.create({
+          form: form._id,
+          encryptedContent: MOCK_ENCRYPTED_CONTENT,
+          version: 0,
+        })
+
+        const result = await EncryptedSubmission.retrieveWebhookInfoById(
+          String(submission._id),
+        )
+
+        expect(result).toEqual({
+          webhookUrl: MOCK_WEBHOOK_URL,
+          isRetryEnabled: true,
+          webhookView: {
+            data: {
+              attachmentDownloadUrls: {},
+              formId: String(form._id),
+              submissionId: String(submission._id),
+              encryptedContent: MOCK_ENCRYPTED_CONTENT,
+              verifiedContent: undefined,
+              version: 0,
+              created: submission.created,
+              paymentContent: {},
+            },
+          },
+        })
+      })
+
+      it('should surface the per-step snapshot tokens a retry resolves against, while keeping them out of the webhook view', async () => {
+        const MultirespondentForm = getMultirespondentFormModel(mongoose)
+        const { user } = await dbHandler.insertFormCollectionReqs()
+        const form = await MultirespondentForm.create({
+          title: 'mrf retry form',
+          admin: user._id,
+          responseMode: FormResponseMode.Multirespondent,
+          publicKey: 'mockPublicKey',
+          webhook: {
+            url: MOCK_WEBHOOK_URL,
+            isRetryEnabled: true,
+          },
+        })
+        const submission = await MultirespondentSubmission.create({
+          form: form._id,
+          submissionType: SubmissionType.Multirespondent,
+          form_fields: [],
+          form_logics: [],
+          workflow: [],
+          submissionPublicKey: 'test public key',
+          encryptedSubmissionSecretKey: 'test secret key',
+          encryptedContent: MOCK_ENCRYPTED_CONTENT,
+          version: 1,
+          workflowStep: 1,
+          mrfVersion: 2,
+          submittedSteps: [
+            {
+              isApproval: false,
+              submittedAt: '2026-07-22T00:00:00.000Z',
+              snapshotTokens: { v4: 'SNAPSHOT_TOKEN_STEP_0' },
+            },
+            {
+              isApproval: false,
+              submittedAt: '2026-07-22T01:00:00.000Z',
+              snapshotTokens: { v4: 'SNAPSHOT_TOKEN_STEP_1' },
+            },
+          ],
+        })
+
+        const result = await Submission.retrieveWebhookInfoById(
+          String(submission._id),
+        )
+
+        expect(result?.submittedStepSnapshotTokens).toEqual([
+          { v4: 'SNAPSHOT_TOKEN_STEP_0' },
+          { v4: 'SNAPSHOT_TOKEN_STEP_1' },
+        ])
+        // Ensure that the external webhook view omits the snapshot tokens.
+        const serialisedView = JSON.stringify(result?.webhookView)
+        expect(serialisedView).not.toContain('SNAPSHOT_TOKEN_STEP_0')
+        expect(serialisedView).not.toContain('SNAPSHOT_TOKEN_STEP_1')
+      })
+
+      it('should return the paymentContent when the submission, payment, and webhook URL exist', async () => {
+        const { form } = await dbHandler.insertEncryptForm({
+          formOptions: {
+            webhook: {
+              url: MOCK_WEBHOOK_URL,
+              isRetryEnabled: true,
+            },
+          },
+        })
+        const submission = await EncryptedSubmission.create({
+          form: form._id,
+          encryptedContent: MOCK_ENCRYPTED_CONTENT,
+          version: 0,
+        })
+
+        const MOCK_PAYMENT_INTENT_ID = 'MOCK_PAYMENT_INTENT_ID'
+        const MOCK_EMAIL = 'MOCK_EMAIL'
+        const MOCK_PAYMENT_STATUS = 'succeeded'
+        const payment = await PaymentSubmission.create({
+          amount: 100,
+          paymentStatus: 'successful',
+          submission: submission._id,
+          gstEnabled: false,
+          paymentIntentId: MOCK_PAYMENT_INTENT_ID,
+          email: MOCK_EMAIL,
+          targetAccountId: 'targetAccountId',
+          formId: form._id,
+          pendingSubmissionId: submission._id,
+          status: MOCK_PAYMENT_STATUS,
+        })
+        submission.paymentId = payment._id
+        await submission.save()
+
+        const result = await EncryptedSubmission.retrieveWebhookInfoById(
+          String(submission._id),
+        )
+
+        expect(result).toEqual({
+          webhookUrl: MOCK_WEBHOOK_URL,
+          isRetryEnabled: true,
+          webhookView: {
+            data: {
+              attachmentDownloadUrls: {},
+              formId: String(form._id),
+              submissionId: String(submission._id),
+              encryptedContent: MOCK_ENCRYPTED_CONTENT,
+              verifiedContent: undefined,
+              version: 0,
+              created: submission.created,
+              paymentContent: {
+                amount: '1.00',
+                dateTime: '-',
+                payer: MOCK_EMAIL,
+                paymentIntent: MOCK_PAYMENT_INTENT_ID,
+                productService: '-',
+                status: MOCK_PAYMENT_STATUS,
+                transactionFee: '-',
+                type: 'payment_charge',
+                url: expect.stringContaining(
+                  `api/v3/payments/${form._id}/${payment._id}/invoice/download`,
+                ),
+              },
+            },
+          },
+        })
+      })
+
+      it('should not return the paymentContent when the payment type is Fixed', async () => {
+        const { form } = await dbHandler.insertEncryptForm({
+          formOptions: {
+            webhook: {
+              url: MOCK_WEBHOOK_URL,
+              isRetryEnabled: true,
+            },
+          },
+        })
+        const submission = await EncryptedSubmission.create({
+          form: form._id,
+          encryptedContent: MOCK_ENCRYPTED_CONTENT,
+          version: 0,
+        })
+
+        const MOCK_PAYMENT_INTENT_ID = 'MOCK_PAYMENT_INTENT_ID'
+        const MOCK_EMAIL = 'MOCK_EMAIL'
+        const MOCK_PAYMENT_STATUS = 'succeeded'
+        const payment = await PaymentSubmission.create({
+          amount: 100,
+          paymentStatus: 'successful',
+          submission: submission._id,
+          gstEnabled: false,
+          paymentIntentId: MOCK_PAYMENT_INTENT_ID,
+          email: MOCK_EMAIL,
+          targetAccountId: 'targetAccountId',
+          formId: form._id,
+          pendingSubmissionId: submission._id,
+          status: MOCK_PAYMENT_STATUS,
+          payment_fields_snapshot: {
+            payment_type: PaymentType.Fixed,
+          },
+        })
+        submission.paymentId = payment._id
+        await submission.save()
+
+        const result = await EncryptedSubmission.retrieveWebhookInfoById(
+          String(submission._id),
+        )
+
+        expect(result).toEqual({
+          webhookUrl: MOCK_WEBHOOK_URL,
+          isRetryEnabled: true,
+          webhookView: {
+            data: {
+              attachmentDownloadUrls: {},
+              formId: String(form._id),
+              submissionId: String(submission._id),
+              encryptedContent: MOCK_ENCRYPTED_CONTENT,
+              verifiedContent: undefined,
+              version: 0,
+              created: submission.created,
+              paymentContent: {},
+            },
+          },
+        })
+      })
+
+      it('should return null when the submission ID does not exist', async () => {
+        // Create submission
+        const { form } = await dbHandler.insertEncryptForm({
+          formOptions: {
+            webhook: {
+              url: MOCK_WEBHOOK_URL,
+              isRetryEnabled: true,
+            },
+          },
+        })
+        await EncryptedSubmission.create({
+          form: form._id,
+          encryptedContent: MOCK_ENCRYPTED_CONTENT,
+          version: 0,
+        })
+
+        // Attempt to find submission with a different ID
+        const result = await EncryptedSubmission.retrieveWebhookInfoById(
+          String(new ObjectId().toHexString()),
+        )
+
+        expect(result).toBeNull()
+      })
+
+      it('should return empty string for the webhook URL when the form does not have a webhook URL', async () => {
+        const { form } = await dbHandler.insertEncryptForm()
+        const submission = await EncryptedSubmission.create({
+          form: form._id,
+          encryptedContent: MOCK_ENCRYPTED_CONTENT,
+          version: 0,
+        })
+
+        const result = await EncryptedSubmission.retrieveWebhookInfoById(
+          String(submission._id),
+        )
+
+        expect(result).toEqual({
+          webhookUrl: '',
+          isRetryEnabled: false,
+          webhookView: {
+            data: {
+              attachmentDownloadUrls: {},
+              formId: String(form._id),
+              submissionId: String(submission._id),
+              encryptedContent: MOCK_ENCRYPTED_CONTENT,
+              verifiedContent: undefined,
+              version: 0,
+              created: submission.created,
+              paymentContent: {},
+            },
+          },
+        })
+      })
+
+      it('should return false for isRetryEnabled when the form does not have retries enabled', async () => {
+        const { form } = await dbHandler.insertEncryptForm({
+          formOptions: {
+            webhook: {
+              url: MOCK_WEBHOOK_URL,
+              isRetryEnabled: false,
+            },
+          },
+        })
+        const submission = await EncryptedSubmission.create({
+          form: form._id,
+          encryptedContent: MOCK_ENCRYPTED_CONTENT,
+          version: 0,
+        })
+
+        const result = await EncryptedSubmission.retrieveWebhookInfoById(
+          String(submission._id),
+        )
+
+        expect(result).toEqual({
+          webhookUrl: MOCK_WEBHOOK_URL,
+          isRetryEnabled: false,
+          webhookView: {
+            data: {
+              attachmentDownloadUrls: {},
+              formId: String(form._id),
+              submissionId: String(submission._id),
+              encryptedContent: MOCK_ENCRYPTED_CONTENT,
+              verifiedContent: undefined,
+              version: 0,
+              created: submission.created,
+              paymentContent: {},
+            },
+          },
+        })
+      })
+
+      it('should return the populated submission for a multirespondent submission', async () => {
+        const MultirespondentForm = getMultirespondentFormModel(mongoose)
+        const { user } = await dbHandler.insertFormCollectionReqs()
+        const form = await MultirespondentForm.create({
+          title: 'mrf webhook form',
+          admin: user._id,
+          responseMode: FormResponseMode.Multirespondent,
+          publicKey: 'mockPublicKey',
+          webhook: {
+            url: MOCK_WEBHOOK_URL,
+            isRetryEnabled: true,
+          },
+        })
+        const submission = await MultirespondentSubmission.create({
+          form: form._id,
+          submissionType: SubmissionType.Multirespondent,
+          form_fields: [],
+          form_logics: [],
+          workflow: [],
+          submissionPublicKey: 'test public key',
+          encryptedSubmissionSecretKey: 'test secret key',
+          encryptedContent: MOCK_ENCRYPTED_CONTENT,
+          version: 1,
+          workflowStep: 0,
+          submittedSteps: [],
+        })
+
+        const result = await Submission.retrieveWebhookInfoById(
+          String(submission._id),
+        )
+
+        expect(result).toEqual({
+          webhookUrl: MOCK_WEBHOOK_URL,
+          isRetryEnabled: true,
+          webhookView: {
+            data: {
+              attachmentDownloadUrls: {},
+              formId: String(form._id),
+              submissionId: String(submission._id),
+              encryptedContent: MOCK_ENCRYPTED_CONTENT,
+              encryptedSubmissionSecretKey: 'test secret key',
+              verifiedContent: undefined,
+              version: 3,
+              created: submission.created,
+              paymentContent: {},
+              workflowContent: {
+                workflow: submission.workflow,
+                workflowStep: 0,
+                submittedSteps: [],
+              },
+            },
+          },
+        })
+      })
+    })
+
+    describe('findFormsWithSubsAbove', () => {
+      it('should return ids and counts of forms with more than given minimum submissions', async () => {
+        // Arrange
+        const formCounts = [4, 2, 4]
+        const formIdsAndCounts = times(formCounts.length, (it) => ({
+          _id: new mongoose.Types.ObjectId(),
+          count: formCounts[it],
+        }))
+        const submissionPromises: Promise<ISubmissionSchema>[] = []
+        formIdsAndCounts.forEach(({ count, _id: formId }) => {
+          times(count, () =>
+            submissionPromises.push(
+              Submission.create({
+                form: formId,
+                myInfoFields: [],
+                submissionType: SubmissionType.Email,
+                responseHash: 'hash',
+                responseSalt: 'salt',
+              }),
+            ),
+          )
+        })
+        await Promise.all(submissionPromises)
+        const minSubCount = 3
+
+        // Act
+        const actualResult =
+          await Submission.findFormsWithSubsAbove(minSubCount)
+
+        // Assert
+        const expectedResult = formIdsAndCounts.filter(
+          ({ count }) => count > minSubCount,
+        )
+        expect(actualResult).toEqual(expect.arrayContaining(expectedResult))
+      })
+
+      it('should return an empty array if no forms have submission counts higher than given count', async () => {
+        // Arrange
+        const formCounts = [1, 1, 2]
+        const formIdsAndCounts = times(formCounts.length, (it) => ({
+          _id: new mongoose.Types.ObjectId(),
+          count: formCounts[it],
+        }))
+        const submissionPromises: Promise<ISubmissionSchema>[] = []
+        formIdsAndCounts.forEach(({ count, _id: formId }) => {
+          times(count, () =>
+            submissionPromises.push(
+              Submission.create({
+                form: formId,
+                myInfoFields: [],
+                submissionType: SubmissionType.Email,
+                responseHash: 'hash',
+                responseSalt: 'salt',
+              }),
+            ),
+          )
+        })
+        await Promise.all(submissionPromises)
+        // Tests for greater than, should not return even if equal to some
+        // submission count.
+        const minSubCount = 2
+
+        // Act
+        const actualResult =
+          await Submission.findFormsWithSubsAbove(minSubCount)
+
+        // Assert
+        expect(actualResult).toEqual([])
+      })
+    })
+
+    describe('findEncryptedOrMultirespondentSubmissionById', () => {
+      it('should find an encrypt submission on the form', async () => {
+        // Arrange
+        const submission = await EncryptedSubmission.create(
+          MOCK_ENCRYPT_SUBMISSION_PARAMS,
+        )
+
+        // Act
+        const actualResult =
+          await Submission.findEncryptedOrMultirespondentSubmissionById(
+            MOCK_FORM_ID.toHexString(),
+            submission._id.toHexString(),
+          )
+
+        // Assert
+        expect(actualResult).not.toBeNull()
+        expect(actualResult?.submissionType).toEqual(SubmissionType.Encrypt)
+        expect(actualResult?.encryptedContent).toEqual(MOCK_ENCRYPTED_CONTENT)
+        expect(actualResult?.version).toEqual(1)
+      })
+
+      it('should find an encrypt submission with version 2.1', async () => {
+        // Arrange
+        const submission = await EncryptedSubmission.create({
+          ...MOCK_ENCRYPT_SUBMISSION_PARAMS,
+          version: 2.1,
+        })
+
+        // Act
+        const actualResult =
+          await Submission.findEncryptedOrMultirespondentSubmissionById(
+            MOCK_FORM_ID.toHexString(),
+            submission._id.toHexString(),
+          )
+
+        // Assert
+        expect(actualResult?.submissionType).toEqual(SubmissionType.Encrypt)
+        expect(actualResult?.version).toEqual(2.1)
+      })
+
+      it('should find a multirespondent submission on the form', async () => {
+        // Arrange
+        const submission = await MultirespondentSubmission.create(
+          MOCK_MULTIRESPONDENT_SUBMISSION_PARAMS,
+        )
+
+        // Act
+        const actualResult =
+          await Submission.findEncryptedOrMultirespondentSubmissionById(
+            MOCK_FORM_ID.toHexString(),
+            submission._id.toHexString(),
+          )
+
+        // Assert
+        expect(actualResult).not.toBeNull()
+        expect(actualResult?.submissionType).toEqual(
+          SubmissionType.Multirespondent,
+        )
+        const mrfResult = actualResult as MultirespondentSubmissionData
+        expect(mrfResult.encryptedSubmissionSecretKey).toEqual(
+          'This is an encrypted secret key',
+        )
+        expect(mrfResult.workflow).toBeDefined()
+      })
+
+      it('should project myInfoReadOnlyFields for a multirespondent submission', async () => {
+        // Arrange
+        const myInfoFieldId = new ObjectId().toHexString()
+        const submission = await MultirespondentSubmission.create({
+          ...MOCK_MULTIRESPONDENT_SUBMISSION_PARAMS,
+          myInfoReadOnlyFields: [myInfoFieldId],
+        })
+
+        // Act
+        const actualResult =
+          await Submission.findEncryptedOrMultirespondentSubmissionById(
+            MOCK_FORM_ID.toHexString(),
+            submission._id.toHexString(),
+          )
+
+        // Assert
+        // The [MyInfo] prefix on the admin response view depends on this
+        // field being projected.
+        expect(
+          (actualResult as MultirespondentSubmissionData).myInfoReadOnlyFields,
+        ).toEqual([myInfoFieldId])
+      })
+
+      it('should find every submission type on a mode-migrated form holding encrypt, v3 and v4 submissions', async () => {
+        // Arrange
+        const encryptSubmission = await EncryptedSubmission.create(
+          MOCK_ENCRYPT_SUBMISSION_PARAMS,
+        )
+        const mrfV3Submission = await MultirespondentSubmission.create(
+          MOCK_MULTIRESPONDENT_SUBMISSION_PARAMS,
+        )
+        const mrfV4Submission = await MultirespondentSubmission.create({
+          ...MOCK_MULTIRESPONDENT_SUBMISSION_PARAMS,
+          version: 4,
+          mrfVersion: 2,
+        })
+
+        // Act
+        const results = await Promise.all(
+          [encryptSubmission, mrfV3Submission, mrfV4Submission].map(
+            (submission) =>
+              Submission.findEncryptedOrMultirespondentSubmissionById(
+                MOCK_FORM_ID.toHexString(),
+                submission._id.toHexString(),
+              ),
+          ),
+        )
+
+        // Assert
+        expect(results[0]?.submissionType).toEqual(SubmissionType.Encrypt)
+        expect(results[1]?.submissionType).toEqual(
+          SubmissionType.Multirespondent,
+        )
+        expect(results[1]?.version).toEqual(3)
+        expect(results[2]?.submissionType).toEqual(
+          SubmissionType.Multirespondent,
+        )
+        expect(results[2]?.version).toEqual(4)
+        expect(
+          (results[2] as MultirespondentSubmissionData).mrfVersion,
+        ).toEqual(2)
+      })
+
+      it('should return null for an email submission on the same form', async () => {
+        // Arrange
+        const submission = await EmailSubmission.create(
+          MOCK_EMAIL_SUBMISSION_PARAMS,
+        )
+
+        // Act
+        const actualResult =
+          await Submission.findEncryptedOrMultirespondentSubmissionById(
+            MOCK_FORM_ID.toHexString(),
+            submission._id.toHexString(),
+          )
+
+        // Assert
+        expect(actualResult).toBeNull()
+      })
+
+      it('should return null when the submission belongs to another form', async () => {
+        // Arrange
+        const submission = await EncryptedSubmission.create(
+          MOCK_ENCRYPT_SUBMISSION_PARAMS,
+        )
+
+        // Act
+        const actualResult =
+          await Submission.findEncryptedOrMultirespondentSubmissionById(
+            new ObjectId().toHexString(),
+            submission._id.toHexString(),
+          )
+
+        // Assert
+        expect(actualResult).toBeNull()
+      })
+    })
+
+    describe('getEncryptedOrMultirespondentSubmissionCursorByFormId', () => {
+      it('should stream each encrypt and multirespondent submission exactly once, excluding email submissions', async () => {
+        // Arrange
+        // A mode-migrated form: one encrypt, one MRF v3, one MRF v4 and one
+        // email submission all on the same form.
+        const encryptSubmission = await EncryptedSubmission.create(
+          MOCK_ENCRYPT_SUBMISSION_PARAMS,
+        )
+        const mrfV3Submission = await MultirespondentSubmission.create(
+          MOCK_MULTIRESPONDENT_SUBMISSION_PARAMS,
+        )
+        const mrfV4Submission = await MultirespondentSubmission.create({
+          ...MOCK_MULTIRESPONDENT_SUBMISSION_PARAMS,
+          version: 4,
+          mrfVersion: 2,
+        })
+        await EmailSubmission.create(MOCK_EMAIL_SUBMISSION_PARAMS)
+
+        // Act
+        const cursor =
+          Submission.getEncryptedOrMultirespondentSubmissionCursorByFormId(
+            MOCK_FORM_ID.toHexString(),
+            {},
+          )
+        const docs = []
+        for await (const doc of cursor) docs.push(doc)
+
+        // Assert
+        expect(docs).toHaveLength(3)
+        const docIds = docs.map((doc) => String(doc._id)).sort()
+        expect(docIds).toEqual(
+          [encryptSubmission._id, mrfV3Submission._id, mrfV4Submission._id]
+            .map(String)
+            .sort(),
+        )
+        const typeCounts = docs.reduce<Record<string, number>>((acc, doc) => {
+          acc[doc.submissionType] = (acc[doc.submissionType] ?? 0) + 1
+          return acc
+        }, {})
+        expect(typeCounts).toEqual({
+          [SubmissionType.Encrypt]: 1,
+          [SubmissionType.Multirespondent]: 2,
+        })
+      })
+
+      it('should not load unclassified step sub-fields for multirespondent docs', async () => {
+        // Arrange
+        await MultirespondentSubmission.create({
+          ...MOCK_MULTIRESPONDENT_SUBMISSION_PARAMS,
+          submittedSteps: [
+            {
+              isApproval: true,
+              submittedAt: '2026-07-22T00:00:00.000Z',
+              status: WorkflowStatus.APPROVED,
+              nextStepRecipientEmails: ['next@example.com'],
+              submitterId: 'SUBMITTER_ID_HASH',
+              snapshotTokens: { v4: 'SNAPSHOT_TOKEN_LEAF_VALUE' },
+            },
+          ],
+        })
+
+        // Act
+        const cursor =
+          Submission.getEncryptedOrMultirespondentSubmissionCursorByFormId(
+            MOCK_FORM_ID.toHexString(),
+            {},
+          )
+        const docs = []
+        for await (const doc of cursor) docs.push(doc)
+
+        // Assert
+        expect(docs).toHaveLength(1)
+        expect(
+          (docs[0] as MultirespondentSubmissionCursorData).submittedSteps,
+        ).toEqual([
+          {
+            isApproval: true,
+            submittedAt: '2026-07-22T00:00:00.000Z',
+            status: WorkflowStatus.APPROVED,
+            nextStepRecipientEmails: ['next@example.com'],
+          },
+        ])
+      })
+
+      it('should project myInfoReadOnlyFields for multirespondent submissions', async () => {
+        // Arrange
+        const myInfoFieldId = new ObjectId().toHexString()
+        await MultirespondentSubmission.create({
+          ...MOCK_MULTIRESPONDENT_SUBMISSION_PARAMS,
+          myInfoReadOnlyFields: [myInfoFieldId],
+        })
+
+        // Act
+        const cursor =
+          Submission.getEncryptedOrMultirespondentSubmissionCursorByFormId(
+            MOCK_FORM_ID.toHexString(),
+            {},
+          )
+        const docs = []
+        for await (const doc of cursor) docs.push(doc)
+
+        // Assert
+        // The [MyInfo] prefix in MRF exports depends on this field being
+        // projected.
+        expect(docs).toHaveLength(1)
+        expect(
+          (docs[0] as MultirespondentSubmissionCursorData).myInfoReadOnlyFields,
+        ).toEqual([myInfoFieldId])
+      })
+
+      it('should project the payment reference for encrypt submissions and never for multirespondent submissions', async () => {
+        // Arrange
+        // Payment-enabled storage-mode forms are migration-eligible, so a
+        // mode-migrated form can hold encrypt submissions carrying payments.
+        // Payments and workflows never combine on a form, so multirespondent
+        // submissions can never carry one.
+        const mockPaymentId = new ObjectId()
+        const paidEncryptSubmission = await EncryptedSubmission.create({
+          ...MOCK_ENCRYPT_SUBMISSION_PARAMS,
+          paymentId: mockPaymentId,
+        })
+        const unpaidEncryptSubmission = await EncryptedSubmission.create(
+          MOCK_ENCRYPT_SUBMISSION_PARAMS,
+        )
+        const mrfSubmission = await MultirespondentSubmission.create(
+          MOCK_MULTIRESPONDENT_SUBMISSION_PARAMS,
+        )
+
+        // Act
+        const cursor =
+          Submission.getEncryptedOrMultirespondentSubmissionCursorByFormId(
+            MOCK_FORM_ID.toHexString(),
+            {},
+          )
+        const docs = []
+        for await (const doc of cursor) docs.push(doc)
+
+        // Assert
+        expect(docs).toHaveLength(3)
+        const docsById = new Map(docs.map((doc) => [String(doc._id), doc]))
+        const paidDoc = docsById.get(
+          String(paidEncryptSubmission._id),
+        ) as StorageModeSubmissionCursorData
+        expect(String(paidDoc.paymentId)).toEqual(String(mockPaymentId))
+        expect(
+          docsById.get(String(unpaidEncryptSubmission._id)),
+        ).not.toHaveProperty('paymentId')
+        expect(docsById.get(String(mrfSubmission._id))).not.toHaveProperty(
+          'paymentId',
+        )
+      })
+    })
+
+    describe('findAllEncryptedOrMultirespondentMetadataByFormId', () => {
+      it('should return agreeing rows and count across both submission types, excluding email submissions', async () => {
+        // Arrange
+        const encryptSubmission = await EncryptedSubmission.create(
+          MOCK_ENCRYPT_SUBMISSION_PARAMS,
+        )
+        const mrfSubmission = await MultirespondentSubmission.create(
+          MOCK_MULTIRESPONDENT_SUBMISSION_PARAMS,
+        )
+        await EmailSubmission.create(MOCK_EMAIL_SUBMISSION_PARAMS)
+
+        // Act
+        const actualResult =
+          await Submission.findAllEncryptedOrMultirespondentMetadataByFormId(
+            MOCK_FORM_ID.toHexString(),
+          )
+
+        // Assert
+        expect(actualResult.count).toEqual(2)
+        expect(actualResult.metadata).toHaveLength(2)
+        expect(actualResult.metadata.map((entry) => entry.number)).toEqual([
+          2, 1,
+        ])
+        const metadataByRefNo = new Map(
+          actualResult.metadata.map((entry) => [String(entry.refNo), entry]),
+        )
+        // The encrypt row carries no mrf metadata, so the dashboard renders
+        // it like a multirespondent submission with no workflow.
+        expect(
+          metadataByRefNo.get(String(encryptSubmission._id))?.mrf,
+        ).toBeUndefined()
+        const mrfEntry = metadataByRefNo.get(String(mrfSubmission._id))
+        expect(mrfEntry?.mrf).toBeDefined()
+        expect(mrfEntry?.mrf?.workflowNumTotalSteps).toEqual(2)
+        expect(mrfEntry?.mrf?.workflowCurrentStepNumber).toEqual(1)
+      })
+
+      it('should keep rows and count to the date range across both submission types', async () => {
+        // Arrange
+        // RATIONALE: mongoose treats the created timestamp as immutable, so
+        // set it on the raw collection.
+        const setCreated = (_id: unknown, created: string) =>
+          Submission.collection.updateOne(
+            { _id },
+            { $set: { created: new Date(created) } },
+          )
+        const inRangeEncrypt = await EncryptedSubmission.create(
+          MOCK_ENCRYPT_SUBMISSION_PARAMS,
+        )
+        const inRangeMrf = await MultirespondentSubmission.create(
+          MOCK_MULTIRESPONDENT_SUBMISSION_PARAMS,
+        )
+        const outOfRangeMrf = await MultirespondentSubmission.create(
+          MOCK_MULTIRESPONDENT_SUBMISSION_PARAMS,
+        )
+        // 6 Oct 09:00 and 8 Oct 23:30 SGT are inside 6-8 Oct; 9 Oct 00:30
+        // SGT is outside.
+        await setCreated(inRangeEncrypt._id, '2026-10-06T01:00:00.000Z')
+        await setCreated(inRangeMrf._id, '2026-10-08T15:30:00.000Z')
+        await setCreated(outOfRangeMrf._id, '2026-10-08T16:30:00.000Z')
+
+        // Act
+        const actualResult =
+          await Submission.findAllEncryptedOrMultirespondentMetadataByFormId(
+            MOCK_FORM_ID.toHexString(),
+            { startDate: '2026-10-06', endDate: '2026-10-08' },
+          )
+
+        // Assert
+        expect(actualResult.count).toEqual(2)
+        expect(
+          actualResult.metadata.map((entry) => String(entry.refNo)).sort(),
+        ).toEqual([String(inRangeEncrypt._id), String(inRangeMrf._id)].sort())
+      })
+
+      it('should return empty page and zero count when the form only has email submissions', async () => {
+        // Arrange
+        await EmailSubmission.create(MOCK_EMAIL_SUBMISSION_PARAMS)
+
+        // Act
+        const actualResult =
+          await Submission.findAllEncryptedOrMultirespondentMetadataByFormId(
+            MOCK_FORM_ID.toHexString(),
+          )
+
+        // Assert
+        expect(actualResult).toEqual({ metadata: [], count: 0 })
+      })
+    })
+
+    describe('findEncryptedOrMultirespondentSingleMetadata', () => {
+      it('should return metadata without mrf for an encrypt submission', async () => {
+        // Arrange
+        const submission = await EncryptedSubmission.create(
+          MOCK_ENCRYPT_SUBMISSION_PARAMS,
+        )
+
+        // Act
+        const actualResult =
+          await Submission.findEncryptedOrMultirespondentSingleMetadata(
+            MOCK_FORM_ID.toHexString(),
+            submission._id.toHexString(),
+          )
+
+        // Assert
+        expect(actualResult).not.toBeNull()
+        expect(String(actualResult?.refNo)).toEqual(String(submission._id))
+        expect(actualResult?.mrf).toBeUndefined()
+      })
+
+      it('should return metadata with mrf for a multirespondent submission', async () => {
+        // Arrange
+        const submission = await MultirespondentSubmission.create(
+          MOCK_MULTIRESPONDENT_SUBMISSION_PARAMS,
+        )
+
+        // Act
+        const actualResult =
+          await Submission.findEncryptedOrMultirespondentSingleMetadata(
+            MOCK_FORM_ID.toHexString(),
+            submission._id.toHexString(),
+          )
+
+        // Assert
+        expect(actualResult).not.toBeNull()
+        expect(actualResult?.mrf).toBeDefined()
+        expect(actualResult?.mrf?.workflowNumTotalSteps).toEqual(2)
+      })
+
+      it('should return payment metadata alongside mrf for a multirespondent submission with a completed payment', async () => {
+        // Arrange
+        const submission = await MultirespondentSubmission.create(
+          MOCK_MULTIRESPONDENT_SUBMISSION_PARAMS,
+        )
+        const payment = await PaymentSubmission.create({
+          amount: 100,
+          email: 'MOCK_EMAIL',
+          paymentIntentId: 'MOCK_PAYMENT_INTENT_ID',
+          gstEnabled: false,
+          targetAccountId: 'targetAccountId',
+          formId: MOCK_FORM_ID.toHexString(),
+          pendingSubmissionId: submission._id,
+          status: 'succeeded',
+          completedPayment: {
+            paymentDate: new Date('2024-01-01T00:00:00.000Z'),
+            submissionId: submission._id,
+            transactionFee: 10,
+            receiptUrl: 'https://example.com/receipt',
+          },
+        })
+        submission.paymentId = payment._id
+        await submission.save()
+
+        // Act
+        const actualResult =
+          await Submission.findEncryptedOrMultirespondentSingleMetadata(
+            MOCK_FORM_ID.toHexString(),
+            submission._id.toHexString(),
+          )
+
+        // Assert
+        expect(actualResult?.mrf).toBeDefined()
+        expect(actualResult?.payments).toEqual({
+          payoutDate: null,
+          paymentAmt: 100,
+          transactionFee: 10,
+          email: 'MOCK_EMAIL',
+        })
+      })
+
+      it('should return null for an email submission', async () => {
+        // Arrange
+        const submission = await EmailSubmission.create(
+          MOCK_EMAIL_SUBMISSION_PARAMS,
+        )
+
+        // Act
+        const actualResult =
+          await Submission.findEncryptedOrMultirespondentSingleMetadata(
+            MOCK_FORM_ID.toHexString(),
+            submission._id.toHexString(),
+          )
+
+        // Assert
+        expect(actualResult).toBeNull()
+      })
+    })
+
+    describe('findSingleMetadata', () => {
+      it('should not return mrf metadata for storage mode form', async () => {
+        // Arrange
+        const formId = new ObjectId()
+        const submission = await EncryptedSubmission.create({
+          submissionType: SubmissionType.Encrypt,
+          form: formId,
+          encryptedContent: MOCK_ENCRYPTED_CONTENT,
+          version: 1,
+          authType: FormAuthType.NIL,
+          myInfoFields: [],
+          webhookResponses: [],
+        })
+
+        // Act
+        const result = await EncryptedSubmission.findSingleMetadata(
+          String(formId),
+          String(submission._id),
+        )
+
+        // Assert
+        expect(result?.mrf).toBeUndefined()
+      })
+
+      it('should return mrf metadata for an mrf form', async () => {
+        // Arrange
+        const formId = new ObjectId()
+        const workflowId = new ObjectId()
+        const fieldId = new ObjectId()
+        const submission = await MultirespondentSubmission.create({
+          form: formId,
+          submissionType: SubmissionType.Multirespondent,
+          form_fields: [{ _id: fieldId, fieldType: BasicField.ShortText }],
+          form_logics: [],
+          workflow: [
+            { _id: workflowId, workflow_type: WorkflowType.Static, emails: [] },
+          ],
+          submissionPublicKey: 'test public key',
+          encryptedSubmissionSecretKey: 'test secret key',
+          encryptedContent: 'test encrypted content',
+          version: 1,
+          workflowStep: 0,
+          submittedSteps: [],
+        })
+
+        await submission.save()
+
+        // Act
+        const result = await MultirespondentSubmission.findSingleMetadata(
+          String(formId),
+          String(submission._id),
+        )
+
+        // Assert
+        expect(result).toBeDefined()
+        expect(result?.mrf).toEqual(
+          buildMrfMetadata({
+            workflow: submission.workflow,
+            workflowStep: submission.workflowStep,
+            submittedSteps: submission.submittedSteps,
+            created: submission.created,
+          }),
+        )
+        expect(result?.refNo).toBeDefined()
+        expect(result?.number).toEqual(1)
+      })
+    })
+
+    describe('findAllMetadataByFormId', () => {
+      it('should not return mrf metadata for storage mode form', async () => {
+        // Arrange
+        const formId = new ObjectId()
+        await EncryptedSubmission.create({
+          submissionType: SubmissionType.Encrypt,
+          form: formId,
+          encryptedContent: MOCK_ENCRYPTED_CONTENT,
+          version: 1,
+          authType: FormAuthType.NIL,
+          myInfoFields: [],
+          webhookResponses: [],
+        })
+
+        // Act
+        const result = await EncryptedSubmission.findAllMetadataByFormId(
+          String(formId),
+        )
+
+        // Assert
+        expect(result.metadata[0].mrf).toBeUndefined()
+        expect(result.metadata[0].refNo).toBeDefined()
+        expect(result.metadata[0].number).toEqual(1)
+        expect(result.count).toEqual(1)
+      })
+
+      it('should return mrf metadata for an mrf form', async () => {
+        // Arrange
+        const formId = new ObjectId()
+        const workflowId = new ObjectId()
+        const fieldId = new ObjectId()
+        const submission = await MultirespondentSubmission.create({
+          form: formId,
+          submissionType: SubmissionType.Multirespondent,
+          form_fields: [{ _id: fieldId, fieldType: BasicField.ShortText }],
+          form_logics: [],
+          workflow: [
+            { _id: workflowId, workflow_type: WorkflowType.Static, emails: [] },
+          ],
+          submissionPublicKey: 'test public key',
+          encryptedSubmissionSecretKey: 'test secret key',
+          encryptedContent: 'test encrypted content',
+          version: 1,
+          workflowStep: 0,
+          submittedSteps: [],
+        })
+
+        await submission.save()
+
+        // Act
+        const result = await MultirespondentSubmission.findAllMetadataByFormId(
+          String(formId),
+        )
+
+        // Assert
+        expect(result.count).toEqual(1)
+        expect(result.metadata[0].mrf).toEqual(
+          buildMrfMetadata({
+            workflowStep: submission.workflowStep,
+            workflow: submission.workflow,
+            submittedSteps: submission.submittedSteps,
+            created: submission.created,
+          }),
+        )
+        expect(result.metadata[0].refNo).toBeDefined()
+        expect(result.metadata[0].number).toEqual(1)
+      })
+    })
+  })
+
+  describe('Multirespondent admin queries', () => {
+    const MOCK_MRF_SUBMISSION = () => ({
+      form: MOCK_FORM_ID,
+      submissionType: SubmissionType.Multirespondent,
+      form_fields: [],
+      form_logics: [],
+      workflow: [],
+      submissionPublicKey: 'test public key',
+      encryptedSubmissionSecretKey: 'test secret key',
+      encryptedContent: MOCK_ENCRYPTED_CONTENT,
+      version: 1,
+      workflowStep: 1,
+      submittedSteps: [
+        {
+          isApproval: true,
+          submittedAt: '2026-07-22T00:00:00.000Z',
+          status: WorkflowStatus.APPROVED,
+          nextStepRecipientEmails: ['next@example.com'],
+          submitterId: 'SUBMITTER_ID_HASH',
+          snapshotTokens: { v4: 'SNAPSHOT_TOKEN_LEAF_VALUE' },
+        },
+      ],
+    })
+
+    const EXPECTED_ADMIN_STEP = {
+      isApproval: true,
+      submittedAt: '2026-07-22T00:00:00.000Z',
+      status: WorkflowStatus.APPROVED,
+      nextStepRecipientEmails: ['next@example.com'],
+    }
+
+    it('findEncryptedSubmissionById should not load unclassified step sub-fields', async () => {
+      const created = await MultirespondentSubmission.create(
+        MOCK_MRF_SUBMISSION(),
+      )
+
+      const actual =
+        await MultirespondentSubmission.findEncryptedSubmissionById(
+          String(MOCK_FORM_ID),
+          String(created._id),
+        )
+
+      expect(actual!.toObject().submittedSteps).toEqual([EXPECTED_ADMIN_STEP])
+    })
+
+    it('getSubmissionCursorByFormId should not load unclassified step sub-fields', async () => {
+      await MultirespondentSubmission.create(MOCK_MRF_SUBMISSION())
+
+      const cursor = MultirespondentSubmission.getSubmissionCursorByFormId(
+        String(MOCK_FORM_ID),
+        {},
+      )
+      const docs = []
+      for await (const doc of cursor) docs.push(doc)
+
+      expect(docs).toHaveLength(1)
+      expect(docs[0].submittedSteps).toEqual([EXPECTED_ADMIN_STEP])
+    })
+  })
+
+  describe('Methods', () => {
+    describe('getWebhookView', () => {
+      it('should returnt non-null view with paymentContent when submission has paymentId', async () => {
+        const formId = new ObjectId()
+
+        const submission = await EncryptedSubmission.create({
+          submissionType: SubmissionType.Encrypt,
+          form: formId,
+          encryptedContent: MOCK_ENCRYPTED_CONTENT,
+          version: 1,
+          authType: FormAuthType.NIL,
+          myInfoFields: [],
+          webhookResponses: [],
+        })
+
+        const MOCK_PAYMENT_INTENT_ID = 'MOCK_PAYMENT_INTENT_ID'
+        const MOCK_EMAIL = 'MOCK_EMAIL'
+        const MOCK_PAYMENT_STATUS = 'succeeded'
+        const payment = await PaymentSubmission.create({
+          amount: 100,
+          paymentStatus: 'successful',
+          submission: submission._id,
+          gstEnabled: false,
+          paymentIntentId: MOCK_PAYMENT_INTENT_ID,
+          email: MOCK_EMAIL,
+          targetAccountId: 'targetAccountId',
+          formId: formId,
+          pendingSubmissionId: submission._id,
+          status: MOCK_PAYMENT_STATUS,
+        })
+        submission.paymentId = payment._id
+        await submission.save()
+
+        // Act
+        const actualWebhookView = await submission.getWebhookView()
+
+        // Assert
+        expect(actualWebhookView).toEqual({
+          data: {
+            formId: expect.any(String),
+            submissionId: expect.any(String),
+            created: expect.any(Date),
+            encryptedContent: MOCK_ENCRYPTED_CONTENT,
+            verifiedContent: undefined,
+            attachmentDownloadUrls: {},
+            version: 1,
+            paymentContent: {
+              amount: '1.00',
+              dateTime: '-',
+              payer: MOCK_EMAIL,
+              paymentIntent: MOCK_PAYMENT_INTENT_ID,
+              productService: '-',
+              status: MOCK_PAYMENT_STATUS,
+              transactionFee: '-',
+              type: 'payment_charge',
+              url: expect.stringContaining(
+                `api/v3/payments/${formId}/${payment._id}/invoice/download`,
+              ),
+            },
+          },
+        })
+      })
+      it('should project submittedSteps for multirespondent submissions, omitting the internal snapshotTokens', async () => {
+        // Arrange
+        const formId = new ObjectId()
+        const submission = await MultirespondentSubmission.create({
+          form: formId,
+          submissionType: SubmissionType.Multirespondent,
+          form_fields: [],
+          form_logics: [],
+          workflow: [],
+          submissionPublicKey: 'test public key',
+          encryptedSubmissionSecretKey: 'test secret key',
+          encryptedContent: MOCK_ENCRYPTED_CONTENT,
+          version: 1,
+          workflowStep: 1,
+          submittedSteps: [
+            {
+              isApproval: true,
+              submittedAt: '2026-07-22T00:00:00.000Z',
+              status: WorkflowStatus.APPROVED,
+              nextStepRecipientEmails: ['next@example.com'],
+              submitterId: 'SUBMITTER_ID_HASH',
+              snapshotTokens: { v4: 'SNAPSHOT_TOKEN_LEAF_VALUE' },
+            },
+          ],
+        })
+
+        // Act
+        const actualWebhookView = await submission.getWebhookView()
+
+        // Assert
+        const { submittedSteps } = actualWebhookView!.data
+          .workflowContent as WorkflowWebhookEventObject
+        expect(submittedSteps).toEqual([
+          {
+            isApproval: true,
+            submittedAt: '2026-07-22T00:00:00.000Z',
+            status: WorkflowStatus.APPROVED,
+            nextStepRecipientEmails: ['next@example.com'],
+            submitterId: 'SUBMITTER_ID_HASH',
+          },
+        ])
+        expect(JSON.stringify(actualWebhookView)).not.toContain(
+          'SNAPSHOT_TOKEN_LEAF_VALUE',
+        )
+      })
+
+      it('should return non-null view with encryptedSubmission type when submission has no verified content', async () => {
+        // Arrange
+        const formId = new ObjectId()
+
+        const submission = await EncryptedSubmission.create({
+          submissionType: SubmissionType.Encrypt,
+          form: formId,
+          encryptedContent: MOCK_ENCRYPTED_CONTENT,
+          version: 1,
+          authType: FormAuthType.NIL,
+          myInfoFields: [],
+          webhookResponses: [],
+        })
+
+        // Act
+        const actualWebhookView = await submission.getWebhookView()
+
+        // Assert
+        expect(actualWebhookView).toEqual({
+          data: {
+            formId: expect.any(String),
+            submissionId: expect.any(String),
+            created: expect.any(Date),
+            encryptedContent: MOCK_ENCRYPTED_CONTENT,
+            verifiedContent: undefined,
+            attachmentDownloadUrls: {},
+            version: 1,
+            paymentContent: {},
+          },
+        })
+      })
+
+      it('should return non-null view with encryptedSubmission type when submission has verified content', async () => {
+        // Arrange
+        const formId = new ObjectId()
+
+        const submission = await EncryptedSubmission.create({
+          submissionType: SubmissionType.Encrypt,
+          form: formId,
+          encryptedContent: MOCK_ENCRYPTED_CONTENT,
+          verifiedContent: MOCK_VERIFIED_CONTENT,
+          version: 1,
+          authType: FormAuthType.NIL,
+          myInfoFields: [],
+          webhookResponses: [],
+        })
+
+        // Act
+        const actualWebhookView = await submission.getWebhookView()
+
+        // Assert
+        expect(actualWebhookView).toEqual({
+          data: {
+            attachmentDownloadUrls: {},
+            formId: expect.any(String),
+            submissionId: expect.any(String),
+            created: expect.any(Date),
+            encryptedContent: MOCK_ENCRYPTED_CONTENT,
+            verifiedContent: MOCK_VERIFIED_CONTENT,
+            version: 1,
+            paymentContent: {},
+          },
+        })
+      })
+
+      it('should return non-null view with encryptedSubmission type when submission is populated with webhook info', async () => {
+        // Arrange
+        const { form } = await dbHandler.insertEncryptForm({
+          formOptions: {
+            webhook: {
+              url: MOCK_WEBHOOK_URL,
+              isRetryEnabled: false,
+            },
+          },
+        })
+
+        const submission = await EncryptedSubmission.create({
+          submissionType: SubmissionType.Encrypt,
+          form: form._id,
+          encryptedContent: MOCK_ENCRYPTED_CONTENT,
+          verifiedContent: MOCK_VERIFIED_CONTENT,
+          version: 1,
+          authType: FormAuthType.NIL,
+          myInfoFields: [],
+          webhookResponses: [],
+        })
+
+        const populatedSubmission = await EncryptedSubmission.findById(
+          submission._id,
+        ).populate('form', 'webhook')
+
+        // Act
+        const actualWebhookView = await populatedSubmission!.getWebhookView()
+
+        // Assert
+        expect(actualWebhookView).toEqual({
+          data: {
+            attachmentDownloadUrls: {},
+            formId: expect.any(String),
+            submissionId: expect.any(String),
+            created: expect.any(Date),
+            encryptedContent: MOCK_ENCRYPTED_CONTENT,
+            verifiedContent: MOCK_VERIFIED_CONTENT,
+            version: 1,
+            paymentContent: {},
+          },
+        })
+      })
+
+      it('should return null view with non-encryptSubmission type', async () => {
+        // Arrange
+        const formId = new ObjectId()
+        const submission = await EmailSubmission.create({
+          submissionType: SubmissionType.Email,
+          form: formId,
+          encryptedContent: MOCK_ENCRYPTED_CONTENT,
+          version: 1,
+          authType: FormAuthType.NIL,
+          myInfoFields: [],
+          recipientEmails: [],
+          responseHash: 'hash',
+          responseSalt: 'salt',
+          hasBounced: false,
+        })
+
+        // Act
+        const actualWebhookView = await submission.getWebhookView()
+
+        // Assert
+        expect(actualWebhookView).toBeNull()
+      })
+    })
+
+    describe('addWebhookResponse', () => {
+      it('should return updated submission with webhook response when submission ID is valid', async () => {
+        // Arrange
+        const formId = new ObjectId()
+        const submission = await EncryptedSubmission.create({
+          submissionType: SubmissionType.Encrypt,
+          form: formId,
+          encryptedContent: MOCK_ENCRYPTED_CONTENT,
+          version: 1,
+          authType: FormAuthType.NIL,
+          myInfoFields: [],
+          recipientEmails: [],
+          responseHash: 'hash',
+          responseSalt: 'salt',
+          hasBounced: false,
+        })
+
+        const webhookResponse = new Object({
+          _id: submission._id,
+          created: submission.created,
+          signature: 'some signature',
+          webhookUrl: 'https://form.gov.sg/endpoint',
+          response: {
+            data: '{"result":"test-result"}',
+            status: 200,
+            headers: '{}',
+          },
+        }) as WebhookResponse
+
+        // Act
+        const actualSubmission = await EncryptedSubmission.addWebhookResponse(
+          submission._id,
+          webhookResponse,
+        )
+        const webhookResponses = actualSubmission!.toObject().webhookResponses!
+
+        // Assert
+        expect(webhookResponses[0].signature).toEqual(webhookResponse.signature)
+        expect(webhookResponses[0].webhookUrl).toEqual(
+          webhookResponse.webhookUrl,
+        )
+        expect(webhookResponses[0].response).toEqual(webhookResponse.response)
+      })
+
+      it('should return null when submission id is invalid', async () => {
+        // Arrange
+        const formId = new ObjectId()
+        const submission = await EncryptedSubmission.create({
+          submissionType: SubmissionType.Encrypt,
+          form: formId,
+          encryptedContent: MOCK_ENCRYPTED_CONTENT,
+          version: 1,
+          authType: FormAuthType.NIL,
+          myInfoFields: [],
+          recipientEmails: [],
+          responseHash: 'hash',
+          responseSalt: 'salt',
+          hasBounced: false,
+        })
+
+        const webhookResponse = {
+          _id: submission._id,
+          created: submission.created,
+          signature: 'some signature',
+          webhookUrl: 'https://form.gov.sg/endpoint',
+          response: {
+            status: 200,
+            headers: '',
+            data: '',
+          },
+        } as WebhookResponse
+
+        const invalidSubmissionId = new ObjectId().toHexString()
+
+        // Act
+        const actualSubmission = await EncryptedSubmission.addWebhookResponse(
+          invalidSubmissionId,
+          webhookResponse,
+        )
+
+        // Assert
+        expect(actualSubmission).toBeNull()
+      })
+
+      it('should push a webhook response onto a multirespondent submission', async () => {
+        // Arrange
+        const formId = new ObjectId()
+        const submission = await MultirespondentSubmission.create({
+          form: formId,
+          submissionType: SubmissionType.Multirespondent,
+          form_fields: [],
+          form_logics: [],
+          workflow: [],
+          submissionPublicKey: 'test public key',
+          encryptedSubmissionSecretKey: 'test secret key',
+          encryptedContent: MOCK_ENCRYPTED_CONTENT,
+          version: 1,
+          workflowStep: 0,
+          submittedSteps: [],
+        })
+
+        const webhookResponse: WebhookResponse = {
+          signature: 'mrf signature',
+          webhookUrl: 'https://form.gov.sg/mrf-endpoint',
+          response: {
+            data: '{"result":"mrf-ok"}',
+            status: 200,
+            headers: '{}',
+          },
+        }
+
+        // Act — call via the base Submission model to confirm the static
+        // resolves through the discriminator for MRF submissions.
+        const actualSubmission = await Submission.addWebhookResponse(
+          String(submission._id),
+          webhookResponse,
+        )
+        const webhookResponses = actualSubmission!.toObject().webhookResponses!
+
+        // Assert
+        expect(webhookResponses).toHaveLength(1)
+        expect(webhookResponses[0].signature).toEqual(webhookResponse.signature)
+        expect(webhookResponses[0].webhookUrl).toEqual(
+          webhookResponse.webhookUrl,
+        )
+        expect(webhookResponses[0].response).toEqual(webhookResponse.response)
+      })
+    })
+  })
+})
